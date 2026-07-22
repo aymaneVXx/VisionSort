@@ -1,0 +1,168 @@
+{"frame_index": 0, "class_name": "parcel", "confidence": 0.97, "bbox": [20, 182, 92, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 1, "class_name": "parcel", "confidence": 0.97, "bbox": [27, 182, 99, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 2, "class_name": "parcel", "confidence": 0.97, "bbox": [34, 182, 106, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 3, "class_name": "parcel", "confidence": 0.97, "bbox": [41, 182, 113, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 4, "class_name": "parcel", "confidence": 0.97, "bbox": [48, 182, 120, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 5, "class_name": "parcel", "confidence": 0.97, "bbox": [55, 182, 127, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 6, "class_name": "parcel", "confidence": 0.97, "bbox": [62, 182, 134, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 7, "class_name": "parcel", "confidence": 0.97, "bbox": [69, 182, 141, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 8, "class_name": "parcel", "confidence": 0.97, "bbox": [76, 182, 148, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 9, "class_name": "parcel", "confidence": 0.97, "bbox": [83, 182, 155, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 10, "class_name": "parcel", "confidence": 0.97, "bbox": [90, 182, 162, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 11, "class_name": "parcel", "confidence": 0.97, "bbox": [97, 182, 169, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 12, "class_name": "parcel", "confidence": 0.97, "bbox": [104, 182, 176, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 13, "class_name": "parcel", "confidence": 0.97, "bbox": [111, 182, 183, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 14, "class_name": "parcel", "confidence": 0.97, "bbox": [118, 182, 190, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 15, "class_name": "parcel", "confidence": 0.97, "bbox": [125, 182, 197, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 16, "class_name": "parcel", "confidence": 0.97, "bbox": [132, 182, 204, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 17, "class_name": "parcel", "confidence": 0.97, "bbox": [139, 182, 211, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 18, "class_name": "parcel", "confidence": 0.97, "bbox": [146, 182, 218, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 18, "class_name": "parcel", "confidence": 0.92, "bbox": [74, 140, 149, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 19, "class_name": "parcel", "confidence": 0.97, "bbox": [153, 182, 225, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 19, "class_name": "parcel", "confidence": 0.92, "bbox": [82, 140, 157, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 20, "class_name": "parcel", "confidence": 0.97, "bbox": [160, 182, 232, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 20, "class_name": "parcel", "confidence": 0.92, "bbox": [90, 140, 165, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 21, "class_name": "parcel", "confidence": 0.97, "bbox": [167, 182, 239, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 21, "class_name": "parcel", "confidence": 0.92, "bbox": [98, 140, 173, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 22, "class_name": "parcel", "confidence": 0.97, "bbox": [174, 182, 246, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 22, "class_name": "parcel", "confidence": 0.92, "bbox": [106, 140, 181, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 23, "class_name": "parcel", "confidence": 0.97, "bbox": [181, 182, 253, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 23, "class_name": "parcel", "confidence": 0.92, "bbox": [114, 140, 189, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 24, "class_name": "parcel", "confidence": 0.97, "bbox": [188, 182, 260, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 24, "class_name": "parcel", "confidence": 0.92, "bbox": [122, 140, 197, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 24, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 24, "class_name": "left_wrist", "confidence": 0.93, "bbox": [430, 175, 452, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 24, "class_name": "right_wrist", "confidence": 0.93, "bbox": [458, 185, 480, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 25, "class_name": "parcel", "confidence": 0.97, "bbox": [195, 182, 267, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 25, "class_name": "parcel", "confidence": 0.92, "bbox": [130, 140, 205, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 25, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 25, "class_name": "left_wrist", "confidence": 0.93, "bbox": [430, 175, 452, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 25, "class_name": "right_wrist", "confidence": 0.93, "bbox": [458, 185, 480, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 26, "class_name": "parcel", "confidence": 0.97, "bbox": [202, 182, 274, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 26, "class_name": "parcel", "confidence": 0.92, "bbox": [138, 140, 213, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 26, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 26, "class_name": "left_wrist", "confidence": 0.93, "bbox": [430, 175, 452, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 26, "class_name": "right_wrist", "confidence": 0.93, "bbox": [458, 185, 480, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 27, "class_name": "parcel", "confidence": 0.97, "bbox": [209, 182, 281, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 27, "class_name": "parcel", "confidence": 0.92, "bbox": [146, 140, 221, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 27, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 27, "class_name": "left_wrist", "confidence": 0.93, "bbox": [430, 175, 452, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 27, "class_name": "right_wrist", "confidence": 0.93, "bbox": [458, 185, 480, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 28, "class_name": "parcel", "confidence": 0.97, "bbox": [216, 182, 288, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 28, "class_name": "parcel", "confidence": 0.74, "bbox": [154, 140, 229, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 28, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 28, "class_name": "left_wrist", "confidence": 0.93, "bbox": [430, 175, 452, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 28, "class_name": "right_wrist", "confidence": 0.93, "bbox": [458, 185, 480, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 29, "class_name": "parcel", "confidence": 0.97, "bbox": [223, 182, 295, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 29, "class_name": "parcel", "confidence": 0.74, "bbox": [162, 140, 237, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 29, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 29, "class_name": "left_wrist", "confidence": 0.93, "bbox": [428, 175, 450, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 29, "class_name": "right_wrist", "confidence": 0.93, "bbox": [456, 185, 478, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 30, "class_name": "parcel", "confidence": 0.97, "bbox": [230, 182, 302, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 30, "class_name": "parcel", "confidence": 0.74, "bbox": [170, 140, 245, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 30, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 30, "class_name": "left_wrist", "confidence": 0.93, "bbox": [426, 175, 448, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 30, "class_name": "right_wrist", "confidence": 0.93, "bbox": [454, 185, 476, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 31, "class_name": "parcel", "confidence": 0.97, "bbox": [237, 182, 309, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 31, "class_name": "parcel", "confidence": 0.74, "bbox": [178, 140, 253, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 31, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 31, "class_name": "left_wrist", "confidence": 0.93, "bbox": [424, 175, 446, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 31, "class_name": "right_wrist", "confidence": 0.93, "bbox": [452, 185, 474, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 32, "class_name": "parcel", "confidence": 0.97, "bbox": [244, 182, 316, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 32, "class_name": "parcel", "confidence": 0.74, "bbox": [186, 140, 261, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 32, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 32, "class_name": "left_wrist", "confidence": 0.93, "bbox": [422, 175, 444, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 32, "class_name": "right_wrist", "confidence": 0.93, "bbox": [450, 185, 472, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 33, "class_name": "parcel", "confidence": 0.97, "bbox": [251, 182, 323, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 33, "class_name": "parcel", "confidence": 0.74, "bbox": [194, 140, 269, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 33, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 33, "class_name": "left_wrist", "confidence": 0.93, "bbox": [420, 175, 442, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 33, "class_name": "right_wrist", "confidence": 0.93, "bbox": [448, 185, 470, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 34, "class_name": "parcel", "confidence": 0.97, "bbox": [258, 182, 330, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 34, "class_name": "parcel", "confidence": 0.74, "bbox": [202, 140, 277, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 34, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 34, "class_name": "left_wrist", "confidence": 0.93, "bbox": [418, 175, 440, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 34, "class_name": "right_wrist", "confidence": 0.93, "bbox": [446, 185, 468, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 35, "class_name": "parcel", "confidence": 0.97, "bbox": [265, 182, 337, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 35, "class_name": "parcel", "confidence": 0.92, "bbox": [210, 140, 285, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 35, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 35, "class_name": "left_wrist", "confidence": 0.93, "bbox": [416, 175, 438, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 35, "class_name": "right_wrist", "confidence": 0.93, "bbox": [444, 185, 466, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 36, "class_name": "parcel", "confidence": 0.97, "bbox": [272, 182, 344, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 36, "class_name": "parcel", "confidence": 0.92, "bbox": [218, 140, 293, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 36, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 36, "class_name": "left_wrist", "confidence": 0.93, "bbox": [414, 175, 436, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 36, "class_name": "right_wrist", "confidence": 0.93, "bbox": [442, 185, 464, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 37, "class_name": "parcel", "confidence": 0.97, "bbox": [279, 182, 351, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 37, "class_name": "parcel", "confidence": 0.92, "bbox": [226, 140, 301, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 37, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 37, "class_name": "left_wrist", "confidence": 0.93, "bbox": [412, 175, 434, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 37, "class_name": "right_wrist", "confidence": 0.93, "bbox": [440, 185, 462, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 38, "class_name": "parcel", "confidence": 0.97, "bbox": [286, 182, 358, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 38, "class_name": "parcel", "confidence": 0.92, "bbox": [234, 140, 309, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 38, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 38, "class_name": "left_wrist", "confidence": 0.93, "bbox": [410, 175, 432, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 38, "class_name": "right_wrist", "confidence": 0.93, "bbox": [438, 185, 460, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 39, "class_name": "parcel", "confidence": 0.97, "bbox": [293, 182, 365, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 39, "class_name": "parcel", "confidence": 0.92, "bbox": [242, 140, 317, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 39, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 39, "class_name": "left_wrist", "confidence": 0.93, "bbox": [408, 175, 430, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 39, "class_name": "right_wrist", "confidence": 0.93, "bbox": [436, 185, 458, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 40, "class_name": "parcel", "confidence": 0.97, "bbox": [300, 182, 372, 224], "attributes": {"parcel_hint": "P1", "validated_on_site": false}}
+{"frame_index": 40, "class_name": "parcel", "confidence": 0.92, "bbox": [250, 140, 325, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 40, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 40, "class_name": "left_wrist", "confidence": 0.93, "bbox": [406, 175, 428, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 40, "class_name": "right_wrist", "confidence": 0.93, "bbox": [434, 185, 456, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 41, "class_name": "parcel", "confidence": 0.92, "bbox": [258, 140, 333, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 41, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 41, "class_name": "left_wrist", "confidence": 0.93, "bbox": [404, 175, 426, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 41, "class_name": "right_wrist", "confidence": 0.93, "bbox": [432, 185, 454, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 42, "class_name": "parcel", "confidence": 0.92, "bbox": [266, 140, 341, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 42, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 42, "class_name": "left_wrist", "confidence": 0.93, "bbox": [402, 175, 424, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 42, "class_name": "right_wrist", "confidence": 0.93, "bbox": [430, 185, 452, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 43, "class_name": "parcel", "confidence": 0.92, "bbox": [274, 140, 349, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 43, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 43, "class_name": "left_wrist", "confidence": 0.93, "bbox": [400, 175, 422, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 43, "class_name": "right_wrist", "confidence": 0.93, "bbox": [428, 185, 450, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 44, "class_name": "parcel", "confidence": 0.92, "bbox": [282, 140, 357, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 44, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 44, "class_name": "left_wrist", "confidence": 0.93, "bbox": [398, 175, 420, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 44, "class_name": "right_wrist", "confidence": 0.93, "bbox": [426, 185, 448, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 45, "class_name": "parcel", "confidence": 0.92, "bbox": [290, 140, 365, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 45, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 45, "class_name": "left_wrist", "confidence": 0.93, "bbox": [396, 175, 418, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 45, "class_name": "right_wrist", "confidence": 0.93, "bbox": [424, 185, 446, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 46, "class_name": "parcel", "confidence": 0.92, "bbox": [298, 140, 373, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 46, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 46, "class_name": "left_wrist", "confidence": 0.93, "bbox": [394, 175, 416, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 46, "class_name": "right_wrist", "confidence": 0.93, "bbox": [422, 185, 444, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 47, "class_name": "parcel", "confidence": 0.92, "bbox": [306, 140, 381, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 47, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 47, "class_name": "left_wrist", "confidence": 0.93, "bbox": [392, 175, 414, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 47, "class_name": "right_wrist", "confidence": 0.93, "bbox": [420, 185, 442, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 48, "class_name": "parcel", "confidence": 0.92, "bbox": [314, 140, 389, 185], "attributes": {"parcel_hint": "P2", "validated_on_site": false}}
+{"frame_index": 48, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 48, "class_name": "left_wrist", "confidence": 0.93, "bbox": [390, 175, 412, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 48, "class_name": "right_wrist", "confidence": 0.93, "bbox": [418, 185, 440, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 49, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 49, "class_name": "left_wrist", "confidence": 0.93, "bbox": [388, 175, 410, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 49, "class_name": "right_wrist", "confidence": 0.93, "bbox": [416, 185, 438, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 50, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 50, "class_name": "left_wrist", "confidence": 0.93, "bbox": [386, 175, 408, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 50, "class_name": "right_wrist", "confidence": 0.93, "bbox": [414, 185, 436, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 51, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 51, "class_name": "left_wrist", "confidence": 0.93, "bbox": [384, 175, 406, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 51, "class_name": "right_wrist", "confidence": 0.93, "bbox": [412, 185, 434, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 52, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 52, "class_name": "left_wrist", "confidence": 0.93, "bbox": [382, 175, 404, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 52, "class_name": "right_wrist", "confidence": 0.93, "bbox": [410, 185, 432, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 53, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 53, "class_name": "left_wrist", "confidence": 0.93, "bbox": [380, 175, 402, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 53, "class_name": "right_wrist", "confidence": 0.93, "bbox": [408, 185, 430, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 54, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 54, "class_name": "left_wrist", "confidence": 0.93, "bbox": [378, 175, 400, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 54, "class_name": "right_wrist", "confidence": 0.93, "bbox": [406, 185, 428, 207], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 55, "class_name": "person", "confidence": 0.95, "bbox": [420, 95, 530, 310], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 55, "class_name": "left_wrist", "confidence": 0.93, "bbox": [376, 175, 398, 197], "attributes": {"operator_id": "OP1"}}
+{"frame_index": 55, "class_name": "right_wrist", "confidence": 0.93, "bbox": [404, 185, 426, 207], "attributes": {"operator_id": "OP1"}}

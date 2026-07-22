@@ -1,0 +1,67 @@
+app:
+  name: VisionSort
+  demo_mode: true
+  site_validated: false
+  timezone: UTC
+runtime:
+  poll_interval_seconds: 1.0
+  max_buffer_size: 3
+  preview_jpeg_quality: 82
+  recording_segment_seconds: 10
+  details_flush_every: 10
+  max_inference_queue: 8
+gpu:
+  allow_training_while_inference: false
+  max_concurrent_live_sources: 3
+  device: auto
+tracking:
+  site_topology:
+    edges:
+      - from_role: C1
+        to_role: C2
+        min_transit_s: 0.5
+        max_transit_s: 10.0
+      - from_role: C2
+        to_role: C3
+        min_transit_s: 0.2
+        max_transit_s: 12.0
+  zones:
+    C1:
+      - zone_id: c1_exit
+        kind: exit
+        x1: 0.82
+        y1: 0.0
+        x2: 1.0
+        y2: 1.0
+    C2:
+      - zone_id: c2_entry
+        kind: entry
+        x1: 0.0
+        y1: 0.0
+        x2: 0.18
+        y2: 1.0
+      - zone_id: c2_pick
+        kind: pick
+        x1: 0.55
+        y1: 0.1
+        x2: 0.95
+        y2: 0.9
+    C3:
+      - zone_id: c3_entry
+        kind: entry
+        x1: 0.0
+        y1: 0.0
+        x2: 0.18
+        y2: 1.0
+      - zone_id: zone_A
+        kind: destination
+        x1: 0.50
+        y1: 0.15
+        x2: 0.75
+        y2: 0.50
+      - zone_id: zone_B
+        kind: destination
+        x1: 0.62
+        y1: 0.55
+        x2: 0.93
+        y2: 0.92

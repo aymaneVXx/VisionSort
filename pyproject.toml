@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "visionsort"
+version = "0.1.0"
+description = "Application locale de vision industrielle multicaméra pour suivi de colis, événements opérateur et cycle dataset/training."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "streamlit>=1.37,<2.0",
+  "opencv-python-headless>=4.10,<5.0",
+  "numpy>=1.26,<3.0",
+  "PyYAML>=6.0,<7.0",
+  "pandas>=2.2,<3.0",
+  "pyarrow>=17.0,<20.0",
+  "pytest>=8.2,<9.0",
+  "ultralytics>=8.3,<9.0",
+  "psutil>=6.0,<7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest-cov>=5.0,<6.0",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["visionsort*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
