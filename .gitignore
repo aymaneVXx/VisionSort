@@ -9,6 +9,7 @@ venv/
 build/
 dist/
 *.egg-info/
+test_import.py
 data/runtime/*
 !data/runtime/.gitkeep
 data/recordings/*
@@ -17,5 +18,8 @@ data/datasets/*
 !data/datasets/.gitkeep
 data/models/*
 !data/models/.gitkeep
+data/visionsort.db
+data/demo/*
+!data/demo/.gitkeep
 logs/*
 !logs/.gitkeep
