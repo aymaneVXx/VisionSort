@@ -21,9 +21,12 @@ class FrameSource(Protocol):
 
 @dataclass(slots=True)
 class Frame:
+    session_id: str
     camera_id: str
+    camera_role: str
     frame_index: int
-    timestamp: float
+    timestamp_local: float
+    timestamp_global: float
     image: np.ndarray
     source_fps: float = 0.0
 
@@ -33,6 +36,8 @@ class Observation:
     class_name: str
     confidence: float
     bbox: tuple[float, float, float, float]
+    model_id: str | None = None
+    model_version: str | None = None
     mask: list[list[float]] | None = None
     keypoints: list[tuple[float, float, float]] | None = None
     embedding: list[float] | None = None
@@ -41,16 +46,22 @@ class Observation:
 
 @dataclass(slots=True)
 class TrackObservation:
+    session_id: str
+    source_id: str
     camera_id: str
+    camera_role: str
     local_track_id: int
     frame_index: int
-    timestamp: float
+    timestamp_local: float
+    timestamp_global: float
     class_name: str
     confidence: float
     bbox: tuple[float, float, float, float]
     velocity: tuple[float, float]
     zone_id: str | None = None
     appearance_hint: list[float] | None = None
+    model_id: str | None = None
+    tracker_id: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> dict[str, Any]:
@@ -60,10 +71,15 @@ class TrackObservation:
 @dataclass(slots=True)
 class Tracklet:
     tracklet_id: str
+    session_id: str
+    source_id: str
     camera_id: str
+    camera_role: str
     local_track_id: int
-    started_at: float
-    ended_at: float
+    started_at_local: float
+    ended_at_local: float
+    started_at_global: float
+    ended_at_global: float
     class_name: str
     first_bbox: tuple[float, float, float, float]
     last_bbox: tuple[float, float, float, float]
@@ -72,6 +88,8 @@ class Tracklet:
     frame_count: int
     observation_path: str
     summary_json: dict[str, Any]
+    model_id: str | None = None
+    tracker_id: str | None = None
 
 
 @dataclass(slots=True)

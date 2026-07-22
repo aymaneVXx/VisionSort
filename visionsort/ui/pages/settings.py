@@ -16,5 +16,10 @@ def render(context: UIContext) -> None:
     current_text = json.dumps(site_config, indent=2, ensure_ascii=False)
     payload = st.text_area("Configuration site JSON", value=current_text or "{}", height=280)
     if st.button("Enregistrer la configuration"):
-        context.repo.enqueue_command(CommandType.UPSERT_SITE_CONFIG, json.loads(payload))
+        try:
+            parsed = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            st.error(f"JSON invalide: {exc}")
+            return
+        context.repo.enqueue_command(CommandType.UPSERT_SITE_CONFIG, parsed)
         st.success("Commande d'enregistrement de configuration envoyée.")

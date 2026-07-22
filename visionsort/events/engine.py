@@ -42,7 +42,7 @@ class ParcelEventEngine:
         for parcel_track in parcel_tracks:
             parcel_key = str(parcel_track.extra.get("parcel_hint") or f"{camera_id}:{parcel_track.local_track_id}")
             evidence = self.parcels.setdefault(parcel_key, ParcelEvidence(parcel_key=parcel_key))
-            evidence.last_timestamp = parcel_track.timestamp
+            evidence.last_timestamp = parcel_track.timestamp_global
             evidence.last_bbox = parcel_track.bbox
 
             parcel_center = bbox_center(parcel_track.bbox)
@@ -50,7 +50,9 @@ class ParcelEventEngine:
             hand_overlap = max((bbox_iou(parcel_track.bbox, w.bbox) for w in wrists), default=0.0)
             person_overlap = max((bbox_iou(parcel_track.bbox, p.bbox) for p in persons), default=0.0)
             speed = math.sqrt(parcel_track.velocity[0] ** 2 + parcel_track.velocity[1] ** 2)
-            current_zone = zone_for_bbox(parcel_track.bbox, zones)
+            iw = parcel_track.extra.get("_image_w")
+            ih = parcel_track.extra.get("_image_h")
+            current_zone = zone_for_bbox(parcel_track.bbox, zones, image_size=(int(iw), int(ih)) if iw and ih else None)
             exit_signal = 1.0 if current_zone and "exit" in current_zone else 0.0
             destination_signal = 1.0 if current_zone and current_zone.startswith("zone_") else 0.0
             stillness = max(0.0, 1.0 - min(speed / 0.25, 1.0))
@@ -110,6 +112,10 @@ class ParcelEventEngine:
             "event_type": event_type,
             "parcel_id": parcel_key,
             "camera_id": camera_id,
+            "frame_index": track.frame_index,
+            "timestamp_global": track.timestamp_global,
+            "model_id": track.model_id,
+            "tracker_id": track.tracker_id,
             "payload": {
                 "bbox": track.bbox,
                 "state": evidence.state.value,

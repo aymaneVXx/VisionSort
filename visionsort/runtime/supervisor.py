@@ -19,7 +19,7 @@ from visionsort.core.config import load_config
 from visionsort.core.enums import CommandStatus, CommandType, JobType, MatchResult, SourceStatus
 from visionsort.core.paths import DB_PATH, ROOT_DIR, ensure_project_dirs
 from visionsort.core.types import GlobalParcel, Tracklet
-from visionsort.database.db import VisionSortDB
+from visionsort.database.db import VisionSortDB, utc_now
 from visionsort.database.repositories import (
     ArtifactRepository,
     ControlRepository,
@@ -28,9 +28,10 @@ from visionsort.database.repositories import (
     TrackingRepository,
 )
 from visionsort.datasets.pipeline import build_dataset
-from visionsort.deployment.registry import activate_model, rollback_to_previous_active
+from visionsort.deployment.registry import activate_model, promote_model, rollback_to_previous_active, set_model_status
 from visionsort.inference.engine import inference_worker_loop
 from visionsort.runtime.demo_assets import ensure_demo_assets
+from visionsort.runtime.pipeline_worker import pipeline_worker_loop
 from visionsort.sources.frame_sources import can_open_uri
 from visionsort.tracking.engine import GlobalParcelTracker
 from visionsort.training.pipeline import create_training_job, training_worker_loop
@@ -75,6 +76,7 @@ class RuntimeSupervisor:
         self.control_flags = self.manager.dict()
         self.camera_processes: dict[str, tuple[mp.Process, Any]] = {}
         self.training_processes: dict[str, mp.Process] = {}
+        self.pipeline_processes: dict[str, mp.Process] = {}
         self.active_model_id: str | None = None
         self.arbiter = GPUResourceArbiter(
             allow_training_while_inference=bool(self.config.get("gpu", "allow_training_while_inference", default=False)),
@@ -96,7 +98,7 @@ class RuntimeSupervisor:
         )
 
     def _source_roles(self) -> dict[str, str]:
-        return {row["role"]: row["role"] for row in self.db.fetch_all("SELECT role FROM sources")}
+        return {row["id"]: row["role"] for row in self.db.fetch_all("SELECT id, role FROM sources")}
 
     def bootstrap_demo_sources(self) -> None:
         if not self.config.demo_mode:
@@ -145,7 +147,7 @@ class RuntimeSupervisor:
         self.job_repo.mark_job_stopped(JobType.SUPERVISOR.value, "main", status="STOPPED")
 
     def sync_inference_sources(self) -> None:
-        sources = {row["role"]: dict(row) for row in self.db.fetch_all("SELECT * FROM sources")}
+        sources = {row["id"]: dict(row) for row in self.db.fetch_all("SELECT * FROM sources")}
         self.inference_request_queue.put({"kind": "SYNC_SOURCES", "source_map": sources})
 
     def ensure_model_loaded(self, model_id: str) -> None:
@@ -164,7 +166,7 @@ class RuntimeSupervisor:
             time.sleep(0.1)
         raise RuntimeError(f"Chargement du modèle expiré: {model_id}")
 
-    def start_source(self, source_id: str) -> None:
+    def start_source(self, source_id: str, *, session_id: str, session_start_global: float, replay_offset_ms: float = 0.0) -> None:
         row = self.db.fetch_one("SELECT * FROM sources WHERE id = ?", (source_id,))
         if row is None:
             raise RuntimeError("Source introuvable.")
@@ -179,6 +181,9 @@ class RuntimeSupervisor:
         stop_event = self.ctx.Event()
         cfg = dict(row)
         cfg["replay_fps"] = 8.0
+        cfg["session_id"] = session_id
+        cfg["session_start_global"] = float(session_start_global)
+        cfg["replay_offset_ms"] = float(replay_offset_ms)
         self.control_flags[source_id] = {"recording": False}
         process = self.ctx.Process(
             target=camera_worker_loop,
@@ -199,6 +204,29 @@ class RuntimeSupervisor:
         self.camera_processes[source_id] = (process, stop_event)
         self.job_repo.upsert_job_run(JobType.CAMERA.value, source_id, process.pid or 0, "RUNNING", {"role": row["role"], "model_id": row["model_id"]})
         self.control_repo.update_source_state(source_id, status=SourceStatus.CONNECTING.value, fps=0.0)
+
+    def start_session(self, session_id: str) -> None:
+        session = self.control_repo.get_capture_session(session_id)
+        if session is None:
+            raise RuntimeError("Session introuvable.")
+        start_global = float(time.time())
+        self.control_repo.update_capture_session(session_id, started_at=start_global)
+        sources = self.control_repo.list_capture_session_sources(session_id)
+        if not sources:
+            raise RuntimeError("Session sans caméras assignées.")
+        for sess_src in sources:
+            self.start_source(
+                sess_src["source_id"],
+                session_id=session_id,
+                session_start_global=start_global,
+                replay_offset_ms=float(sess_src.get("time_offset_ms") or 0.0),
+            )
+
+    def stop_session(self, session_id: str) -> None:
+        sources = self.control_repo.list_capture_session_sources(session_id)
+        for sess_src in sources:
+            self.stop_source(sess_src["source_id"])
+        self.control_repo.update_capture_session(session_id, ended_at=float(time.time()))
 
     def stop_source(self, source_id: str) -> None:
         data = self.camera_processes.pop(source_id, None)
@@ -231,6 +259,14 @@ class RuntimeSupervisor:
         if not allowed:
             raise RuntimeError(reason)
         job_id = create_training_job(self.db, payload["dataset_id"], payload["model_id"], payload)
+        dataset = self.db.fetch_one("SELECT summary_json FROM datasets WHERE id = ?", (payload["dataset_id"],))
+        if dataset and dataset["summary_json"]:
+            session_id = json.loads(dataset["summary_json"]).get("session_id")
+            if session_id:
+                self.db.execute(
+                    "UPDATE capture_sessions SET pipeline_state = ?, last_training_job_id = ?, updated_at = ? WHERE id = ?",
+                    ("TRAINING", job_id, utc_now(), session_id),
+                )
         process = self.ctx.Process(
             target=training_worker_loop,
             args=(str(DB_PATH), job_id, payload, self.config.demo_mode),
@@ -243,22 +279,22 @@ class RuntimeSupervisor:
         self.artifact_repo.update_training_job(job_id, "RUNNING")
         return job_id
 
-    def handle_tracklet(self, payload: dict[str, Any]) -> None:
-        tracklet = Tracklet(
-            tracklet_id=payload["tracklet_id"],
-            camera_id=payload["camera_id"],
-            local_track_id=int(payload["local_track_id"]),
-            started_at=float(payload["started_at"]),
-            ended_at=float(payload["ended_at"]),
-            class_name=payload["class_name"],
-            first_bbox=tuple(payload["first_bbox"]),
-            last_bbox=tuple(payload["last_bbox"]),
-            avg_speed=float(payload["avg_speed"]),
-            last_zone_id=payload.get("last_zone_id"),
-            frame_count=int(payload["frame_count"]),
-            observation_path=payload["observation_path"],
-            summary_json=payload["summary_json"],
+    def start_pipeline_step(self, *, session_id: str, step: str, params: dict[str, Any]) -> str:
+        step_name = str(step).upper()
+        job_key = f"{session_id}:{step_name}:{int(time.time() * 1000)}"
+        process = self.ctx.Process(
+            target=pipeline_worker_loop,
+            args=(str(DB_PATH), session_id, step_name, params),
+            daemon=True,
+            name=f"visionsort-pipeline-{job_key}",
         )
+        process.start()
+        self.pipeline_processes[job_key] = process
+        self.job_repo.upsert_job_run(JobType.DATASET.value, job_key, process.pid or 0, "RUNNING", {"session_id": session_id, "step": step_name})
+        return job_key
+
+    def handle_tracklet(self, payload: dict[str, Any]) -> None:
+        tracklet = Tracklet(**payload)
         self.global_tracker.source_roles = self._source_roles()
         parcel_id, result, reasons, candidate = self.global_tracker.process_tracklet(tracklet)
         self.tracking_repo.upsert_tracklet(tracklet, parcel_id=parcel_id or None, match_result=result.value)
@@ -277,6 +313,11 @@ class RuntimeSupervisor:
             parcel_id=parcel_id or None,
             camera_id=tracklet.camera_id,
             severity="warning" if result == MatchResult.AMBIGUOUS else "info",
+            session_id=tracklet.session_id,
+            source_id=tracklet.source_id,
+            timestamp_global=tracklet.ended_at_global,
+            model_id=tracklet.model_id,
+            tracker_id=tracklet.tracker_id,
         )
 
     def handle_command(self, command: dict[str, Any]) -> None:
@@ -288,9 +329,26 @@ class RuntimeSupervisor:
             if command_type == CommandType.REGISTER_SOURCE.value:
                 source_id = self.control_repo.upsert_source(payload)
                 result_payload = {"source_id": source_id}
+            elif command_type == CommandType.CREATE_SESSION.value:
+                session_id = self.control_repo.create_capture_session(
+                    name=payload["name"],
+                    demo_mode=bool(payload.get("demo_mode", False)),
+                    sources=payload.get("sources", []),
+                    config=payload.get("config", {}),
+                )
+                result_payload = {"session_id": session_id}
+            elif command_type == CommandType.START_SESSION.value:
+                self.start_session(payload["session_id"])
+                result_payload = {"session_id": payload["session_id"]}
+            elif command_type == CommandType.STOP_SESSION.value:
+                self.stop_session(payload["session_id"])
+                job_key = self.start_pipeline_step(session_id=payload["session_id"], step="PROCESS_SESSION", params={})
+                result_payload = {"session_id": payload["session_id"], "job_key": job_key}
             elif command_type == CommandType.START_SOURCE.value:
-                self.start_source(payload["source_id"])
-                result_payload = {"source_id": payload["source_id"]}
+                sid = payload.get("session_id", "session-adhoc")
+                start_global = float(payload.get("session_start_global") or time.time())
+                self.start_source(payload["source_id"], session_id=sid, session_start_global=start_global, replay_offset_ms=float(payload.get("replay_offset_ms") or 0.0))
+                result_payload = {"source_id": payload["source_id"], "session_id": sid}
             elif command_type == CommandType.STOP_SOURCE.value:
                 self.stop_source(payload["source_id"])
                 result_payload = {"source_id": payload["source_id"]}
@@ -303,9 +361,37 @@ class RuntimeSupervisor:
             elif command_type == CommandType.TEST_SOURCE.value:
                 result_payload = self.test_source(payload)
             elif command_type == CommandType.CREATE_DATASET.value:
-                result_payload = build_dataset(self.db, name=payload.get("name", "autodataset"))
+                if "session_id" not in payload:
+                    raise RuntimeError("session_id requis pour CREATE_DATASET.")
+                result_payload = build_dataset(self.db, session_id=payload["session_id"], name=payload.get("name", "autodataset"))
             elif command_type == CommandType.START_TRAINING.value:
                 result_payload = {"job_id": self.start_training(payload)}
+            elif command_type == CommandType.RUN_PIPELINE_STEP.value:
+                job_key = self.start_pipeline_step(session_id=payload["session_id"], step=payload["step"], params=payload.get("params", {}))
+                result_payload = {"job_key": job_key}
+            elif command_type == CommandType.UPDATE_DATASET_ITEM.value:
+                self.artifact_repo.update_dataset_item(
+                    payload["item_id"],
+                    annotation_status=payload.get("annotation_status"),
+                )
+                item = self.db.fetch_one("SELECT dataset_id, session_id FROM dataset_items WHERE id = ?", (payload["item_id"],))
+                result_payload = {"item_id": payload["item_id"]}
+                if item and item["dataset_id"] and item["session_id"]:
+                    job_key = self.start_pipeline_step(
+                        session_id=item["session_id"],
+                        step="FINALIZE_DATASET",
+                        params={"dataset_id": item["dataset_id"]},
+                    )
+                    result_payload["job_key"] = job_key
+            elif command_type == CommandType.PROMOTE_MODEL.value:
+                promote_model(self.db, payload["model_id"])
+                result_payload = {"model_id": payload["model_id"], "status": "CHAMPION"}
+            elif command_type == CommandType.REJECT_MODEL.value:
+                set_model_status(self.db, payload["model_id"], "REJECTED")
+                result_payload = {"model_id": payload["model_id"], "status": "REJECTED"}
+            elif command_type == CommandType.ARCHIVE_MODEL.value:
+                set_model_status(self.db, payload["model_id"], "ARCHIVED")
+                result_payload = {"model_id": payload["model_id"], "status": "ARCHIVED"}
             elif command_type == CommandType.ACTIVATE_MODEL.value:
                 activate_model(self.db, payload["model_id"])
                 result_payload = {"model_id": payload["model_id"]}
@@ -338,12 +424,19 @@ class RuntimeSupervisor:
                     parcel_id=message.get("parcel_id"),
                     camera_id=message.get("camera_id"),
                     severity="warning" if "ambiguous" in message["event_type"] else "info",
+                    session_id=message.get("session_id"),
+                    source_id=message.get("source_id"),
+                    frame_index=message.get("frame_index"),
+                    timestamp_global=message.get("timestamp_global"),
+                    model_id=message.get("model_id"),
+                    tracker_id=message.get("tracker_id"),
                 )
             elif message["kind"] == "TRACKLET":
                 self.handle_tracklet(message["tracklet"])
             elif message["kind"] == "RECORDING":
                 self.artifact_repo.add_recording(
                     source_id=message["source_id"],
+                    session_id=message.get("session_id"),
                     segment_path=message["segment_path"],
                     started_at=message["started_at"],
                     ended_at=message["ended_at"],
@@ -373,6 +466,10 @@ class RuntimeSupervisor:
             if not process.is_alive():
                 self.job_repo.mark_job_stopped(JobType.TRAINING.value, job_id, status="EXITED")
                 self.training_processes.pop(job_id, None)
+        for job_key, process in list(self.pipeline_processes.items()):
+            if not process.is_alive():
+                self.job_repo.mark_job_stopped(JobType.DATASET.value, job_key, status="EXITED")
+                self.pipeline_processes.pop(job_key, None)
 
     def run_forever(self) -> None:
         self.start()

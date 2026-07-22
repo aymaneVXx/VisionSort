@@ -23,3 +23,4 @@ data/demo/*
 !data/demo/.gitkeep
 logs/*
 !logs/.gitkeep
+Ultralytics/

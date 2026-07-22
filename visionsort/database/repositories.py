@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from dataclasses import asdict
 from pathlib import Path
@@ -18,12 +19,13 @@ class ControlRepository:
     def enqueue_command(self, command_type: CommandType | str, payload: dict[str, Any], owner: str = "streamlit") -> str:
         command_id = str(uuid.uuid4())
         now = utc_now()
+        command_value = command_type.value if isinstance(command_type, CommandType) else str(command_type)
         self.db.execute(
             """
             INSERT INTO commands (id, command_type, payload_json, status, error_text, created_at, updated_at, owner)
             VALUES (?, ?, ?, ?, NULL, ?, ?, ?)
             """,
-            (command_id, str(command_type), json.dumps(payload), CommandStatus.PENDING.value, now, now, owner),
+            (command_id, command_value, json.dumps(payload), CommandStatus.PENDING.value, now, now, owner),
         )
         return command_id
 
@@ -35,9 +37,10 @@ class ControlRepository:
         return [dict(row) for row in rows]
 
     def mark_command(self, command_id: str, status: CommandStatus | str, error_text: str | None = None) -> None:
+        status_value = status.value if isinstance(status, CommandStatus) else str(status)
         self.db.execute(
             "UPDATE commands SET status = ?, error_text = ?, updated_at = ? WHERE id = ?",
-            (str(status), error_text, utc_now(), command_id),
+            (status_value, error_text, utc_now(), command_id),
         )
 
     def list_sources(self) -> list[dict[str, Any]]:
@@ -50,6 +53,71 @@ class ControlRepository:
             """
         )
         return [dict(row) for row in rows]
+
+    def list_capture_sessions(self) -> list[dict[str, Any]]:
+        return [dict(row) for row in self.db.fetch_all("SELECT * FROM capture_sessions ORDER BY created_at DESC")]
+
+    def get_capture_session(self, session_id: str) -> dict[str, Any] | None:
+        row = self.db.fetch_one("SELECT * FROM capture_sessions WHERE id = ?", (session_id,))
+        return dict(row) if row else None
+
+    def list_capture_session_sources(self, session_id: str) -> list[dict[str, Any]]:
+        return [dict(row) for row in self.db.fetch_all("SELECT * FROM capture_session_sources WHERE session_id = ? ORDER BY camera_role ASC", (session_id,))]
+
+    def create_capture_session(self, *, name: str, demo_mode: bool, sources: list[dict[str, Any]], config: dict[str, Any]) -> str:
+        session_id = f"session-{uuid.uuid4().hex[:10]}"
+        now = utc_now()
+        self.db.execute(
+            """
+            INSERT INTO capture_sessions (id, name, pipeline_state, demo_mode, site_validated, config_json, report_path, started_at, ended_at, created_at, updated_at)
+            VALUES (?, ?, 'CAPTURED', ?, 0, ?, NULL, NULL, NULL, ?, ?)
+            """,
+            (session_id, name, int(demo_mode), json.dumps(config), now, now),
+        )
+        rows: list[tuple[Any, ...]] = []
+        for item in sources:
+            rows.append(
+                (
+                    f"sesssrc-{uuid.uuid4().hex[:10]}",
+                    session_id,
+                    item["source_id"],
+                    item["camera_role"],
+                    float(item.get("time_offset_ms", 0.0)),
+                    item.get("replay_fps"),
+                    now,
+                    now,
+                )
+            )
+        if rows:
+            self.db.execute_many(
+                """
+                INSERT INTO capture_session_sources
+                (id, session_id, source_id, camera_role, time_offset_ms, replay_fps, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+        return session_id
+
+    def update_capture_session(self, session_id: str, *, pipeline_state: str | None = None, started_at: float | None = None, ended_at: float | None = None, report_path: str | None = None) -> None:
+        fields: list[str] = []
+        params: list[Any] = []
+        if pipeline_state is not None:
+            fields.append("pipeline_state = ?")
+            params.append(pipeline_state)
+        if started_at is not None:
+            fields.append("started_at = ?")
+            params.append(started_at)
+        if ended_at is not None:
+            fields.append("ended_at = ?")
+            params.append(ended_at)
+        if report_path is not None:
+            fields.append("report_path = ?")
+            params.append(report_path)
+        fields.append("updated_at = ?")
+        params.append(utc_now())
+        params.append(session_id)
+        self.db.execute(f"UPDATE capture_sessions SET {', '.join(fields)} WHERE id = ?", tuple(params))
 
     def upsert_source(self, payload: dict[str, Any]) -> str:
         now = utc_now()
@@ -106,6 +174,7 @@ class ControlRepository:
     ) -> None:
         current = self.db.fetch_one("SELECT * FROM source_state WHERE source_id = ?", (source_id,))
         metrics_json = json.dumps(metrics if metrics is not None else json.loads(current["metrics_json"]) if current else {})
+        status_value = status.value if isinstance(status, SourceStatus) else str(status)
         self.db.execute(
             """
             INSERT INTO source_state
@@ -124,7 +193,7 @@ class ControlRepository:
             """,
             (
                 source_id,
-                str(status),
+                status_value,
                 fps,
                 last_error,
                 last_frame_ts,
@@ -167,13 +236,31 @@ class ControlRepository:
         return [dict(row) for row in self.db.fetch_all("SELECT * FROM global_parcels ORDER BY last_seen_at DESC")]
 
     def list_tracklets(self, limit: int = 200) -> list[dict[str, Any]]:
-        return [dict(row) for row in self.db.fetch_all("SELECT * FROM tracklets ORDER BY ended_at DESC LIMIT ?", (limit,))]
+        return [dict(row) for row in self.db.fetch_all("SELECT * FROM tracklets ORDER BY ended_at_global DESC LIMIT ?", (limit,))]
 
     def list_recordings(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self.db.fetch_all("SELECT * FROM recordings ORDER BY started_at DESC")]
 
     def list_datasets(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self.db.fetch_all("SELECT * FROM datasets ORDER BY created_at DESC")]
+
+    def list_dataset_items(self, dataset_id: str, limit: int = 500) -> list[dict[str, Any]]:
+        return [
+            dict(row)
+            for row in self.db.fetch_all(
+                "SELECT * FROM dataset_items WHERE dataset_id = ? ORDER BY created_at DESC LIMIT ?",
+                (dataset_id, limit),
+            )
+        ]
+
+    def list_pipeline_steps(self, session_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        return [
+            dict(row)
+            for row in self.db.fetch_all(
+                "SELECT * FROM pipeline_step_runs WHERE session_id = ? ORDER BY created_at DESC LIMIT ?",
+                (session_id, limit),
+            )
+        ]
 
     def list_training_jobs(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self.db.fetch_all("SELECT * FROM training_jobs ORDER BY created_at DESC")]
@@ -193,14 +280,36 @@ class EventRepository:
         parcel_id: str | None = None,
         camera_id: str | None = None,
         severity: str = "info",
+        *,
+        session_id: str | None = None,
+        source_id: str | None = None,
+        frame_index: int | None = None,
+        timestamp_global: float | None = None,
+        model_id: str | None = None,
+        tracker_id: str | None = None,
     ) -> str:
         event_id = str(uuid.uuid4())
         self.db.execute(
             """
-            INSERT INTO events (id, event_type, parcel_id, camera_id, severity, payload_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO events
+            (id, event_type, parcel_id, camera_id, severity, payload_json, session_id, source_id, frame_index, timestamp_global, model_id, tracker_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (event_id, event_type, parcel_id, camera_id, severity, json.dumps(payload), utc_now()),
+            (
+                event_id,
+                event_type,
+                parcel_id,
+                camera_id,
+                severity,
+                json.dumps(payload),
+                session_id,
+                source_id,
+                frame_index,
+                timestamp_global,
+                model_id,
+                tracker_id,
+                utc_now(),
+            ),
         )
         return event_id
 
@@ -213,24 +322,33 @@ class TrackingRepository:
         self.db.execute(
             """
             INSERT INTO tracklets
-            (tracklet_id, parcel_id, camera_id, local_track_id, started_at, ended_at, class_name, last_zone_id, frame_count, avg_speed, observation_path, summary_json, match_result)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (tracklet_id, parcel_id, session_id, source_id, camera_id, camera_role, local_track_id, started_at_local, ended_at_local, started_at_global, ended_at_global,
+             class_name, last_zone_id, frame_count, avg_speed, observation_path, summary_json, match_result, model_id, tracker_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(tracklet_id) DO UPDATE SET
                 parcel_id = excluded.parcel_id,
-                ended_at = excluded.ended_at,
+                ended_at_local = excluded.ended_at_local,
+                ended_at_global = excluded.ended_at_global,
                 last_zone_id = excluded.last_zone_id,
                 frame_count = excluded.frame_count,
                 avg_speed = excluded.avg_speed,
                 summary_json = excluded.summary_json,
-                match_result = excluded.match_result
+                match_result = excluded.match_result,
+                model_id = excluded.model_id,
+                tracker_id = excluded.tracker_id
             """,
             (
                 tracklet.tracklet_id,
                 parcel_id,
+                tracklet.session_id,
+                tracklet.source_id,
                 tracklet.camera_id,
+                tracklet.camera_role,
                 tracklet.local_track_id,
-                tracklet.started_at,
-                tracklet.ended_at,
+                tracklet.started_at_local,
+                tracklet.ended_at_local,
+                tracklet.started_at_global,
+                tracklet.ended_at_global,
                 tracklet.class_name,
                 tracklet.last_zone_id,
                 tracklet.frame_count,
@@ -238,6 +356,8 @@ class TrackingRepository:
                 tracklet.observation_path,
                 json.dumps(tracklet.summary_json),
                 str(match_result),
+                tracklet.model_id,
+                tracklet.tracker_id,
             ),
         )
 
@@ -277,14 +397,24 @@ class ArtifactRepository:
     def __init__(self, db: VisionSortDB):
         self.db = db
 
-    def add_recording(self, source_id: str, segment_path: str, started_at: float, ended_at: float, frame_count: int, size_bytes: int) -> str:
+    def add_recording(
+        self,
+        *,
+        source_id: str,
+        session_id: str | None,
+        segment_path: str,
+        started_at: float,
+        ended_at: float,
+        frame_count: int,
+        size_bytes: int,
+    ) -> str:
         rec_id = str(uuid.uuid4())
         self.db.execute(
             """
-            INSERT INTO recordings (id, source_id, segment_path, started_at, ended_at, frame_count, size_bytes, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO recordings (id, source_id, session_id, segment_path, started_at, ended_at, frame_count, size_bytes, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (rec_id, source_id, segment_path, started_at, ended_at, frame_count, size_bytes, utc_now()),
+            (rec_id, source_id, session_id, segment_path, started_at, ended_at, frame_count, size_bytes, utc_now()),
         )
         return rec_id
 
@@ -304,16 +434,88 @@ class ArtifactRepository:
             (dataset_id, name, root_path, status, manifest_path, data_yaml_path, json.dumps(summary), now, now),
         )
 
-    def add_dataset_item(self, dataset_id: str, image_path: str, label_path: str | None, annotation_status: str, reason: str, score: float, metadata: dict[str, Any]) -> str:
+    def add_dataset_item(
+        self,
+        *,
+        dataset_id: str,
+        session_id: str | None,
+        sample_group_id: str | None,
+        split: str | None,
+        source_id: str | None,
+        camera_role: str | None,
+        frame_index: int | None,
+        timestamp_global: float | None,
+        image_path: str,
+        label_path: str | None,
+        annotation_status: str,
+        reason: str,
+        score: float,
+        metadata: dict[str, Any],
+    ) -> str:
         item_id = str(uuid.uuid4())
         self.db.execute(
             """
-            INSERT INTO dataset_items (id, dataset_id, image_path, label_path, annotation_status, reason, score, metadata_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO dataset_items
+            (id, dataset_id, session_id, sample_group_id, split, source_id, camera_role, frame_index, timestamp_global,
+             image_path, label_path, annotation_status, reason, score, metadata_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (item_id, dataset_id, image_path, label_path, annotation_status, reason, score, json.dumps(metadata), utc_now()),
+            (
+                item_id,
+                dataset_id,
+                session_id,
+                sample_group_id,
+                split,
+                source_id,
+                camera_role,
+                frame_index,
+                timestamp_global,
+                image_path,
+                label_path,
+                annotation_status,
+                reason,
+                score,
+                json.dumps(metadata),
+                utc_now(),
+            ),
         )
         return item_id
+
+    def update_dataset_item(self, item_id: str, *, annotation_status: str | None = None, label_path: str | None = None, metadata: dict[str, Any] | None = None) -> None:
+        fields: list[str] = []
+        params: list[Any] = []
+        if annotation_status is not None:
+            fields.append("annotation_status = ?")
+            params.append(annotation_status)
+        if label_path is not None:
+            fields.append("label_path = ?")
+            params.append(label_path)
+        if metadata is not None:
+            fields.append("metadata_json = ?")
+            params.append(json.dumps(metadata))
+        if not fields:
+            return
+        params.append(item_id)
+        self.db.execute(f"UPDATE dataset_items SET {', '.join(fields)} WHERE id = ?", tuple(params))
+
+    def start_pipeline_step(self, session_id: str, step: str, inputs: dict[str, Any], log_path: str | None = None) -> str:
+        step_id = str(uuid.uuid4())
+        now = utc_now()
+        self.db.execute(
+            """
+            INSERT INTO pipeline_step_runs
+            (id, session_id, step, status, inputs_json, outputs_json, error_text, log_path, started_at, ended_at, created_at, updated_at)
+            VALUES (?, ?, ?, 'RUNNING', ?, '{}', NULL, ?, ?, NULL, ?, ?)
+            """,
+            (step_id, session_id, step, json.dumps(inputs), log_path, time.time(), now, now),
+        )
+        return step_id
+
+    def finish_pipeline_step(self, step_id: str, *, status: str, outputs: dict[str, Any] | None = None, error_text: str | None = None) -> None:
+        self.db.execute(
+            "UPDATE pipeline_step_runs SET status = ?, outputs_json = ?, error_text = ?, ended_at = ?, updated_at = ? WHERE id = ?",
+            (status, json.dumps(outputs or {}), error_text, time.time(), utc_now(), step_id),
+        )
 
     def add_training_job(self, dataset_id: str, model_id: str, status: str, recipe: dict[str, Any], log_path: str) -> str:
         job_id = str(uuid.uuid4())

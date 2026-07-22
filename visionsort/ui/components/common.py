@@ -4,6 +4,7 @@ from pathlib import Path
 
 import streamlit as st
 
+from visionsort.core.paths import ROOT_DIR
 from visionsort.ui.state import UIContext
 
 
@@ -20,7 +21,11 @@ def demo_warning(context: UIContext) -> None:
 
 
 def show_preview(preview_path: str | None, label: str) -> None:
-    if preview_path and Path(preview_path).exists():
-        st.image(preview_path, caption=label, use_container_width=True)
-    else:
-        st.caption(f"Aucune preview disponible pour {label}.")
+    if preview_path:
+        path = Path(preview_path)
+        if not path.is_absolute():
+            path = ROOT_DIR / path
+        if path.exists():
+            st.image(str(path), caption=label, use_container_width=True)
+            return
+    st.caption(f"Aucune preview disponible pour {label}.")

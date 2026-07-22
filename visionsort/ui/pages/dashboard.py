@@ -13,6 +13,7 @@ def render(context: UIContext) -> None:
     page_header("Dashboard", "Vue de supervision générale VisionSort")
     demo_warning(context)
     sources = context.repo.list_sources()
+    sessions = context.repo.list_capture_sessions()
     jobs = context.repo.list_jobs()
     events = context.repo.recent_events(limit=20)
     parcels = context.repo.list_parcels()
@@ -21,6 +22,11 @@ def render(context: UIContext) -> None:
     st.columns(4)[1].metric("Jobs", len(jobs))
     st.columns(4)[2].metric("Événements", len(events))
     st.columns(4)[3].metric("Colis globaux", len(parcels))
+    st.subheader("Capture Sessions")
+    if sessions:
+        st.dataframe(pd.DataFrame(sessions), use_container_width=True)
+    else:
+        st.info("Aucune session disponible.")
     st.subheader("État des sources")
     if sources:
         df = pd.DataFrame(sources)

@@ -12,9 +12,13 @@ from visionsort.core.types import Frame
 
 @dataclass(slots=True)
 class SourceSettings:
+    session_id: str
     camera_id: str
+    camera_role: str
     uri: str
+    session_start_global: float
     replay_fps: float = 8.0
+    replay_offset_ms: float = 0.0
     loop: bool = True
     reconnect_delay_s: float = 2.0
 
@@ -24,12 +28,19 @@ class OpenCVSourceBase:
         self.settings = settings
         self.capture: cv2.VideoCapture | None = None
         self.frame_index = 0
+        self._video_fps = 0.0
+        self._video_t0_local = 0.0
 
     def open(self) -> None:
         self.capture = cv2.VideoCapture(self.settings.uri)
         self.frame_index = 0
         if not self.capture or not self.capture.isOpened():
             raise RuntimeError(f"Impossible d'ouvrir la source {self.settings.uri}")
+        try:
+            self._video_fps = float(self.capture.get(cv2.CAP_PROP_FPS) or 0.0)
+        except Exception:
+            self._video_fps = 0.0
+        self._video_t0_local = self._current_local_ts()
 
     def close(self) -> None:
         if self.capture is not None:
@@ -41,13 +52,29 @@ class OpenCVSourceBase:
             raise RuntimeError("Source non ouverte")
         return self.capture.read()
 
+    def _current_local_ts(self) -> float:
+        if self.capture is None:
+            return 0.0
+        pos_msec = float(self.capture.get(cv2.CAP_PROP_POS_MSEC) or 0.0)
+        if pos_msec > 0.0:
+            return pos_msec / 1000.0
+        if self._video_fps > 0.0:
+            return float(self.frame_index) / self._video_fps
+        return float(self.frame_index) / max(self.settings.replay_fps, 1.0)
+
     def _build_frame(self, image) -> Frame:
+        timestamp_local = self._current_local_ts()
+        offset_s = float(self.settings.replay_offset_ms) / 1000.0
+        timestamp_global = float(self.settings.session_start_global) + (timestamp_local - self._video_t0_local) + offset_s
         frame = Frame(
+            session_id=self.settings.session_id,
             camera_id=self.settings.camera_id,
+            camera_role=self.settings.camera_role,
             frame_index=self.frame_index,
-            timestamp=time.time(),
+            timestamp_local=timestamp_local,
+            timestamp_global=timestamp_global,
             image=image,
-            source_fps=self.settings.replay_fps,
+            source_fps=self._video_fps or self.settings.replay_fps,
         )
         self.frame_index += 1
         return frame
@@ -89,18 +116,60 @@ class RTSPSource(OpenCVSourceBase):
     def read(self) -> Frame | None:
         ok, image = self._read_raw()
         if ok:
-            return self._build_frame(image)
+            timestamp_global = time.time()
+            frame = Frame(
+                session_id=self.settings.session_id,
+                camera_id=self.settings.camera_id,
+                camera_role=self.settings.camera_role,
+                frame_index=self.frame_index,
+                timestamp_local=timestamp_global,
+                timestamp_global=timestamp_global,
+                image=image,
+                source_fps=self._video_fps or 0.0,
+            )
+            self.frame_index += 1
+            return frame
         self.close()
         time.sleep(self.settings.reconnect_delay_s)
         self.open()
         ok, image = self._read_raw()
         if not ok:
             return None
-        return self._build_frame(image)
+        timestamp_global = time.time()
+        frame = Frame(
+            session_id=self.settings.session_id,
+            camera_id=self.settings.camera_id,
+            camera_role=self.settings.camera_role,
+            frame_index=self.frame_index,
+            timestamp_local=timestamp_global,
+            timestamp_global=timestamp_global,
+            image=image,
+            source_fps=self._video_fps or 0.0,
+        )
+        self.frame_index += 1
+        return frame
 
 
-def build_source(source_type: str, camera_id: str, uri: str, replay_fps: float = 8.0) -> OpenCVSourceBase:
-    settings = SourceSettings(camera_id=camera_id, uri=uri, replay_fps=replay_fps)
+def build_source(
+    *,
+    source_type: str,
+    session_id: str,
+    camera_id: str,
+    camera_role: str,
+    uri: str,
+    session_start_global: float,
+    replay_fps: float = 8.0,
+    replay_offset_ms: float = 0.0,
+) -> OpenCVSourceBase:
+    settings = SourceSettings(
+        session_id=session_id,
+        camera_id=camera_id,
+        camera_role=camera_role,
+        uri=uri,
+        session_start_global=session_start_global,
+        replay_fps=replay_fps,
+        replay_offset_ms=replay_offset_ms,
+    )
     normalized = source_type.upper()
     if normalized == SourceType.REPLAY.value:
         return ReplaySource(settings)

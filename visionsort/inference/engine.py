@@ -97,6 +97,8 @@ class SharedInferenceEngine:
         self.config = config
         self.backend: DemoDetectionBackend | UltralyticsBackend | None = None
         self.backend_info: dict[str, Any] = {}
+        self.model_id: str | None = None
+        self.model_version: str | None = None
 
     def load_model(self, model_id: str, source_map: dict[str, dict[str, Any]]) -> None:
         row = self.db.fetch_one("SELECT * FROM model_registry WHERE id = ?", (model_id,))
@@ -117,12 +119,18 @@ class SharedInferenceEngine:
             )
         else:
             raise RuntimeError(f"Backend de modèle non supporté: {backend}")
-        self.backend_info = {"model_id": model_id, "backend": backend, "loaded_at": time.time()}
+        self.model_id = model_id
+        self.model_version = row["weights_path"] or model_id
+        self.backend_info = {"model_id": model_id, "backend": backend, "model_version": self.model_version, "loaded_at": time.time()}
 
     def predict(self, camera_id: str, frame_index: int, image: np.ndarray) -> list[Observation]:
         if self.backend is None:
             return []
-        return self.backend.predict(camera_id, frame_index, image)
+        output = self.backend.predict(camera_id, frame_index, image)
+        for obs in output:
+            obs.model_id = self.model_id
+            obs.model_version = self.model_version
+        return output
 
 
 def inference_worker_loop(
@@ -156,9 +164,12 @@ def inference_worker_loop(
                 result_queue.put(
                     {
                         "kind": "INFER_RESULT",
+                        "session_id": message["session_id"],
                         "camera_id": message["camera_id"],
+                        "camera_role": message.get("camera_role"),
                         "frame_index": message["frame_index"],
-                        "timestamp": message["timestamp"],
+                        "timestamp_local": message["timestamp_local"],
+                        "timestamp_global": message["timestamp_global"],
                         "observations": [obs.__dict__ for obs in engine.predict(message["camera_id"], message["frame_index"], message["image"])],
                     }
                 )
@@ -166,6 +177,7 @@ def inference_worker_loop(
                 result_queue.put(
                     {
                         "kind": "INFER_ERROR",
+                        "session_id": message.get("session_id"),
                         "camera_id": message["camera_id"],
                         "frame_index": message["frame_index"],
                         "error": str(exc),

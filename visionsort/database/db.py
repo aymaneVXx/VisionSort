@@ -104,7 +104,7 @@ class VisionSortDB:
         conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("PRAGMA foreign_keys=ON")
         try:
             yield conn
             conn.commit()
@@ -124,6 +124,32 @@ class VisionSortDB:
                     model_id TEXT NOT NULL,
                     tracker_id TEXT NOT NULL,
                     enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS capture_sessions (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    pipeline_state TEXT NOT NULL DEFAULT 'CAPTURED',
+                    demo_mode INTEGER NOT NULL DEFAULT 0,
+                    site_validated INTEGER NOT NULL DEFAULT 0,
+                    config_json TEXT NOT NULL DEFAULT '{}',
+                    report_path TEXT,
+                    last_dataset_id TEXT,
+                    last_training_job_id TEXT,
+                    last_candidate_model_id TEXT,
+                    started_at REAL,
+                    ended_at REAL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS capture_session_sources (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    camera_role TEXT NOT NULL,
+                    time_offset_ms REAL NOT NULL DEFAULT 0,
+                    replay_fps REAL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -158,6 +184,9 @@ class VisionSortDB:
                     status TEXT NOT NULL,
                     is_active INTEGER NOT NULL DEFAULT 0,
                     notes_json TEXT NOT NULL DEFAULT '{}',
+                    metrics_json TEXT NOT NULL DEFAULT '{}',
+                    parent_model_id TEXT,
+                    created_from_job_id TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -176,22 +205,35 @@ class VisionSortDB:
                     camera_id TEXT,
                     severity TEXT NOT NULL DEFAULT 'info',
                     payload_json TEXT NOT NULL,
+                    session_id TEXT,
+                    source_id TEXT,
+                    frame_index INTEGER,
+                    timestamp_global REAL,
+                    model_id TEXT,
+                    tracker_id TEXT,
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS tracklets (
                     tracklet_id TEXT PRIMARY KEY,
                     parcel_id TEXT,
+                    session_id TEXT,
+                    source_id TEXT,
                     camera_id TEXT NOT NULL,
+                    camera_role TEXT,
                     local_track_id INTEGER NOT NULL,
-                    started_at REAL NOT NULL,
-                    ended_at REAL NOT NULL,
+                    started_at_local REAL,
+                    ended_at_local REAL,
+                    started_at_global REAL NOT NULL,
+                    ended_at_global REAL NOT NULL,
                     class_name TEXT NOT NULL,
                     last_zone_id TEXT,
                     frame_count INTEGER NOT NULL,
                     avg_speed REAL NOT NULL,
                     observation_path TEXT NOT NULL,
                     summary_json TEXT NOT NULL,
-                    match_result TEXT NOT NULL DEFAULT 'UNMATCHED'
+                    match_result TEXT NOT NULL DEFAULT 'UNMATCHED',
+                    model_id TEXT,
+                    tracker_id TEXT
                 );
                 CREATE TABLE IF NOT EXISTS global_parcels (
                     parcel_id TEXT PRIMARY KEY,
@@ -208,6 +250,7 @@ class VisionSortDB:
                 CREATE TABLE IF NOT EXISTS recordings (
                     id TEXT PRIMARY KEY,
                     source_id TEXT NOT NULL,
+                    session_id TEXT,
                     segment_path TEXT NOT NULL,
                     started_at REAL NOT NULL,
                     ended_at REAL NOT NULL,
@@ -229,6 +272,13 @@ class VisionSortDB:
                 CREATE TABLE IF NOT EXISTS dataset_items (
                     id TEXT PRIMARY KEY,
                     dataset_id TEXT NOT NULL,
+                    session_id TEXT,
+                    sample_group_id TEXT,
+                    split TEXT,
+                    source_id TEXT,
+                    camera_role TEXT,
+                    frame_index INTEGER,
+                    timestamp_global REAL,
                     image_path TEXT NOT NULL,
                     label_path TEXT,
                     annotation_status TEXT NOT NULL,
@@ -236,6 +286,20 @@ class VisionSortDB:
                     score REAL NOT NULL,
                     metadata_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS pipeline_step_runs (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    step TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    inputs_json TEXT NOT NULL DEFAULT '{}',
+                    outputs_json TEXT NOT NULL DEFAULT '{}',
+                    error_text TEXT,
+                    log_path TEXT,
+                    started_at REAL,
+                    ended_at REAL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS training_jobs (
                     id TEXT PRIMARY KEY,
@@ -267,15 +331,17 @@ class VisionSortDB:
                 CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at);
                 CREATE INDEX IF NOT EXISTS idx_commands_status ON commands(status);
                 CREATE INDEX IF NOT EXISTS idx_tracklets_camera ON tracklets(camera_id, local_track_id);
+                CREATE INDEX IF NOT EXISTS idx_pipeline_steps_session ON pipeline_step_runs(session_id, step, created_at);
                 """
             )
+            self._migrate(conn)
             now = utc_now()
             for model in DEFAULT_MODELS:
                 conn.execute(
                     """
                     INSERT OR IGNORE INTO model_registry
-                    (id, name, task, backend, weights_path, status, is_active, notes_json, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, name, task, backend, weights_path, status, is_active, notes_json, metrics_json, parent_model_id, created_from_job_id, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}', NULL, NULL, ?, ?)
                     """,
                     (
                         model["id"],
@@ -310,6 +376,73 @@ class VisionSortDB:
                 "INSERT OR IGNORE INTO site_config (id, config_json, updated_at) VALUES ('default', '{}', ?)",
                 (now,),
             )
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+
+        def has_column(table: str, column: str) -> bool:
+            rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+            return any(r[1] == column for r in rows)
+
+        def add_column(table: str, definition: str) -> None:
+            name = definition.strip().split()[0]
+            if has_column(table, name):
+                return
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+
+        if version < 1:
+            add_column("events", "session_id TEXT")
+            add_column("events", "source_id TEXT")
+            add_column("events", "frame_index INTEGER")
+            add_column("events", "timestamp_global REAL")
+            add_column("events", "model_id TEXT")
+            add_column("events", "tracker_id TEXT")
+            add_column("recordings", "session_id TEXT")
+            add_column("tracklets", "session_id TEXT")
+            add_column("tracklets", "source_id TEXT")
+            add_column("tracklets", "camera_role TEXT")
+            add_column("tracklets", "started_at_local REAL")
+            add_column("tracklets", "ended_at_local REAL")
+            add_column("tracklets", "started_at_global REAL")
+            add_column("tracklets", "ended_at_global REAL")
+            add_column("tracklets", "model_id TEXT")
+            add_column("tracklets", "tracker_id TEXT")
+            conn.execute("PRAGMA user_version = 1")
+
+        if version < 2:
+            add_column("capture_sessions", "last_dataset_id TEXT")
+            add_column("capture_sessions", "last_training_job_id TEXT")
+            add_column("capture_sessions", "last_candidate_model_id TEXT")
+            add_column("model_registry", "metrics_json TEXT NOT NULL DEFAULT '{}'")
+            add_column("model_registry", "parent_model_id TEXT")
+            add_column("model_registry", "created_from_job_id TEXT")
+            add_column("dataset_items", "session_id TEXT")
+            add_column("dataset_items", "sample_group_id TEXT")
+            add_column("dataset_items", "split TEXT")
+            add_column("dataset_items", "source_id TEXT")
+            add_column("dataset_items", "camera_role TEXT")
+            add_column("dataset_items", "frame_index INTEGER")
+            add_column("dataset_items", "timestamp_global REAL")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pipeline_step_runs (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    step TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    inputs_json TEXT NOT NULL DEFAULT '{}',
+                    outputs_json TEXT NOT NULL DEFAULT '{}',
+                    error_text TEXT,
+                    log_path TEXT,
+                    started_at REAL,
+                    ended_at REAL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_pipeline_steps_session ON pipeline_step_runs(session_id, step, created_at)")
+            conn.execute("PRAGMA user_version = 2")
 
     def fetch_all(self, query: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
         with self.connect() as conn:

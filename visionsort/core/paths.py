@@ -10,6 +10,8 @@ DEMO_DIR = DATA_DIR / "demo"
 RUNTIME_DIR = DATA_DIR / "runtime"
 PREVIEWS_DIR = RUNTIME_DIR / "previews"
 DETAILS_DIR = RUNTIME_DIR / "details"
+OBSERVATIONS_DIR = RUNTIME_DIR / "observations"
+REPORTS_DIR = RUNTIME_DIR / "reports"
 RECORDINGS_DIR = DATA_DIR / "recordings"
 DATASETS_DIR = DATA_DIR / "datasets"
 MODELS_DIR = DATA_DIR / "models"
@@ -25,6 +27,8 @@ def ensure_project_dirs() -> None:
         RUNTIME_DIR,
         PREVIEWS_DIR,
         DETAILS_DIR,
+        OBSERVATIONS_DIR,
+        REPORTS_DIR,
         RECORDINGS_DIR,
         DATASETS_DIR,
         MODELS_DIR,

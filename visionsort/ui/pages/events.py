@@ -16,5 +16,14 @@ def render(context: UIContext) -> None:
         st.info("Aucun événement.")
         return
     df = pd.DataFrame(events)
-    df["payload_json"] = df["payload_json"].apply(lambda value: json.dumps(json.loads(value), ensure_ascii=False)[:250])
-    st.dataframe(df, use_container_width=True)
+    event_types = sorted(df["event_type"].dropna().unique().tolist()) if "event_type" in df else []
+    selected_type = st.selectbox("Filtrer par type", ["Tous"] + event_types, index=0)
+    if selected_type != "Tous":
+        df = df[df["event_type"] == selected_type]
+    df["payload_preview"] = df["payload_json"].apply(lambda value: json.dumps(json.loads(value), ensure_ascii=False)[:250])
+    st.dataframe(df.drop(columns=["payload_json"]), use_container_width=True)
+    if not df.empty:
+        options = {f"{row['event_type']} | {row['created_at']}": row for _, row in df.iterrows()}
+        selected = st.selectbox("Voir un payload complet", list(options), index=0)
+        if selected:
+            st.code(json.dumps(json.loads(options[selected]["payload_json"]), ensure_ascii=False, indent=2), language="json")

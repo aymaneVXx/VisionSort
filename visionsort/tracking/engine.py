@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from visionsort.core.config import relative_to_root
 from visionsort.core.enums import MatchResult, ParcelState
 from visionsort.core.paths import DETAILS_DIR
 from visionsort.core.types import GlobalParcel, HandoffCandidate, Observation, TrackObservation, Tracklet
@@ -36,12 +37,24 @@ def box_area(box: tuple[float, float, float, float]) -> float:
     return abs((x2 - x1) * (y2 - y1))
 
 
-def zone_for_bbox(box: tuple[float, float, float, float], zones: list[dict[str, Any]] | None) -> str | None:
+def zone_for_bbox(
+    box: tuple[float, float, float, float],
+    zones: list[dict[str, Any]] | None,
+    *,
+    image_size: tuple[int, int] | None = None,
+) -> str | None:
     if not zones:
         return None
     cx, cy = bbox_center(box)
+    iw = ih = None
+    if image_size is not None:
+        iw, ih = int(image_size[0]), int(image_size[1])
     for zone in zones:
-        if zone["x1"] <= cx <= zone["x2"] and zone["y1"] <= cy <= zone["y2"]:
+        x1, y1, x2, y2 = float(zone["x1"]), float(zone["y1"]), float(zone["x2"]), float(zone["y2"])
+        if iw and ih and max(x1, y1, x2, y2) <= 1.5:
+            x1, x2 = x1 * iw, x2 * iw
+            y1, y2 = y1 * ih, y2 * ih
+        if x1 <= cx <= x2 and y1 <= cy <= y2:
             return zone["zone_id"]
     return None
 
@@ -58,14 +71,36 @@ class _LiveTrack:
 
 
 class GreedyIOUTracker:
-    def __init__(self, camera_id: str, zones: list[dict[str, Any]] | None = None, max_misses: int = 6):
+    def __init__(
+        self,
+        *,
+        session_id: str,
+        source_id: str,
+        camera_id: str,
+        camera_role: str,
+        tracker_id: str,
+        zones: list[dict[str, Any]] | None = None,
+        max_misses: int = 6,
+    ):
+        self.session_id = session_id
+        self.source_id = source_id
         self.camera_id = camera_id
+        self.camera_role = camera_role
+        self.tracker_id = tracker_id
         self.zones = zones or []
         self.max_misses = max_misses
         self.next_track_id = 1
         self.live_tracks: dict[int, _LiveTrack] = {}
 
-    def update(self, frame_index: int, timestamp: float, observations: list[Observation]) -> tuple[list[TrackObservation], list[Tracklet]]:
+    def update(
+        self,
+        *,
+        frame_index: int,
+        timestamp_local: float,
+        timestamp_global: float,
+        image_size: tuple[int, int] | None = None,
+        observations: list[Observation],
+    ) -> tuple[list[TrackObservation], list[Tracklet]]:
         produced: list[TrackObservation] = []
         finalized: list[Tracklet] = []
         unmatched_track_ids = set(self.live_tracks)
@@ -85,22 +120,28 @@ class GreedyIOUTracker:
             live = self.live_tracks[track_id]
             prev_cx, prev_cy = bbox_center(live.last_bbox)
             cx, cy = bbox_center(obs.bbox)
-            dt = max(timestamp - live.last_timestamp, 1e-3)
+            dt = max(timestamp_global - live.last_timestamp, 1e-3)
             track_obs = TrackObservation(
+                session_id=self.session_id,
+                source_id=self.source_id,
                 camera_id=self.camera_id,
+                camera_role=self.camera_role,
                 local_track_id=track_id,
                 frame_index=frame_index,
-                timestamp=timestamp,
+                timestamp_local=timestamp_local,
+                timestamp_global=timestamp_global,
                 class_name=obs.class_name,
                 confidence=obs.confidence,
                 bbox=obs.bbox,
                 velocity=((cx - prev_cx) / dt, (cy - prev_cy) / dt),
-                zone_id=zone_for_bbox(obs.bbox, self.zones),
+                zone_id=zone_for_bbox(obs.bbox, self.zones, image_size=image_size),
                 appearance_hint=obs.embedding,
-                extra=obs.attributes,
+                model_id=obs.model_id,
+                tracker_id=self.tracker_id,
+                extra={**obs.attributes, "_image_w": image_size[0], "_image_h": image_size[1]} if image_size else obs.attributes,
             )
             live.last_bbox = obs.bbox
-            live.last_timestamp = timestamp
+            live.last_timestamp = timestamp_global
             live.last_frame_index = frame_index
             live.history.append(track_obs)
             live.misses = 0
@@ -114,23 +155,29 @@ class GreedyIOUTracker:
             track_id = self.next_track_id
             self.next_track_id += 1
             track_obs = TrackObservation(
+                session_id=self.session_id,
+                source_id=self.source_id,
                 camera_id=self.camera_id,
+                camera_role=self.camera_role,
                 local_track_id=track_id,
                 frame_index=frame_index,
-                timestamp=timestamp,
+                timestamp_local=timestamp_local,
+                timestamp_global=timestamp_global,
                 class_name=obs.class_name,
                 confidence=obs.confidence,
                 bbox=obs.bbox,
                 velocity=(0.0, 0.0),
-                zone_id=zone_for_bbox(obs.bbox, self.zones),
+                zone_id=zone_for_bbox(obs.bbox, self.zones, image_size=image_size),
                 appearance_hint=obs.embedding,
-                extra=obs.attributes,
+                model_id=obs.model_id,
+                tracker_id=self.tracker_id,
+                extra={**obs.attributes, "_image_w": image_size[0], "_image_h": image_size[1]} if image_size else obs.attributes,
             )
             self.live_tracks[track_id] = _LiveTrack(
                 local_track_id=track_id,
                 class_name=obs.class_name,
                 last_bbox=obs.bbox,
-                last_timestamp=timestamp,
+                last_timestamp=timestamp_global,
                 last_frame_index=frame_index,
                 history=[track_obs],
             )
@@ -154,34 +201,276 @@ class GreedyIOUTracker:
 
     def _finalize(self, track_id: int) -> Tracklet:
         live = self.live_tracks.pop(track_id)
-        tracklet_id = f"{self.camera_id}-{track_id}-{int(live.history[0].timestamp * 1000)}"
+        DETAILS_DIR.mkdir(parents=True, exist_ok=True)
+        tracklet_id = f"{self.session_id}-{self.camera_id}-{track_id}-{int(live.history[0].timestamp_global * 1000)}"
         details_path = DETAILS_DIR / f"{tracklet_id}.jsonl"
         lines = [json.dumps(item.to_json()) for item in live.history]
         details_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
         speeds = [math.sqrt(item.velocity[0] ** 2 + item.velocity[1] ** 2) for item in live.history]
         return Tracklet(
             tracklet_id=tracklet_id,
+            session_id=self.session_id,
+            source_id=self.source_id,
             camera_id=self.camera_id,
+            camera_role=self.camera_role,
             local_track_id=track_id,
-            started_at=live.history[0].timestamp,
-            ended_at=live.history[-1].timestamp,
+            started_at_local=live.history[0].timestamp_local,
+            ended_at_local=live.history[-1].timestamp_local,
+            started_at_global=live.history[0].timestamp_global,
+            ended_at_global=live.history[-1].timestamp_global,
             class_name=live.class_name,
             first_bbox=live.history[0].bbox,
             last_bbox=live.history[-1].bbox,
             avg_speed=sum(speeds) / max(len(speeds), 1),
             last_zone_id=live.history[-1].zone_id,
             frame_count=len(live.history),
-            observation_path=str(details_path),
+            observation_path=relative_to_root(details_path),
             summary_json={
                 "start_frame": live.history[0].frame_index,
                 "end_frame": live.history[-1].frame_index,
-                "duration_s": live.history[-1].timestamp - live.history[0].timestamp,
+                "duration_s": live.history[-1].timestamp_global - live.history[0].timestamp_global,
                 "first_bbox": live.history[0].bbox,
                 "last_bbox": live.history[-1].bbox,
                 "parcel_hint": live.history[-1].extra.get("parcel_hint") or live.history[0].extra.get("parcel_hint"),
                 "validated_on_site": False,
             },
+            model_id=live.history[-1].model_id,
+            tracker_id=self.tracker_id,
         )
+
+
+class ByteTrackTracker(GreedyIOUTracker):
+    def __init__(
+        self,
+        *,
+        session_id: str,
+        source_id: str,
+        camera_id: str,
+        camera_role: str,
+        tracker_id: str,
+        zones: list[dict[str, Any]] | None = None,
+        max_misses: int = 12,
+        high_th: float = 0.60,
+        low_th: float = 0.10,
+    ):
+        super().__init__(
+            session_id=session_id,
+            source_id=source_id,
+            camera_id=camera_id,
+            camera_role=camera_role,
+            tracker_id=tracker_id,
+            zones=zones,
+            max_misses=max_misses,
+        )
+        self.high_th = high_th
+        self.low_th = low_th
+
+    def update(
+        self,
+        *,
+        frame_index: int,
+        timestamp_local: float,
+        timestamp_global: float,
+        image_size: tuple[int, int] | None = None,
+        observations: list[Observation],
+    ) -> tuple[list[TrackObservation], list[Tracklet]]:
+        high = [obs for obs in observations if float(obs.confidence) >= self.high_th]
+        low = [obs for obs in observations if self.low_th <= float(obs.confidence) < self.high_th]
+        produced: list[TrackObservation] = []
+        finalized: list[Tracklet] = []
+
+        produced_high, finalized_high = super().update(
+            frame_index=frame_index,
+            timestamp_local=timestamp_local,
+            timestamp_global=timestamp_global,
+            image_size=image_size,
+            observations=high,
+        )
+        produced.extend(produced_high)
+        finalized.extend(finalized_high)
+
+        if not low or not self.live_tracks:
+            return produced, finalized
+
+        unmatched_track_ids = set(self.live_tracks)
+        matched_obs: set[int] = set()
+        candidates: list[tuple[float, int, int]] = []
+        for track_id, track in self.live_tracks.items():
+            for obs_index, obs in enumerate(low):
+                if obs.class_name != track.class_name:
+                    continue
+                candidates.append((bbox_iou(track.last_bbox, obs.bbox), track_id, obs_index))
+
+        for score, track_id, obs_index in sorted(candidates, reverse=True):
+            if score < 0.15 or obs_index in matched_obs or track_id not in unmatched_track_ids:
+                continue
+            obs = low[obs_index]
+            live = self.live_tracks[track_id]
+            prev_cx, prev_cy = bbox_center(live.last_bbox)
+            cx, cy = bbox_center(obs.bbox)
+            dt = max(timestamp_global - live.last_timestamp, 1e-3)
+            track_obs = TrackObservation(
+                session_id=self.session_id,
+                source_id=self.source_id,
+                camera_id=self.camera_id,
+                camera_role=self.camera_role,
+                local_track_id=track_id,
+                frame_index=frame_index,
+                timestamp_local=timestamp_local,
+                timestamp_global=timestamp_global,
+                class_name=obs.class_name,
+                confidence=obs.confidence,
+                bbox=obs.bbox,
+                velocity=((cx - prev_cx) / dt, (cy - prev_cy) / dt),
+                zone_id=zone_for_bbox(obs.bbox, self.zones, image_size=image_size),
+                appearance_hint=obs.embedding,
+                model_id=obs.model_id,
+                tracker_id=self.tracker_id,
+                extra={**obs.attributes, "_image_w": image_size[0], "_image_h": image_size[1]} if image_size else obs.attributes,
+            )
+            live.last_bbox = obs.bbox
+            live.last_timestamp = timestamp_global
+            live.last_frame_index = frame_index
+            live.history.append(track_obs)
+            live.misses = 0
+            matched_obs.add(obs_index)
+            unmatched_track_ids.remove(track_id)
+            produced.append(track_obs)
+
+        for track_id in unmatched_track_ids:
+            self.live_tracks[track_id].misses += 1
+            if self.live_tracks[track_id].misses >= self.max_misses:
+                finalized.append(self._finalize(track_id))
+
+        return produced, finalized
+
+
+class BoTSORTTracker(ByteTrackTracker):
+    def update(
+        self,
+        *,
+        frame_index: int,
+        timestamp_local: float,
+        timestamp_global: float,
+        image_size: tuple[int, int] | None = None,
+        observations: list[Observation],
+    ) -> tuple[list[TrackObservation], list[Tracklet]]:
+        high = [obs for obs in observations if float(obs.confidence) >= self.high_th]
+        low = [obs for obs in observations if self.low_th <= float(obs.confidence) < self.high_th]
+        produced: list[TrackObservation] = []
+        finalized: list[Tracklet] = []
+
+        produced_high, finalized_high = super(ByteTrackTracker, self).update(
+            frame_index=frame_index,
+            timestamp_local=timestamp_local,
+            timestamp_global=timestamp_global,
+            image_size=image_size,
+            observations=high,
+        )
+        produced.extend(produced_high)
+        finalized.extend(finalized_high)
+
+        if not low or not self.live_tracks:
+            return produced, finalized
+
+        unmatched_track_ids = set(self.live_tracks)
+        matched_obs: set[int] = set()
+        candidates: list[tuple[float, int, int]] = []
+
+        for track_id, track in self.live_tracks.items():
+            last_vx = last_vy = 0.0
+            if track.history:
+                last_vx, last_vy = track.history[-1].velocity
+            dt = max(timestamp_global - track.last_timestamp, 0.0)
+            dx, dy = last_vx * dt, last_vy * dt
+            x1, y1, x2, y2 = track.last_bbox
+            pred_bbox = (x1 + dx, y1 + dy, x2 + dx, y2 + dy)
+            for obs_index, obs in enumerate(low):
+                if obs.class_name != track.class_name:
+                    continue
+                candidates.append((bbox_iou(pred_bbox, obs.bbox), track_id, obs_index))
+
+        for score, track_id, obs_index in sorted(candidates, reverse=True):
+            if score < 0.12 or obs_index in matched_obs or track_id not in unmatched_track_ids:
+                continue
+            obs = low[obs_index]
+            live = self.live_tracks[track_id]
+            prev_cx, prev_cy = bbox_center(live.last_bbox)
+            cx, cy = bbox_center(obs.bbox)
+            dt = max(timestamp_global - live.last_timestamp, 1e-3)
+            track_obs = TrackObservation(
+                session_id=self.session_id,
+                source_id=self.source_id,
+                camera_id=self.camera_id,
+                camera_role=self.camera_role,
+                local_track_id=track_id,
+                frame_index=frame_index,
+                timestamp_local=timestamp_local,
+                timestamp_global=timestamp_global,
+                class_name=obs.class_name,
+                confidence=obs.confidence,
+                bbox=obs.bbox,
+                velocity=((cx - prev_cx) / dt, (cy - prev_cy) / dt),
+                zone_id=zone_for_bbox(obs.bbox, self.zones, image_size=image_size),
+                appearance_hint=obs.embedding,
+                model_id=obs.model_id,
+                tracker_id=self.tracker_id,
+                extra={**obs.attributes, "_image_w": image_size[0], "_image_h": image_size[1]} if image_size else obs.attributes,
+            )
+            live.last_bbox = obs.bbox
+            live.last_timestamp = timestamp_global
+            live.last_frame_index = frame_index
+            live.history.append(track_obs)
+            live.misses = 0
+            matched_obs.add(obs_index)
+            unmatched_track_ids.remove(track_id)
+            produced.append(track_obs)
+
+        for track_id in unmatched_track_ids:
+            self.live_tracks[track_id].misses += 1
+            if self.live_tracks[track_id].misses >= self.max_misses:
+                finalized.append(self._finalize(track_id))
+
+        return produced, finalized
+
+
+def build_tracker(
+    *,
+    tracker_id: str,
+    session_id: str,
+    source_id: str,
+    camera_id: str,
+    camera_role: str,
+    zones: list[dict[str, Any]] | None,
+) -> GreedyIOUTracker:
+    if tracker_id == "greedy_iou":
+        return GreedyIOUTracker(
+            session_id=session_id,
+            source_id=source_id,
+            camera_id=camera_id,
+            camera_role=camera_role,
+            tracker_id=tracker_id,
+            zones=zones,
+        )
+    if tracker_id == "bytetrack_cpu":
+        return ByteTrackTracker(
+            session_id=session_id,
+            source_id=source_id,
+            camera_id=camera_id,
+            camera_role=camera_role,
+            tracker_id=tracker_id,
+            zones=zones,
+        )
+    if tracker_id == "botsort_cpu":
+        return BoTSORTTracker(
+            session_id=session_id,
+            source_id=source_id,
+            camera_id=camera_id,
+            camera_role=camera_role,
+            tracker_id=tracker_id,
+            zones=zones,
+        )
+    raise RuntimeError(f"Tracker non supporté: {tracker_id}")
 
 
 class TrackletBuilder:
@@ -206,14 +495,14 @@ class GlobalParcelTracker:
         self.tracklet_to_parcel: dict[str, str] = {}
 
     def process_tracklet(self, tracklet: Tracklet) -> tuple[str, MatchResult, list[str], HandoffCandidate | None]:
-        role = self.source_roles.get(tracklet.camera_id, tracklet.camera_id)
+        role = tracklet.camera_role or self.source_roles.get(tracklet.camera_id, tracklet.camera_id)
         candidates: list[HandoffCandidate] = []
         for parcel in self.parcels.values():
             prev_role = self.source_roles.get(parcel.last_camera_id, parcel.last_camera_id)
             edge = self._find_edge(prev_role, role)
             if edge is None:
                 continue
-            dt = tracklet.started_at - parcel.last_seen_at
+            dt = tracklet.started_at_global - parcel.last_seen_at
             if dt < edge["min_transit_s"] or dt > edge["max_transit_s"]:
                 continue
             size_prev = box_area(tracklet.first_bbox)
@@ -238,8 +527,8 @@ class GlobalParcelTracker:
                 parcel_id=parcel_id,
                 state=ParcelState.ON_CONVEYOR,
                 last_camera_id=tracklet.camera_id,
-                first_seen_at=tracklet.started_at,
-                last_seen_at=tracklet.ended_at,
+                first_seen_at=tracklet.started_at_global,
+                last_seen_at=tracklet.ended_at_global,
                 current_tracklet_id=tracklet.tracklet_id,
                 appearance_signature=None,
             )
@@ -256,7 +545,7 @@ class GlobalParcelTracker:
         parcel_id = self.tracklet_to_parcel[best.from_tracklet_id]
         parcel = self.parcels[parcel_id]
         parcel.last_camera_id = tracklet.camera_id
-        parcel.last_seen_at = tracklet.ended_at
+        parcel.last_seen_at = tracklet.ended_at_global
         parcel.current_tracklet_id = tracklet.tracklet_id
         self.tracklet_to_parcel[tracklet.tracklet_id] = parcel_id
         return parcel_id, MatchResult.MATCHED, best.reasons, best
