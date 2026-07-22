@@ -1,35 +1,46 @@
 # VisionSort
 
-VisionSort est une application locale Python + Streamlit pour piloter un pipeline multicaméra de suivi de colis, handoff entre caméras, détection de prise/dépôt, génération de datasets et déclenchement d'entraînements.
+VisionSort est une plateforme locale Python + Streamlit pour piloter un cycle complet Replay/vision industrielle autour du suivi de colis:
 
-## Principes d'architecture
+- configuration de `CaptureSession` C1/C2/C3
+- acquisition et enregistrement
+- inférence par modèle sélectionnable
+- tracking local et association multicaméra
+- génération de datasets
+- pseudo-annotation et review
+- entraînement, évaluation, promotion et rollback de modèles
 
-- Streamlit n'exécute aucun traitement long: il écrit uniquement des commandes dans SQLite et lit les statuts.
-- `python -m visionsort.runtime.supervisor` est l'unique orchestrateur des processus.
-- Les images, previews, vidéos enregistrées et détails frame-level sont stockés sur disque.
-- SQLite stocke les états, commandes, événements, tracklets, jobs, modèles, trackers et métadonnées.
-- Les détails d'observation sont stockés en JSONL.
-- L'inférence passe par un worker GPU partagé, avec un modèle chargé une seule fois pour toutes les caméras actives.
+## Architecture
+
+- Streamlit ne lance aucun traitement persistant: il écrit des commandes dans SQLite et lit les états.
+- `python -m visionsort.runtime.supervisor` est l’orchestrateur unique des workers et jobs.
+- SQLite stocke uniquement commandes, sessions, états, jobs, événements, tracklets, datasets, modèles et trackers.
+- Les images, previews, enregistrements, observations détaillées et rapports restent sur disque.
+- Les observations détaillées sont stockées en `JSONL`, avec export `Parquet` possible via un step pipeline dédié.
+- L’inférence est conçue autour d’un worker partagé par modèle sélectionné.
 - Chaque caméra conserve son tracker local indépendant.
-- Le mode simulé n'est autorisé que si `DEMO_MODE=1`.
+- Le mode simulé est explicite: aucun résultat démo ne doit être utilisé silencieusement hors `DEMO_MODE=1`.
 
-## Arborescence principale
+## Modules Principaux
 
-- `app.py` : interface Streamlit.
-- `visionsort/runtime/supervisor.py` : supervisor persistant.
-- `visionsort/acquisition/worker.py` : worker caméra.
-- `visionsort/inference/engine.py` : worker GPU partagé et backends.
-- `visionsort/tracking/engine.py` : tracker local, tracklets, tracking multicaméra.
-- `visionsort/events/engine.py` : logique prise/transport/dépôt.
-- `visionsort/datasets/pipeline.py` : création dataset YOLO.
-- `visionsort/training/pipeline.py` : jobs d'entraînement.
-- `scripts/init_project.py` : bootstrap DB et assets démo.
-- `config/default.yaml` : configuration d'exemple.
+- `app.py` : point d’entrée Streamlit
+- `visionsort/runtime/supervisor.py` : supervisor persistant et gestion des commandes
+- `visionsort/runtime/pipeline_worker.py` : steps pipeline (`PROCESS_SESSION`, `SAMPLE`, `AUTO_ANNOTATE`, `FINALIZE_DATASET`, `EXPORT_OBSERVATIONS_PARQUET`)
+- `visionsort/acquisition/worker.py` : boucle caméra/source, previews, enregistrement, observations JSONL
+- `visionsort/inference/engine.py` : backends de modèles et provenance modèle/version
+- `visionsort/tracking/engine.py` : trackers locaux, tracklets, matching multicaméra
+- `visionsort/events/engine.py` : événements métier prise/transport/dépôt
+- `visionsort/datasets/pipeline.py` : création dataset, split stable, déduplication, provenance
+- `visionsort/training/pipeline.py` : training, évaluation, candidat, rapport
+- `visionsort/deployment/registry.py` : activation, promotion, rejet, archivage, rollback
+- `visionsort/observations/export.py` : export `JSONL -> Parquet`
+- `visionsort/ui/pages/` : pages Dashboard, Cameras, Live Tracking, Recordings, Dataset Studio, Training, Models, Events, Settings
 
-## Pré-requis
+## Pré-Requis
 
-- Python 3.10+ dans cet environnement de travail.
-- Le projet a été écrit pour rester compatible avec Python 3.10, même si la cible demandée est Python 3.12.
+- Python `3.10+`
+- cible de projet demandée: `Python 3.12`
+- sur cet environnement, les commandes validées utilisent `python -m ...`
 
 ## Installation
 
@@ -40,70 +51,135 @@ python -m pip install -e .
 
 ## Initialisation
 
-Sans démo :
+Mode standard :
 
 ```powershell
 python scripts/init_project.py
 ```
 
-Avec démo Replay explicite :
+Mode Replay démo explicite :
 
 ```powershell
 $env:DEMO_MODE="1"
 python scripts/init_project.py
 ```
 
-## Lancement
+## Démarrer L’Application
 
-Terminal 1 :
+Ouvrir **2 terminaux** dans le dossier du projet.
+
+Terminal 1, supervisor :
 
 ```powershell
 $env:DEMO_MODE="1"
 python -m visionsort.runtime.supervisor
 ```
 
-Terminal 2 :
+Terminal 2, Streamlit :
 
 ```powershell
 $env:DEMO_MODE="1"
-streamlit run app.py
+python -m streamlit run app.py
 ```
 
-## Utilisation rapide en démo
+Ensuite ouvrir :
 
-1. Activer `DEMO_MODE=1`.
-2. Lancer `scripts/init_project.py`.
-3. Lancer le supervisor.
-4. Ouvrir Streamlit.
-5. Aller sur `Cameras`.
-6. Utiliser `Bootstrap démo` si nécessaire.
-7. Démarrer les sources `C1`, `C2`, `C3`.
-8. Visualiser les previews et les événements dans `Live Tracking` et `Events`.
-9. Activer l'enregistrement puis consulter `Recordings`.
-10. Générer un dataset depuis `Dataset Studio`.
-11. Lancer un entraînement depuis `Training`.
+- [http://localhost:8501](http://localhost:8501)
 
-## Ce qui est implémenté
+## Arrêter L’Application
 
-- Sources `Replay`, `VideoFileSource`, `RTSPSource`.
-- Supervisor de processus indépendant de Streamlit.
-- Worker GPU partagé avec chargement unique du modèle actif.
-- Trackers locaux indépendants par caméra.
-- Tracklets et suivi multicaméra prudents avec `MATCHED`, `AMBIGUOUS`, `UNMATCHED`.
-- Machine d'états colis avec `ON_CONVEYOR`, `PICK_CANDIDATE`, `PICKED`, `CARRIED`, `DROP_CANDIDATE`, `DROPPED`.
-- Génération d'un dataset YOLO à partir des tracklets Replay.
-- Registre modèles et trackers avec identifiants SQLite.
-- Entraînement séparé avec journalisation et gestion d'échec.
+Pour arrêter proprement :
 
-## Limites connues
+1. Dans Streamlit, arrêter d’abord les sessions/sources si elles tournent encore.
+2. Dans chaque terminal, appuyer sur `Ctrl+C`.
 
-- Les règles multicaméra, prise et dépôt sont testables en Replay mais restent non validées sur site sans données réelles.
-- Le backend `demo_synth_det` est réservé à `DEMO_MODE`.
-- Les modèles Ultralytics préentraînés peuvent nécessiter le téléchargement des poids au premier lancement.
-- Les wrappers ByteTrack et BoT-SORT sont enregistrés dans SQLite; leur exploitation réelle dépend de la disponibilité runtime Ultralytics dans l'environnement.
+Ordre recommandé :
+
+1. arrêter Streamlit avec `Ctrl+C`
+2. arrêter le supervisor avec `Ctrl+C`
+
+Si un worker caméra reste bloqué anormalement, relancer le supervisor puis arrêter la session depuis l’UI avant de quitter.
+
+## Workflow Replay Recommandé
+
+1. Activer `DEMO_MODE=1`
+2. Initialiser le projet
+3. Lancer le supervisor
+4. Lancer Streamlit
+5. Aller dans `Cameras`
+6. Enregistrer ou bootstrapper les sources Replay
+7. Créer une `CaptureSession` avec C1/C2/C3 et offsets si nécessaire
+8. Démarrer la session
+9. Consulter `Dashboard`, `Live Tracking`, `Events`, `Recordings`
+10. Arrêter la session
+11. Aller dans `Dataset Studio`
+12. Lancer `SAMPLE`
+13. Lancer `AUTO_ANNOTATE`
+14. Revoir les items `NEEDS_REVIEW`
+15. Lancer `FINALIZE_DATASET`
+16. Optionnel: lancer `EXPORT_OBSERVATIONS_PARQUET`
+17. Aller dans `Training`
+18. Lancer un entraînement
+19. Aller dans `Models`
+20. Comparer, promouvoir, activer ou rollbacker le modèle
+
+## Pipeline Runtime
+
+Le cycle persistant actuellement câblé autour des sessions/datasets couvre notamment :
+
+- `CAPTURED`
+- `PROCESSED`
+- `SAMPLED`
+- `AUTO_ANNOTATED`
+- `REVIEW_PENDING`
+- `DATASET_READY`
+- `TRAINING`
+- `EVALUATED`
+- `CANDIDATE`
+- `DEPLOYED`
+- `REJECTED`
+
+Des rapports JSON machine-readable sont produits dans `data/runtime/reports/`.
+
+## Fonctionnalités Opérationnelles
+
+- `CaptureSession` avec C1/C2/C3 et offsets Replay
+- sources `Replay`, `VideoFileSource`, `RTSPSource`
+- timestamps `local` et `global`
+- observations détaillées sur disque en `JSONL`
+- export `Parquet` via pipeline si dépendances disponibles
+- previews JPEG et enregistrements segmentés
+- tracking local par caméra
+- tracklets persistés
+- matching multicam `MATCHED / AMBIGUOUS / UNMATCHED`
+- événements prise/transport/dépôt en logique Replay
+- génération de datasets YOLO depuis tracklets
+- split stable et déduplication basique d’images
+- pseudo-annotation et review `NEEDS_REVIEW`
+- training hors Streamlit
+- évaluation post-training
+- registre modèles avec `CANDIDATE / CHAMPION / REJECTED / ARCHIVED`
+- activation, promotion et rollback
+
+## Limites Connues
+
+- Les règles multicaméra, prise et dépôt sont testables en Replay mais non validées sur site.
+- Le backend `demo_synth_det` reste réservé à `DEMO_MODE`.
+- Les modèles Ultralytics peuvent nécessiter le téléchargement des poids au premier lancement.
+- ByteTrack et BoT-SORT sont explicitement limités par l’environnement runtime disponible.
+- L’export Parquet dépend de `pandas` + `pyarrow`.
+- La validation RTSP réelle, la calibration géométrique et les réglages métier nécessitent encore les vraies caméras.
 
 ## Tests
 
+Exécution complète validée récemment :
+
 ```powershell
-pytest
+python -m pytest tests/test_supervisor_stop_session.py tests/test_supervisor_commands.py tests/test_pipeline_guardrails.py tests/test_dataset_pipeline.py tests/test_pipeline_worker.py tests/test_training_pipeline.py tests/test_training_registry_cycle.py tests/test_model_registry.py tests/test_tracking_events.py tests/test_database.py
+```
+
+Run rapide :
+
+```powershell
+python -m pytest
 ```
