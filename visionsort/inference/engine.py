@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gc
+import hashlib
 import json
 import queue
 import time
@@ -10,6 +12,7 @@ from typing import Any
 import numpy as np
 
 from visionsort.core.config import AppConfig
+from visionsort.core.paths import ROOT_DIR
 from visionsort.core.types import Observation
 from visionsort.database.db import VisionSortDB
 
@@ -17,6 +20,48 @@ try:
     from ultralytics import YOLO
 except Exception:  # pragma: no cover - dépend de l'environnement
     YOLO = None
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def resolve_model_artifact(model_row: dict[str, Any]) -> tuple[Path, str]:
+    value = str(model_row.get("weights_path") or "")
+    if not value:
+        raise RuntimeError("Chemin de poids vide.")
+    path = Path(value)
+    if not path.is_absolute():
+        path = ROOT_DIR / path
+    path = path.resolve()
+    if not path.exists() or not path.is_file():
+        raise RuntimeError(f"Poids de modèle introuvables: {path}")
+    actual_hash = _sha256(path)
+    notes = json.loads(model_row.get("notes_json") or "{}")
+    metrics = json.loads(model_row.get("metrics_json") or "{}")
+    expected_hash = notes.get("artifact_sha256") or metrics.get(
+        "artifact_sha256"
+    )
+    if expected_hash and str(expected_hash) != actual_hash:
+        raise RuntimeError(
+            f"Hash du modèle invalide: attendu {expected_hash}, obtenu {actual_hash}."
+        )
+    return path, actual_hash
+
+
+def release_model_memory() -> None:
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 
 class DemoDetectionBackend:
@@ -51,10 +96,10 @@ class DemoDetectionBackend:
 
 
 class UltralyticsBackend:
-    def __init__(self, weights_path: str, device: str = "auto"):
+    def __init__(self, weights_path: Path, device: str = "auto"):
         if YOLO is None:
             raise RuntimeError("Ultralytics n'est pas disponible dans cet environnement.")
-        self.model = YOLO(weights_path)
+        self.model = YOLO(str(weights_path))
         self.device = device
 
     def predict(self, camera_id: str, frame_index: int, image: np.ndarray) -> list[Observation]:
@@ -101,28 +146,94 @@ class SharedInferenceEngine:
         self.model_id: str | None = None
         self.model_version: str | None = None
 
-    def load_model(self, model_id: str, source_map: dict[str, dict[str, Any]]) -> None:
-        row = self.db.fetch_one("SELECT * FROM model_registry WHERE id = ?", (model_id,))
-        if row is None:
+    def load_model(
+        self, model_id: str, source_map: dict[str, dict[str, Any]]
+    ) -> None:
+        started = time.perf_counter()
+        previous_model_id = self.model_id
+        self.backend = None
+        release_model_memory()
+        try:
+            backend, info = self._build_backend(model_id, source_map)
+        except Exception as exc:
+            rollback_error = None
+            if previous_model_id:
+                try:
+                    self.backend, previous_info = self._build_backend(
+                        previous_model_id, source_map
+                    )
+                    self.model_id = previous_model_id
+                    self.model_version = str(previous_info["model_version"])
+                    self.backend_info = {
+                        **previous_info,
+                        "rollback_after_failed_model_id": model_id,
+                        "reload_error": str(exc),
+                    }
+                except Exception as rollback_exc:  # pragma: no cover
+                    rollback_error = str(rollback_exc)
+                    self.backend = None
+                    self.model_id = None
+                    self.model_version = None
+            rollback_status = (
+                "ok" if previous_model_id and not rollback_error else "indisponible"
+            )
+            suffix = f" ({rollback_error})" if rollback_error else ""
+            raise RuntimeError(
+                f"Échec du rechargement {model_id}; "
+                f"rollback={rollback_status}{suffix}: {exc}"
+            ) from exc
+        self.backend = backend
+        self.model_id = model_id
+        self.model_version = str(info["model_version"])
+        self.backend_info = {
+            **info,
+            "loaded_at": time.time(),
+            "reload_duration_seconds": time.perf_counter() - started,
+            "previous_model_id": previous_model_id,
+        }
+
+    def _build_backend(
+        self, model_id: str, source_map: dict[str, dict[str, Any]]
+    ) -> tuple[DemoDetectionBackend | UltralyticsBackend, dict[str, Any]]:
+        raw_row = self.db.fetch_one(
+            "SELECT * FROM model_registry WHERE id = ?", (model_id,)
+        )
+        if raw_row is None:
             raise RuntimeError(f"Modèle introuvable: {model_id}")
-        backend = row["backend"]
+        row = dict(raw_row)
+        backend = str(row["backend"])
+        artifact_hash = None
+        resolved_path = None
         if backend == "demo":
             if not self.config.demo_mode:
-                raise RuntimeError("Le backend de démonstration exige DEMO_MODE=1.")
+                raise RuntimeError(
+                    "Le backend de démonstration exige DEMO_MODE=1."
+                )
             demo = DemoDetectionBackend()
             for camera_id, source in source_map.items():
                 demo.register_sidecar(camera_id, source["uri"])
-            self.backend = demo
+            built: DemoDetectionBackend | UltralyticsBackend = demo
+            if row.get("weights_path"):
+                resolved_path, artifact_hash = resolve_model_artifact(row)
         elif backend == "ultralytics":
-            self.backend = UltralyticsBackend(
-                weights_path=row["weights_path"],
+            resolved_path, artifact_hash = resolve_model_artifact(row)
+            built = UltralyticsBackend(
+                weights_path=resolved_path,
                 device=self.config.get("gpu", "device", default="auto"),
             )
         else:
             raise RuntimeError(f"Backend de modèle non supporté: {backend}")
-        self.model_id = model_id
-        self.model_version = row["weights_path"] or model_id
-        self.backend_info = {"model_id": model_id, "backend": backend, "model_version": self.model_version, "loaded_at": time.time()}
+        return built, {
+            "model_id": model_id,
+            "backend": backend,
+            "model_version": (
+                str(resolved_path) if resolved_path is not None else model_id
+            ),
+            "resolved_weights_path": (
+                str(resolved_path) if resolved_path is not None else None
+            ),
+            "artifact_sha256": artifact_hash,
+        }
 
     def predict(self, camera_id: str, frame_index: int, image: np.ndarray) -> list[Observation]:
         if self.backend is None:
@@ -156,10 +267,31 @@ def inference_worker_loop(
             source_map = message["source_map"]
         elif kind == "LOAD_MODEL":
             model_id = message["model_id"]
-            if model_id != loaded_model_id:
-                engine.load_model(model_id, source_map)
-                loaded_model_id = model_id
-            result_queue.put({"kind": "MODEL_READY", "model_id": model_id, "backend_info": engine.backend_info})
+            started = time.perf_counter()
+            try:
+                if model_id != loaded_model_id:
+                    engine.load_model(model_id, source_map)
+                    loaded_model_id = model_id
+                result_queue.put(
+                    {
+                        "kind": "MODEL_READY",
+                        "model_id": model_id,
+                        "backend_info": engine.backend_info,
+                        "duration_seconds": time.perf_counter() - started,
+                    }
+                )
+            except Exception as exc:
+                loaded_model_id = engine.model_id
+                result_queue.put(
+                    {
+                        "kind": "MODEL_LOAD_FAILED",
+                        "model_id": model_id,
+                        "active_model_id": engine.model_id,
+                        "error": str(exc),
+                        "duration_seconds": time.perf_counter() - started,
+                        "rollback_succeeded": engine.model_id is not None,
+                    }
+                )
         elif kind == "INFER":
             try:
                 result_queue.put(

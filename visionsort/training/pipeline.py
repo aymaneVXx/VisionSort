@@ -18,7 +18,7 @@ from visionsort.datasets.pipeline import (
     validate_dataset_splits,
     verify_dataset_fingerprint,
 )
-from visionsort.inference.engine import DemoDetectionBackend
+from visionsort.inference.engine import DemoDetectionBackend, resolve_model_artifact
 from visionsort.runtime.demo_assets import ensure_demo_assets
 
 try:
@@ -67,15 +67,20 @@ def _build_comparison(db: VisionSortDB, metrics: dict[str, Any]) -> dict[str, An
         "merge_rate",
         "fps",
     )
-    deltas = {
-        key: float(metrics.get(key, 0.0)) - float(baseline.get(key, 0.0))
-        for key in keys
-        if key in metrics or key in baseline
-    }
+    deltas: dict[str, float] = {}
+    unavailable: list[str] = []
+    for key in keys:
+        current = metrics.get(key)
+        previous = baseline.get(key)
+        if current is None or previous is None:
+            unavailable.append(key)
+            continue
+        deltas[key] = float(current) - float(previous)
     return {
         "against_model_id": active["id"],
         "deltas": deltas,
-        "status": "compared",
+        "unavailable": unavailable,
+        "status": "compared" if deltas else "unavailable",
     }
 
 
@@ -129,13 +134,17 @@ def _stage_immutable_artifact(
     return str(destination.relative_to(ROOT_DIR)), _sha256(destination)
 
 
-def _metrics_from_results(results: Any) -> dict[str, float]:
+def _metrics_from_results(results: Any) -> dict[str, float | None]:
     values = getattr(results, "results_dict", {}) or {}
+    keys = {
+        "precision": "metrics/precision(B)",
+        "recall": "metrics/recall(B)",
+        "mAP50": "metrics/mAP50(B)",
+        "mAP50_95": "metrics/mAP50-95(B)",
+    }
     return {
-        "precision": float(values.get("metrics/precision(B)", 0.0)),
-        "recall": float(values.get("metrics/recall(B)", 0.0)),
-        "mAP50": float(values.get("metrics/mAP50(B)", 0.0)),
-        "mAP50_95": float(values.get("metrics/mAP50-95(B)", 0.0)),
+        name: float(values[key]) if values.get(key) is not None else None
+        for name, key in keys.items()
     }
 
 
@@ -250,12 +259,26 @@ def _benchmark_replays(
         capture.release()
     duration = max(time.perf_counter() - started, 1e-9)
     return {
-        "status": "COMPLETED" if replay_paths else "SKIPPED",
-        "reason": None if replay_paths else "Aucune vidéo Replay figée configurée.",
+        "status": (
+            "COMPLETED" if replay_paths and total_frames else "UNAVAILABLE"
+        ),
+        "reason": (
+            None
+            if replay_paths and total_frames
+            else "Aucune vidéo Replay figée exploitable configurée."
+        ),
         "frames": total_frames,
-        "fps": total_frames / duration if total_frames else 0.0,
-        "count_accuracy": exact_counts / max(evaluated_frames, 1),
-        "merge_rate": merge_frames / max(evaluated_frames, 1),
+        "evaluated_ground_truth_frames": evaluated_frames,
+        "fps": total_frames / duration if total_frames else None,
+        "count_accuracy": (
+            exact_counts / evaluated_frames if evaluated_frames else None
+        ),
+        "merge_rate": (
+            merge_frames / evaluated_frames if evaluated_frames else None
+        ),
+        "count_metrics_status": (
+            "MEASURED" if evaluated_frames else "UNAVAILABLE"
+        ),
         "frozen": bool(replay_paths),
         "fixture_sha256": fingerprint.hexdigest() if replay_paths else None,
         "validated_on_site": False,
@@ -272,19 +295,23 @@ def _promotion_eligible(
     if not frozen_test:
         failures.append("frozen_test_required")
     checks = {
-        "precision_min": float(metrics.get("precision", 0.0)),
-        "recall_min": float(metrics.get("recall", 0.0)),
-        "map50_min": float(metrics.get("mAP50", 0.0)),
-        "count_accuracy_min": float(metrics.get("count_accuracy", 0.0)),
-        "fps_min": float(metrics.get("fps", 0.0)),
+        "precision_min": metrics.get("precision"),
+        "recall_min": metrics.get("recall"),
+        "map50_min": metrics.get("mAP50"),
+        "count_accuracy_min": metrics.get("count_accuracy"),
+        "fps_min": metrics.get("fps"),
     }
     for criterion, actual in checks.items():
-        if actual < float(criteria[criterion]):
+        if actual is None:
+            failures.append(f"{criterion}:UNAVAILABLE")
+        elif float(actual) < float(criteria[criterion]):
             failures.append(f"{criterion}:{actual:.6f}<{criteria[criterion]:.6f}")
-    merge_rate = float(metrics.get("merge_rate", 1.0))
-    if merge_rate > float(criteria["merge_rate_max"]):
+    merge_rate = metrics.get("merge_rate")
+    if merge_rate is None:
+        failures.append("merge_rate_max:UNAVAILABLE")
+    elif float(merge_rate) > float(criteria["merge_rate_max"]):
         failures.append(
-            f"merge_rate_max:{merge_rate:.6f}>{criteria['merge_rate_max']:.6f}"
+            f"merge_rate_max:{float(merge_rate):.6f}>{criteria['merge_rate_max']:.6f}"
         )
     return not failures, failures
 
@@ -460,7 +487,8 @@ def training_worker_loop(
             yolo_dir.mkdir(parents=True, exist_ok=True)
             os.environ.setdefault("YOLO_CONFIG_DIR", str(yolo_dir))
             data_yaml = ROOT_DIR / dataset_row["data_yaml_path"]
-            model = YOLO(model_row["weights_path"])
+            base_weights, _ = resolve_model_artifact(dict(model_row))
+            model = YOLO(str(base_weights))
             while True:
                 try:
                     train_results = model.train(
@@ -506,7 +534,15 @@ def training_worker_loop(
                 candidate_id=candidate_id,
                 source_path=best_pt,
             )
-            evaluation_model = YOLO(str(ROOT_DIR / weights_path))
+            evaluation_weights = (ROOT_DIR / weights_path).resolve()
+            if (
+                not evaluation_weights.exists()
+                or _sha256(evaluation_weights) != artifact_sha256
+            ):
+                raise RuntimeError(
+                    "Artifact best.pt absent ou altéré avant évaluation."
+                )
+            evaluation_model = YOLO(str(evaluation_weights))
             validation_results = evaluation_model.val(
                 data=str(data_yaml), split="val", verbose=False
             )
@@ -532,9 +568,29 @@ def training_worker_loop(
 
         metrics = {
             **test_metrics,
-            "count_accuracy": float(benchmark.get("count_accuracy", 0.0)),
-            "merge_rate": float(benchmark.get("merge_rate", 1.0)),
-            "fps": float(benchmark.get("fps", 0.0)),
+            "count_accuracy": benchmark.get("count_accuracy"),
+            "merge_rate": benchmark.get("merge_rate"),
+            "fps": benchmark.get("fps"),
+            "metric_availability": {
+                key: (
+                    "MEASURED"
+                    if value is not None
+                    else "UNAVAILABLE"
+                )
+                for key, value in {
+                    "precision": test_metrics.get("precision"),
+                    "recall": test_metrics.get("recall"),
+                    "mAP50": test_metrics.get("mAP50"),
+                    "mAP50_95": test_metrics.get("mAP50_95"),
+                    "count_accuracy": benchmark.get("count_accuracy"),
+                    "merge_rate": benchmark.get("merge_rate"),
+                    "fps": benchmark.get("fps"),
+                }.items()
+            },
+            "reid_metrics": {
+                "status": "UNAVAILABLE",
+                "reason": "Ce candidat n'est pas un modèle ReID.",
+            },
             "validated_on_site": False,
             "mode": "demo" if simulated else "ultralytics",
             "retries": retries,

@@ -266,18 +266,56 @@ class RuntimeSupervisor:
     def ensure_model_loaded(self, model_id: str) -> None:
         if model_id == self.active_model_id:
             return
-        self.sync_inference_sources()
-        self.inference_request_queue.put({"kind": "LOAD_MODEL", "model_id": model_id})
-        timeout = time.time() + 15
-        while time.time() < timeout:
-            self.drain_inference_results()
-            ready = self.inference_result_store.pop("__model_ready__", None)
-            if ready and ready.get("model_id") == model_id:
-                self.active_model_id = model_id
-                self.job_repo.upsert_job_run(JobType.GPU_INFERENCE.value, "shared", self.inference_process.pid or 0, "RUNNING", ready)
-                return
-            time.sleep(0.1)
-        raise RuntimeError(f"Chargement du modèle expiré: {model_id}")
+        flags = getattr(self, "control_flags", None)
+        if flags is not None:
+            flags["__inference_paused__"] = True
+        try:
+            drain_deadline = time.time() + float(
+                self.config.get(
+                    "runtime", "inference_result_ttl_seconds", default=5.0
+                )
+            )
+            while flags is not None and any(
+                str(key).startswith("__inflight__:") for key in list(flags.keys())
+            ):
+                self.drain_inference_results()
+                if time.time() >= drain_deadline:
+                    raise RuntimeError(
+                        "Rechargement annulé: requêtes d'inférence en vol non terminées."
+                    )
+                time.sleep(0.02)
+            self.sync_inference_sources()
+            self.inference_result_store.pop("__model_ready__", None)
+            self.inference_result_store.pop("__model_load_failed__", None)
+            self.inference_request_queue.put(
+                {"kind": "LOAD_MODEL", "model_id": model_id}
+            )
+            timeout = time.time() + 15
+            while time.time() < timeout:
+                self.drain_inference_results()
+                failed = self.inference_result_store.pop(
+                    "__model_load_failed__", None
+                )
+                if failed and failed.get("model_id") == model_id:
+                    self.active_model_id = failed.get("active_model_id")
+                    raise RuntimeError(str(failed.get("error")))
+                ready = self.inference_result_store.pop("__model_ready__", None)
+                if ready and ready.get("model_id") == model_id:
+                    self.active_model_id = model_id
+                    if hasattr(self, "job_repo"):
+                        self.job_repo.upsert_job_run(
+                            JobType.GPU_INFERENCE.value,
+                            "shared",
+                            self.inference_process.pid or 0,
+                            "RUNNING",
+                            ready,
+                        )
+                    return
+                time.sleep(0.1)
+            raise RuntimeError(f"Chargement du modèle expiré: {model_id}")
+        finally:
+            if flags is not None:
+                flags["__inference_paused__"] = False
 
     def runtime_model_id(self, configured_model_id: str) -> str:
         if (
@@ -295,10 +333,8 @@ class RuntimeSupervisor:
     def reload_runtime_model(self, model_id: str) -> bool:
         inference_process = getattr(self, "inference_process", None)
         if inference_process is not None and inference_process.is_alive():
-            self.active_model_id = None
             self.ensure_model_loaded(model_id)
             return True
-        self.active_model_id = None
         return False
 
     def start_source(
@@ -901,8 +937,16 @@ class RuntimeSupervisor:
                     "status": "REJECTED",
                 }
             elif command_type == CommandType.PROMOTE_MODEL.value:
-                promote_model(self.db, payload["model_id"])
-                reloaded = self.reload_runtime_model(payload["model_id"])
+                previous_active = self.db.fetch_one(
+                    "SELECT id FROM model_registry WHERE is_active = 1 LIMIT 1"
+                )
+                try:
+                    reloaded = self.reload_runtime_model(payload["model_id"])
+                    promote_model(self.db, payload["model_id"])
+                except Exception:
+                    if previous_active is not None:
+                        self.reload_runtime_model(str(previous_active["id"]))
+                    raise
                 result_payload = {
                     "model_id": payload["model_id"],
                     "status": "CHAMPION",
@@ -915,19 +959,39 @@ class RuntimeSupervisor:
                 set_model_status(self.db, payload["model_id"], "ARCHIVED")
                 result_payload = {"model_id": payload["model_id"], "status": "ARCHIVED"}
             elif command_type == CommandType.ACTIVATE_MODEL.value:
-                activate_model(self.db, payload["model_id"])
-                reloaded = self.reload_runtime_model(payload["model_id"])
+                previous_active = self.db.fetch_one(
+                    "SELECT id FROM model_registry WHERE is_active = 1 LIMIT 1"
+                )
+                try:
+                    reloaded = self.reload_runtime_model(payload["model_id"])
+                    activate_model(self.db, payload["model_id"])
+                except Exception:
+                    if previous_active is not None:
+                        self.reload_runtime_model(str(previous_active["id"]))
+                    raise
                 result_payload = {
                     "model_id": payload["model_id"],
                     "runtime_reloaded": reloaded,
                 }
             elif command_type == CommandType.ROLLBACK_MODEL.value:
-                rollback_model_id = rollback_to_previous_active(self.db)
-                reloaded = (
-                    self.reload_runtime_model(rollback_model_id)
-                    if rollback_model_id
-                    else False
+                previous_active = self.db.fetch_one(
+                    "SELECT id FROM model_registry WHERE is_active = 1 LIMIT 1"
                 )
+                rollback_model_id = rollback_to_previous_active(self.db)
+                try:
+                    reloaded = (
+                        self.reload_runtime_model(rollback_model_id)
+                        if rollback_model_id
+                        else False
+                    )
+                except Exception:
+                    if previous_active is not None:
+                        self.db.execute(
+                            "UPDATE model_registry SET is_active = CASE WHEN id = ? THEN 1 ELSE 0 END, updated_at = ?",
+                            (str(previous_active["id"]), utc_now()),
+                        )
+                        self.reload_runtime_model(str(previous_active["id"]))
+                    raise
                 result_payload = {
                     "model_id": rollback_model_id,
                     "runtime_reloaded": reloaded,
@@ -999,6 +1063,9 @@ class RuntimeSupervisor:
                 return
             if message["kind"] == "MODEL_READY":
                 self.inference_result_store["__model_ready__"] = message
+                continue
+            if message["kind"] == "MODEL_LOAD_FAILED":
+                self.inference_result_store["__model_load_failed__"] = message
                 continue
             if message["kind"] not in {"INFER_RESULT", "INFER_ERROR"}:
                 continue

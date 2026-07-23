@@ -82,12 +82,14 @@ def test_ultralytics_model_is_loaded_once_for_multiple_images(tmp_path, monkeypa
     monkeypatch.setitem(sys.modules, "ultralytics", fake_module)
     db = VisionSortDB(tmp_path / "load-once.db")
     db.initialize()
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"checkpoint")
     annotator = DetectionAutoAnnotator(
         db,
         {
             "id": "model",
             "backend": "ultralytics",
-            "weights_path": "checkpoint.pt",
+            "weights_path": str(checkpoint),
             "task": "detection",
         },
     )

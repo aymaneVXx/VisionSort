@@ -331,6 +331,13 @@ def camera_worker_loop(
                     )
                 continue
 
+            while (
+                bool(control_flags.get("__inference_paused__", False))
+                and not stop_event.is_set()
+            ):
+                time.sleep(0.01)
+            if stop_event.is_set():
+                break
             ttl_seconds = float(
                 config.get(
                     "runtime", "inference_result_ttl_seconds", default=5.0
@@ -341,9 +348,12 @@ def camera_worker_loop(
                 source_id=source_id,
                 ttl_seconds=ttl_seconds,
             )
+            inflight_key = f"__inflight__:{message['request_id']}"
+            control_flags[inflight_key] = source_id
             try:
                 inference_request_queue.put_nowait(message)
             except queue.Full:
+                control_flags.pop(inflight_key, None)
                 acquisition.mark_dropped()
                 repo.update_source_state(
                     source_id,
@@ -363,6 +373,7 @@ def camera_worker_loop(
             ):
                 time.sleep(0.01)
             result = inference_result_store.pop(request_id, None)
+            control_flags.pop(inflight_key, None)
             if result is None:
                 _increment_inference_metric(
                     inference_result_store, source_id, "timed_out"
@@ -469,4 +480,10 @@ def camera_worker_loop(
     except Exception as exc:  # pragma: no cover - runtime
         repo.update_source_state(source_id, status=SourceStatus.ERROR.value, fps=0.0, last_error=str(exc), preview_path=relative_to_root(preview_path))
     finally:
+        for key in list(control_flags.keys()):
+            if (
+                str(key).startswith("__inflight__:")
+                and control_flags.get(key) == source_id
+            ):
+                control_flags.pop(key, None)
         acquisition.stop()

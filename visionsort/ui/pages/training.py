@@ -22,6 +22,10 @@ def _load_json(text: str | None) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def _metric_text(value, digits: int = 3) -> str:
+    return "UNAVAILABLE" if value is None else f"{float(value):.{digits}f}"
+
+
 def render(context: UIContext) -> None:
     page_header("Training", "Lancement et suivi des recettes d'entraînement")
     demo_warning(context)
@@ -71,10 +75,10 @@ def render(context: UIContext) -> None:
         with st.container(border=True):
             st.write(f"**{job['id']}** - statut `{job['status']}` - dataset `{job['dataset_id']}` - modèle `{job['model_id']}`")
             info_cols = st.columns(4)
-            info_cols[0].metric("Precision", f"{float(metrics.get('precision', 0.0)):.3f}")
-            info_cols[1].metric("Recall", f"{float(metrics.get('recall', 0.0)):.3f}")
-            info_cols[2].metric("mAP50", f"{float(metrics.get('mAP50', 0.0)):.3f}")
-            info_cols[3].metric("FPS", f"{float(metrics.get('fps', 0.0)):.2f}")
+            info_cols[0].metric("Precision", _metric_text(metrics.get("precision")))
+            info_cols[1].metric("Recall", _metric_text(metrics.get("recall")))
+            info_cols[2].metric("mAP50", _metric_text(metrics.get("mAP50")))
+            info_cols[3].metric("FPS", _metric_text(metrics.get("fps"), 2))
             st.caption(
                 f"evaluation={metrics.get('evaluation_status', '-')} | "
                 f"candidate={metrics.get('candidate_status', '-')} | "

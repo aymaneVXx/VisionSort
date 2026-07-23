@@ -12,6 +12,7 @@ import cv2
 from visionsort.core.config import relative_to_root
 from visionsort.core.paths import ROOT_DIR
 from visionsort.database.db import VisionSortDB
+from visionsort.inference.engine import resolve_model_artifact
 
 
 class BaseAutoAnnotator:
@@ -42,6 +43,8 @@ class BaseAutoAnnotator:
                 from ultralytics import YOLO
             except Exception as exc:  # pragma: no cover - optional environment
                 raise RuntimeError("Ultralytics indisponible.") from exc
+            resolved_checkpoint, _ = resolve_model_artifact(self.model_row)
+            self.checkpoint = str(resolved_checkpoint)
             self.model = YOLO(self.checkpoint)
         else:
             raise RuntimeError(f"Backend d'annotation non supporté: {self.backend}")
