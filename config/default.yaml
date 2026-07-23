@@ -27,6 +27,10 @@ model_promotion:
     merge_rate_max: 0.15
     fps_min: 5.0
 tracking:
+  handoff_window_seconds: 0.75
+  handoff_buffer_max_items: 1000
+  handoff_expiry_seconds: 30.0
+  hypothesis_expiry_seconds: 120.0
   site_topology:
     edges:
       - from_role: C1

@@ -338,6 +338,26 @@ class VisionSortDB:
                     started_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS pending_handoffs (
+                    tracklet_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    link_key TEXT NOT NULL,
+                    event_timestamp REAL NOT NULL,
+                    received_at REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS handoff_hypotheses (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    incoming_tracklet_id TEXT NOT NULL,
+                    candidates_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    resolution_json TEXT,
+                    expires_at REAL NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS site_config (
                     id TEXT PRIMARY KEY,
                     config_json TEXT NOT NULL,
@@ -348,6 +368,8 @@ class VisionSortDB:
                 CREATE INDEX IF NOT EXISTS idx_tracklets_camera ON tracklets(camera_id, local_track_id);
                 CREATE INDEX IF NOT EXISTS idx_pipeline_steps_session ON pipeline_step_runs(session_id, step, created_at);
                 CREATE INDEX IF NOT EXISTS idx_dataset_sessions_session ON dataset_sessions(session_id, dataset_id);
+                CREATE INDEX IF NOT EXISTS idx_pending_handoffs_session ON pending_handoffs(session_id, link_key, received_at);
+                CREATE INDEX IF NOT EXISTS idx_handoff_hypotheses_status ON handoff_hypotheses(status, session_id, expires_at);
                 """
             )
             self._migrate(conn)
@@ -494,6 +516,43 @@ class VisionSortDB:
                 "CREATE INDEX IF NOT EXISTS idx_dataset_sessions_session ON dataset_sessions(session_id, dataset_id)"
             )
             conn.execute("PRAGMA user_version = 4")
+
+        if version < 5:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pending_handoffs (
+                    tracklet_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    link_key TEXT NOT NULL,
+                    event_timestamp REAL NOT NULL,
+                    received_at REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    payload_json TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS handoff_hypotheses (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    incoming_tracklet_id TEXT NOT NULL,
+                    candidates_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    resolution_json TEXT,
+                    expires_at REAL NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_pending_handoffs_session ON pending_handoffs(session_id, link_key, received_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_handoff_hypotheses_status ON handoff_hypotheses(status, session_id, expires_at)"
+            )
+            conn.execute("PRAGMA user_version = 5")
 
     def fetch_all(self, query: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
         with self.connect() as conn:

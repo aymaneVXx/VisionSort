@@ -17,7 +17,14 @@ if __name__ == "__main__":
 
 from visionsort.acquisition.worker import camera_worker_loop
 from visionsort.core.config import load_config
-from visionsort.core.enums import CommandStatus, CommandType, JobType, MatchResult, SourceStatus
+from visionsort.core.enums import (
+    CommandStatus,
+    CommandType,
+    JobType,
+    MatchResult,
+    ParcelState,
+    SourceStatus,
+)
 from visionsort.core.paths import DB_PATH, ROOT_DIR, ensure_project_dirs
 from visionsort.core.types import GlobalParcel, Tracklet
 from visionsort.database.db import VisionSortDB, utc_now
@@ -25,6 +32,7 @@ from visionsort.database.repositories import (
     ArtifactRepository,
     ControlRepository,
     EventRepository,
+    HandoffHypothesisRepository,
     JobRepository,
     TrackingRepository,
 )
@@ -35,6 +43,7 @@ from visionsort.runtime.demo_assets import ensure_demo_assets
 from visionsort.runtime.pipeline_worker import pipeline_worker_loop
 from visionsort.sources.frame_sources import can_open_uri
 from visionsort.tracking.engine import GlobalParcelTracker
+from visionsort.tracking.handoffs import PendingHandoffBuffer
 from visionsort.training.pipeline import create_training_job, training_worker_loop
 
 
@@ -65,6 +74,7 @@ class RuntimeSupervisor:
         self.control_repo = ControlRepository(self.db)
         self.event_repo = EventRepository(self.db)
         self.tracking_repo = TrackingRepository(self.db)
+        self.hypothesis_repo = HandoffHypothesisRepository(self.db)
         self.artifact_repo = ArtifactRepository(self.db)
         self.job_repo = JobRepository(self.db)
         self.ctx = mp.get_context("spawn")
@@ -87,6 +97,26 @@ class RuntimeSupervisor:
         )
         topology_edges = self.config.get("tracking", "site_topology", "edges", default=[])
         self.global_tracker = GlobalParcelTracker(topology_edges=topology_edges, source_roles=self._source_roles())
+        self.pending_handoff_buffer = PendingHandoffBuffer(
+            self.db,
+            topology_edges,
+            window_seconds=float(
+                self.config.get(
+                    "tracking", "handoff_window_seconds", default=0.75
+                )
+            ),
+            max_items=int(
+                self.config.get(
+                    "tracking", "handoff_buffer_max_items", default=1000
+                )
+            ),
+            expiry_seconds=float(
+                self.config.get(
+                    "tracking", "handoff_expiry_seconds", default=30.0
+                )
+            ),
+        )
+        self._restore_global_tracker_state()
         self.inference_process = self.ctx.Process(
             target=inference_worker_loop,
             args=(
@@ -102,6 +132,69 @@ class RuntimeSupervisor:
 
     def _source_roles(self) -> dict[str, str]:
         return {row["id"]: row["role"] for row in self.db.fetch_all("SELECT id, role FROM sources")}
+
+    @staticmethod
+    def _tracklet_from_row(row: dict[str, Any]) -> Tracklet:
+        summary = json.loads(row.get("summary_json") or "{}")
+        first_bbox = tuple(
+            float(value)
+            for value in summary.get("first_bbox", summary.get("avg_bbox", [0, 0, 0, 0]))
+        )
+        last_bbox = tuple(
+            float(value)
+            for value in summary.get("last_bbox", summary.get("avg_bbox", [0, 0, 0, 0]))
+        )
+        return Tracklet(
+            tracklet_id=str(row["tracklet_id"]),
+            session_id=str(row.get("session_id") or ""),
+            source_id=str(row.get("source_id") or row["camera_id"]),
+            camera_id=str(row["camera_id"]),
+            camera_role=str(row.get("camera_role") or row["camera_id"]),
+            local_track_id=int(row["local_track_id"]),
+            started_at_local=float(row.get("started_at_local") or 0.0),
+            ended_at_local=float(row.get("ended_at_local") or 0.0),
+            started_at_global=float(row["started_at_global"]),
+            ended_at_global=float(row["ended_at_global"]),
+            class_name=str(row["class_name"]),
+            first_bbox=first_bbox,
+            last_bbox=last_bbox,
+            avg_speed=float(row["avg_speed"]),
+            last_zone_id=row.get("last_zone_id"),
+            frame_count=int(row["frame_count"]),
+            observation_path=str(row["observation_path"]),
+            summary_json=summary,
+            model_id=row.get("model_id"),
+            tracker_id=row.get("tracker_id"),
+        )
+
+    def _restore_global_tracker_state(self) -> None:
+        for raw_row in self.db.fetch_all(
+            "SELECT * FROM tracklets WHERE class_name = 'parcel'"
+        ):
+            row = dict(raw_row)
+            tracklet = self._tracklet_from_row(row)
+            self.global_tracker.tracklets[tracklet.tracklet_id] = tracklet
+            if row.get("parcel_id"):
+                self.global_tracker.tracklet_to_parcel[tracklet.tracklet_id] = str(
+                    row["parcel_id"]
+                )
+        valid_states = {state.value: state for state in ParcelState}
+        for raw_row in self.db.fetch_all("SELECT * FROM global_parcels"):
+            row = dict(raw_row)
+            raw_state = str(row["state"])
+            state_value = raw_state.split(".")[-1]
+            state = valid_states.get(state_value, ParcelState.ON_CONVEYOR)
+            self.global_tracker.parcels[str(row["parcel_id"])] = GlobalParcel(
+                parcel_id=str(row["parcel_id"]),
+                state=state,
+                last_camera_id=str(row["last_camera_id"]),
+                first_seen_at=float(row["first_seen_at"]),
+                last_seen_at=float(row["last_seen_at"]),
+                current_tracklet_id=str(row["current_tracklet_id"]),
+                assigned_destination=row.get("assigned_destination"),
+                operator_id=row.get("operator_id"),
+                appearance_signature=json.loads(row.get("appearance_json") or "[]"),
+            )
 
     def bootstrap_demo_sources(self) -> None:
         if not self.config.demo_mode:
@@ -152,6 +245,8 @@ class RuntimeSupervisor:
     def shutdown(self) -> None:
         for source_id in list(self.camera_processes):
             self.stop_source(source_id)
+        self.drain_runtime_messages()
+        self.flush_pending_handoffs(force=True)
         for job_id, process in list(self.training_processes.items()):
             if process.is_alive():
                 process.terminate()
@@ -296,6 +391,8 @@ class RuntimeSupervisor:
         sources = self.control_repo.list_capture_session_sources(session_id)
         for sess_src in sources:
             self.stop_source(sess_src["source_id"])
+        self.drain_runtime_messages()
+        self.flush_pending_handoffs(force=True, session_id=session_id)
         self.control_repo.update_capture_session(session_id, ended_at=float(time.time()))
 
     def stop_source(self, source_id: str) -> None:
@@ -428,19 +525,61 @@ class RuntimeSupervisor:
     def handle_tracklet(self, payload: dict[str, Any]) -> None:
         self.handle_tracklets([payload])
 
+    def _topology_rank(self, role: str) -> int:
+        edges = self.config.get(
+            "tracking", "site_topology", "edges", default=[]
+        )
+        ranks: dict[str, int] = {}
+        for _ in range(len(edges) + 1):
+            changed = False
+            for edge in edges:
+                left = str(edge["from_role"])
+                right = str(edge["to_role"])
+                proposed = ranks.get(left, 0) + 1
+                if proposed > ranks.get(right, 0):
+                    ranks[right] = proposed
+                    changed = True
+            if not changed:
+                break
+        return ranks.get(role, 0)
+
     def handle_tracklets(self, payloads: list[dict[str, Any]]) -> None:
         tracklets = [Tracklet(**payload) for payload in payloads]
         self.global_tracker.source_roles = self._source_roles()
-        parcel_tracklets = [
-            tracklet for tracklet in tracklets if tracklet.class_name == "parcel"
-        ]
-        parcel_outcomes = self.global_tracker.process_tracklets(parcel_tracklets)
-        outcomes_by_id = {
-            tracklet.tracklet_id: outcome
-            for tracklet, outcome in zip(
-                parcel_tracklets, parcel_outcomes, strict=True
+        outcomes_by_id: dict[
+            str,
+            tuple[str, MatchResult, list[str], Any],
+        ] = {}
+        parcel_tracklets = sorted(
+            (
+                tracklet
+                for tracklet in tracklets
+                if tracklet.class_name == "parcel"
+            ),
+            key=lambda tracklet: (
+                self._topology_rank(tracklet.camera_role),
+                tracklet.ended_at_global,
+                tracklet.tracklet_id,
+            ),
+        )
+        by_rank: dict[int, list[Tracklet]] = {}
+        for tracklet in parcel_tracklets:
+            by_rank.setdefault(
+                self._topology_rank(tracklet.camera_role), []
+            ).append(tracklet)
+        for rank in sorted(by_rank):
+            wave = by_rank[rank]
+            for tracklet in wave:
+                self._try_resolve_hypotheses_with_later_evidence(tracklet)
+            wave_outcomes = self.global_tracker.process_tracklets(wave)
+            outcomes_by_id.update(
+                {
+                    tracklet.tracklet_id: outcome
+                    for tracklet, outcome in zip(
+                        wave, wave_outcomes, strict=True
+                    )
+                }
             )
-        }
         for tracklet in tracklets:
             if tracklet.class_name != "parcel":
                 self.tracking_repo.upsert_tracklet(
@@ -452,6 +591,23 @@ class RuntimeSupervisor:
             parcel_id, result, reasons, candidate = outcomes_by_id[
                 tracklet.tracklet_id
             ]
+            hypothesis_id = None
+            candidate_set = self.global_tracker.last_candidate_sets.get(
+                tracklet.tracklet_id, []
+            )
+            if result == MatchResult.AMBIGUOUS:
+                hypothesis_id = self.hypothesis_repo.create(
+                    session_id=tracklet.session_id,
+                    incoming_tracklet_id=tracklet.tracklet_id,
+                    candidates=[asdict(item) for item in candidate_set],
+                    expiry_seconds=float(
+                        self.config.get(
+                            "tracking",
+                            "hypothesis_expiry_seconds",
+                            default=120.0,
+                        )
+                    ),
+                )
             self.tracking_repo.upsert_tracklet(
                 tracklet,
                 parcel_id=parcel_id or None,
@@ -473,6 +629,8 @@ class RuntimeSupervisor:
                     "tracklet_id": tracklet.tracklet_id,
                     "reasons": reasons,
                     "candidate": asdict(candidate) if candidate else None,
+                    "candidates": [asdict(item) for item in candidate_set],
+                    "hypothesis_id": hypothesis_id,
                     "validated_on_site": False,
                 },
                 parcel_id=parcel_id or None,
@@ -484,6 +642,173 @@ class RuntimeSupervisor:
                 model_id=tracklet.model_id,
                 tracker_id=tracklet.tracker_id,
             )
+
+    def _try_resolve_hypotheses_with_later_evidence(
+        self, later: Tracklet
+    ) -> None:
+        proposals: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
+        edges = self.config.get(
+            "tracking", "site_topology", "edges", default=[]
+        )
+        for hypothesis in self.hypothesis_repo.pending(later.session_id):
+            ambiguous = self.global_tracker.tracklets.get(
+                str(hypothesis["incoming_tracklet_id"])
+            )
+            if ambiguous is None:
+                continue
+            edge = next(
+                (
+                    item
+                    for item in edges
+                    if str(item["from_role"]) == ambiguous.camera_role
+                    and str(item["to_role"]) == later.camera_role
+                ),
+                None,
+            )
+            if edge is None:
+                continue
+            transit = later.started_at_global - ambiguous.ended_at_global
+            if not (
+                float(edge["min_transit_s"])
+                <= transit
+                <= float(edge["max_transit_s"])
+            ):
+                continue
+            for candidate in json.loads(
+                hypothesis.get("candidates_json") or "[]"
+            ):
+                evidence = self.global_tracker.continuation_evidence(
+                    str(candidate["from_tracklet_id"]), later
+                )
+                if evidence is None:
+                    continue
+                combined = 0.6 * float(candidate["score"]) + 0.4 * evidence
+                proposals.append((combined, hypothesis, candidate))
+        proposals.sort(key=lambda item: item[0], reverse=True)
+        if not proposals:
+            return
+        best_score, hypothesis, candidate = proposals[0]
+        second_score = proposals[1][0] if len(proposals) > 1 else 0.0
+        if (
+            best_score < self.global_tracker.minimum_score
+            or best_score - second_score < self.global_tracker.ambiguity_margin
+        ):
+            return
+        outgoing_tracklet_id = str(candidate["from_tracklet_id"])
+        incoming_tracklet_id = str(hypothesis["incoming_tracklet_id"])
+        parcel_id = self.global_tracker.resolve_ambiguous(
+            incoming_tracklet_id, outgoing_tracklet_id
+        )
+        self.hypothesis_repo.resolve(
+            str(hypothesis["id"]),
+            outgoing_tracklet_id=outgoing_tracklet_id,
+            resolution={
+                "mode": "automatic_later_evidence",
+                "later_tracklet_id": later.tracklet_id,
+                "combined_score": best_score,
+            },
+        )
+        incoming = self.global_tracker.tracklets[incoming_tracklet_id]
+        self.tracking_repo.upsert_tracklet(
+            incoming,
+            parcel_id=parcel_id,
+            match_result=MatchResult.MATCHED.value,
+        )
+        self.tracking_repo.upsert_global_parcel(
+            self.global_tracker.parcels[parcel_id]
+        )
+        self.event_repo.add_event(
+            "handoff_ambiguity_resolved",
+            {
+                "hypothesis_id": hypothesis["id"],
+                "incoming_tracklet_id": incoming_tracklet_id,
+                "outgoing_tracklet_id": outgoing_tracklet_id,
+                "later_tracklet_id": later.tracklet_id,
+                "combined_score": best_score,
+                "mode": "automatic_later_evidence",
+            },
+            parcel_id=parcel_id,
+            session_id=later.session_id,
+            timestamp_global=later.started_at_global,
+        )
+
+    def resolve_handoff_hypothesis(
+        self,
+        hypothesis_id: str,
+        outgoing_tracklet_id: str,
+        *,
+        actor: str = "human",
+    ) -> str:
+        hypothesis = self.hypothesis_repo.get(hypothesis_id)
+        if hypothesis is None:
+            raise RuntimeError("Hypothèse introuvable.")
+        incoming_tracklet_id = str(hypothesis["incoming_tracklet_id"])
+        try:
+            parcel_id = self.global_tracker.resolve_ambiguous(
+                incoming_tracklet_id, outgoing_tracklet_id
+            )
+            incoming = self.global_tracker.tracklets[incoming_tracklet_id]
+            self.tracking_repo.upsert_tracklet(
+                incoming,
+                parcel_id=parcel_id,
+                match_result=MatchResult.MATCHED.value,
+            )
+            self.tracking_repo.upsert_global_parcel(
+                self.global_tracker.parcels[parcel_id]
+            )
+        except RuntimeError:
+            outgoing = self.db.fetch_one(
+                "SELECT parcel_id FROM tracklets WHERE tracklet_id = ?",
+                (outgoing_tracklet_id,),
+            )
+            if outgoing is None or not outgoing["parcel_id"]:
+                raise
+            parcel_id = str(outgoing["parcel_id"])
+            incoming_row = self.db.fetch_one(
+                """
+                SELECT camera_id, ended_at_global FROM tracklets
+                WHERE tracklet_id = ?
+                """,
+                (incoming_tracklet_id,),
+            )
+            self.db.execute(
+                """
+                UPDATE tracklets SET parcel_id = ?, match_result = 'MATCHED'
+                WHERE tracklet_id = ?
+                """,
+                (parcel_id, incoming_tracklet_id),
+            )
+            if incoming_row is not None:
+                self.db.execute(
+                    """
+                    UPDATE global_parcels
+                    SET current_tracklet_id = ?, last_camera_id = ?,
+                        last_seen_at = ?
+                    WHERE parcel_id = ?
+                    """,
+                    (
+                        incoming_tracklet_id,
+                        incoming_row["camera_id"],
+                        incoming_row["ended_at_global"],
+                        parcel_id,
+                    ),
+                )
+        self.hypothesis_repo.resolve(
+            hypothesis_id,
+            outgoing_tracklet_id=outgoing_tracklet_id,
+            resolution={"mode": "human", "actor": actor},
+        )
+        return parcel_id
+
+    def flush_pending_handoffs(
+        self, *, force: bool = False, session_id: str | None = None
+    ) -> None:
+        if not hasattr(self, "pending_handoff_buffer"):
+            return
+        for _, payloads in self.pending_handoff_buffer.pop_ready_batches(
+            force=force, session_id=session_id
+        ):
+            self.handle_tracklets(payloads)
 
     def handle_command(self, command: dict[str, Any]) -> None:
         payload = json.loads(command["payload_json"])
@@ -555,6 +880,26 @@ class RuntimeSupervisor:
                         params={"dataset_id": item["dataset_id"]},
                     )
                     result_payload["job_key"] = job_key
+            elif command_type == CommandType.RESOLVE_HANDOFF.value:
+                parcel_id = self.resolve_handoff_hypothesis(
+                    str(payload["hypothesis_id"]),
+                    str(payload["outgoing_tracklet_id"]),
+                    actor=str(payload.get("actor") or command.get("owner") or "human"),
+                )
+                result_payload = {
+                    "hypothesis_id": payload["hypothesis_id"],
+                    "parcel_id": parcel_id,
+                    "status": "RESOLVED",
+                }
+            elif command_type == CommandType.REJECT_HANDOFF.value:
+                self.hypothesis_repo.reject(
+                    str(payload["hypothesis_id"]),
+                    reason=str(payload.get("reason") or "rejet humain"),
+                )
+                result_payload = {
+                    "hypothesis_id": payload["hypothesis_id"],
+                    "status": "REJECTED",
+                }
             elif command_type == CommandType.PROMOTE_MODEL.value:
                 promote_model(self.db, payload["model_id"])
                 reloaded = self.reload_runtime_model(payload["model_id"])
@@ -602,13 +947,15 @@ class RuntimeSupervisor:
             self.event_repo.add_event("command_failed", {"command_type": command_type, "error": str(exc)}, severity="error")
 
     def drain_runtime_messages(self) -> None:
-        tracklet_payloads: list[dict[str, Any]] = []
+        immediate_tracklet_payloads: list[dict[str, Any]] = []
         while True:
             try:
                 message = self.runtime_queue.get_nowait()
             except queue.Empty:
-                if tracklet_payloads:
-                    self.handle_tracklets(tracklet_payloads)
+                if immediate_tracklet_payloads:
+                    self.handle_tracklets(immediate_tracklet_payloads)
+                self.flush_pending_handoffs()
+                self.hypothesis_repo.expire()
                 return
             if message["kind"] == "EVENT":
                 self.event_repo.add_event(
@@ -625,7 +972,13 @@ class RuntimeSupervisor:
                     tracker_id=message.get("tracker_id"),
                 )
             elif message["kind"] == "TRACKLET":
-                tracklet_payloads.append(message["tracklet"])
+                payload = message["tracklet"]
+                if payload.get("class_name") == "parcel":
+                    immediate_tracklet_payloads.extend(
+                        self.pending_handoff_buffer.add(payload)
+                    )
+                else:
+                    immediate_tracklet_payloads.append(payload)
             elif message["kind"] == "RECORDING":
                 self.artifact_repo.add_recording(
                     source_id=message["source_id"],

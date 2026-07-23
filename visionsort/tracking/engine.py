@@ -513,6 +513,7 @@ class GlobalParcelTracker:
         self.parcels: dict[str, GlobalParcel] = {}
         self.tracklet_to_parcel: dict[str, str] = {}
         self.tracklets: dict[str, Tracklet] = {}
+        self.last_candidate_sets: dict[str, list[HandoffCandidate]] = {}
 
     def process_tracklet(self, tracklet: Tracklet) -> tuple[str, MatchResult, list[str], HandoffCandidate | None]:
         return self.process_tracklets([tracklet])[0]
@@ -542,6 +543,7 @@ class GlobalParcelTracker:
                 )
             candidates.sort(key=lambda item: item.score, reverse=True)
             candidates_by_incoming[incoming_index] = candidates
+            self.last_candidate_sets[incoming.tracklet_id] = list(candidates)
 
         ambiguous: set[int] = set()
         for incoming_index, candidates in candidates_by_incoming.items():
@@ -619,6 +621,53 @@ class GlobalParcelTracker:
             )
 
         return [item for item in results if item is not None]
+
+    def resolve_ambiguous(
+        self, incoming_tracklet_id: str, outgoing_tracklet_id: str
+    ) -> str:
+        incoming = self.tracklets.get(incoming_tracklet_id)
+        outgoing = self.tracklets.get(outgoing_tracklet_id)
+        parcel_id = self.tracklet_to_parcel.get(outgoing_tracklet_id)
+        if incoming is None or outgoing is None or parcel_id is None:
+            raise RuntimeError("Tracklets de l'hypothèse indisponibles.")
+        parcel = self.parcels.get(parcel_id)
+        if parcel is None or parcel.current_tracklet_id != outgoing_tracklet_id:
+            raise RuntimeError(
+                "Le candidat sortant a déjà été consommé par un autre handoff."
+            )
+        parcel.last_camera_id = incoming.camera_id
+        parcel.last_seen_at = incoming.ended_at_global
+        parcel.current_tracklet_id = incoming.tracklet_id
+        parcel.appearance_signature = (
+            self._appearance(incoming) or parcel.appearance_signature
+        )
+        self.tracklet_to_parcel[incoming.tracklet_id] = parcel_id
+        return parcel_id
+
+    def continuation_evidence(
+        self, outgoing_tracklet_id: str, later: Tracklet
+    ) -> float | None:
+        outgoing = self.tracklets.get(outgoing_tracklet_id)
+        if outgoing is None:
+            return None
+        outgoing_dimensions = self._dimensions(outgoing)
+        later_dimensions = self._dimensions(later)
+        dimension_score = sum(
+            min(left, right) / max(left, right, 1e-6)
+            for left, right in zip(outgoing_dimensions, later_dimensions)
+        ) / 2.0
+        outgoing_appearance = self._appearance(outgoing)
+        later_appearance = self._appearance(later)
+        if not outgoing_appearance or not later_appearance:
+            return dimension_score
+        length = min(len(outgoing_appearance), len(later_appearance))
+        left = np.asarray(outgoing_appearance[:length], dtype=np.float32)
+        right = np.asarray(later_appearance[:length], dtype=np.float32)
+        denominator = float(np.linalg.norm(left) * np.linalg.norm(right))
+        if denominator <= 1e-9:
+            return dimension_score
+        appearance_score = (float(np.dot(left, right) / denominator) + 1.0) / 2.0
+        return 0.4 * dimension_score + 0.6 * appearance_score
 
     def _register_new_parcel(self, tracklet: Tracklet) -> str:
         parcel_id = f"parcel-{uuid.uuid4().hex[:10]}"

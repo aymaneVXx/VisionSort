@@ -289,6 +289,23 @@ class ControlRepository:
     def list_jobs(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self.db.fetch_all("SELECT * FROM job_runs ORDER BY started_at DESC")]
 
+    def list_handoff_hypotheses(
+        self, status: str | None = None
+    ) -> list[dict[str, Any]]:
+        if status is None:
+            rows = self.db.fetch_all(
+                "SELECT * FROM handoff_hypotheses ORDER BY created_at DESC"
+            )
+        else:
+            rows = self.db.fetch_all(
+                """
+                SELECT * FROM handoff_hypotheses
+                WHERE status = ? ORDER BY created_at DESC
+                """,
+                (status,),
+            )
+        return [dict(row) for row in rows]
+
 
 class EventRepository:
     def __init__(self, db: VisionSortDB):
@@ -413,6 +430,143 @@ class TrackingRepository:
             ),
         )
 
+
+class HandoffHypothesisRepository:
+    def __init__(self, db: VisionSortDB):
+        self.db = db
+
+    def create(
+        self,
+        *,
+        session_id: str,
+        incoming_tracklet_id: str,
+        candidates: list[dict[str, Any]],
+        expiry_seconds: float,
+    ) -> str:
+        existing = self.db.fetch_one(
+            """
+            SELECT id FROM handoff_hypotheses
+            WHERE session_id = ? AND incoming_tracklet_id = ? AND status = 'PENDING'
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (session_id, incoming_tracklet_id),
+        )
+        if existing is not None:
+            return str(existing["id"])
+        hypothesis_id = f"hypothesis-{uuid.uuid4().hex[:12]}"
+        now = utc_now()
+        self.db.execute(
+            """
+            INSERT INTO handoff_hypotheses
+            (id, session_id, incoming_tracklet_id, candidates_json, status,
+             resolution_json, expires_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 'PENDING', NULL, ?, ?, ?)
+            """,
+            (
+                hypothesis_id,
+                session_id,
+                incoming_tracklet_id,
+                json.dumps(candidates),
+                time.time() + max(1.0, float(expiry_seconds)),
+                now,
+                now,
+            ),
+        )
+        return hypothesis_id
+
+    def get(self, hypothesis_id: str) -> dict[str, Any] | None:
+        row = self.db.fetch_one(
+            "SELECT * FROM handoff_hypotheses WHERE id = ?", (hypothesis_id,)
+        )
+        return dict(row) if row else None
+
+    def pending(self, session_id: str | None = None) -> list[dict[str, Any]]:
+        self.expire()
+        if session_id is None:
+            rows = self.db.fetch_all(
+                """
+                SELECT * FROM handoff_hypotheses
+                WHERE status = 'PENDING' ORDER BY created_at
+                """
+            )
+        else:
+            rows = self.db.fetch_all(
+                """
+                SELECT * FROM handoff_hypotheses
+                WHERE status = 'PENDING' AND session_id = ? ORDER BY created_at
+                """,
+                (session_id,),
+            )
+        return [dict(row) for row in rows]
+
+    def resolve(
+        self,
+        hypothesis_id: str,
+        *,
+        outgoing_tracklet_id: str,
+        resolution: dict[str, Any],
+    ) -> None:
+        row = self.get(hypothesis_id)
+        if row is None or row["status"] != "PENDING":
+            raise RuntimeError("Hypothèse de handoff non résoluble.")
+        candidates = json.loads(row["candidates_json"] or "[]")
+        if outgoing_tracklet_id not in {
+            str(candidate["from_tracklet_id"]) for candidate in candidates
+        }:
+            raise RuntimeError("Le tracklet choisi ne fait pas partie des candidats.")
+        self.db.execute(
+            """
+            UPDATE handoff_hypotheses
+            SET status = 'RESOLVED', resolution_json = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                json.dumps(
+                    {
+                        **resolution,
+                        "outgoing_tracklet_id": outgoing_tracklet_id,
+                    }
+                ),
+                utc_now(),
+                hypothesis_id,
+            ),
+        )
+
+    def reject(
+        self, hypothesis_id: str, *, reason: str = "rejet humain"
+    ) -> None:
+        row = self.get(hypothesis_id)
+        if row is None or row["status"] != "PENDING":
+            raise RuntimeError("Hypothèse de handoff non rejetable.")
+        self.db.execute(
+            """
+            UPDATE handoff_hypotheses
+            SET status = 'REJECTED', resolution_json = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (json.dumps({"reason": reason}), utc_now(), hypothesis_id),
+        )
+
+    def expire(self, *, now: float | None = None) -> int:
+        current = float(now if now is not None else time.time())
+        count = self.db.fetch_one(
+            """
+            SELECT COUNT(*) AS count FROM handoff_hypotheses
+            WHERE status = 'PENDING' AND expires_at <= ?
+            """,
+            (current,),
+        )
+        self.db.execute(
+            """
+            UPDATE handoff_hypotheses
+            SET status = 'EXPIRED',
+                resolution_json = '{"reason":"fenêtre de résolution expirée"}',
+                updated_at = ?
+            WHERE status = 'PENDING' AND expires_at <= ?
+            """,
+            (utc_now(), current),
+        )
+        return int((count["count"] if count else 0) or 0)
 
 class ArtifactRepository:
     def __init__(self, db: VisionSortDB):

@@ -5,12 +5,58 @@ import json
 import pandas as pd
 import streamlit as st
 
+from visionsort.core.enums import CommandType
 from visionsort.ui.components.common import page_header
 from visionsort.ui.state import UIContext
 
 
 def render(context: UIContext) -> None:
     page_header("Events", "Journal des événements métier et techniques")
+    hypotheses = context.repo.list_handoff_hypotheses("PENDING")
+    st.subheader(f"Handoffs ambigus ({len(hypotheses)} en attente)")
+    for hypothesis in hypotheses:
+        candidates = json.loads(hypothesis.get("candidates_json") or "[]")
+        with st.container(border=True):
+            st.write(
+                f"`{hypothesis['incoming_tracklet_id']}` — "
+                f"session `{hypothesis['session_id']}`"
+            )
+            st.dataframe(pd.DataFrame(candidates), use_container_width=True)
+            candidate_ids = [
+                str(candidate["from_tracklet_id"]) for candidate in candidates
+            ]
+            selected_candidate = st.selectbox(
+                "Identité sortante",
+                candidate_ids,
+                key=f"candidate-{hypothesis['id']}",
+            )
+            columns = st.columns(2)
+            if columns[0].button(
+                "Résoudre avec ce candidat",
+                key=f"resolve-{hypothesis['id']}",
+                disabled=not selected_candidate,
+            ):
+                context.repo.enqueue_command(
+                    CommandType.RESOLVE_HANDOFF,
+                    {
+                        "hypothesis_id": hypothesis["id"],
+                        "outgoing_tracklet_id": selected_candidate,
+                        "actor": "streamlit",
+                    },
+                )
+                st.success("Résolution envoyée au supervisor.")
+            if columns[1].button(
+                "Rejeter l'hypothèse", key=f"reject-{hypothesis['id']}"
+            ):
+                context.repo.enqueue_command(
+                    CommandType.REJECT_HANDOFF,
+                    {
+                        "hypothesis_id": hypothesis["id"],
+                        "reason": "rejet depuis Streamlit",
+                    },
+                )
+                st.info("Rejet envoyé au supervisor.")
+    st.divider()
     events = context.repo.recent_events(limit=500)
     if not events:
         st.info("Aucun événement.")
