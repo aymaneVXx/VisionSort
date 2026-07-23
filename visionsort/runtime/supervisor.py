@@ -39,6 +39,7 @@ from visionsort.database.repositories import (
 from visionsort.datasets.pipeline import build_dataset
 from visionsort.deployment.registry import activate_model, promote_model, rollback_to_previous_active, set_model_status
 from visionsort.inference.engine import inference_worker_loop
+from visionsort.media.archive import build_session_media_report
 from visionsort.runtime.demo_assets import ensure_demo_assets
 from visionsort.runtime.pipeline_worker import pipeline_worker_loop
 from visionsort.sources.frame_sources import can_open_uri
@@ -369,6 +370,9 @@ class RuntimeSupervisor:
         replay_offset_ms: float = 0.0,
         replay_fps: float = 8.0,
         replay_loop: bool = False,
+        archive_required: bool = False,
+        source_type_snapshot: str | None = None,
+        source_uri_snapshot: str | None = None,
     ) -> None:
         row = self.db.fetch_one("SELECT * FROM sources WHERE id = ?", (source_id,))
         if row is None:
@@ -388,12 +392,17 @@ class RuntimeSupervisor:
         self.ensure_model_loaded(runtime_model_id)
         stop_event = self.ctx.Event()
         cfg = dict(row)
+        if source_type_snapshot:
+            cfg["source_type"] = source_type_snapshot
+        if source_uri_snapshot:
+            cfg["uri"] = source_uri_snapshot
         cfg["model_id"] = runtime_model_id
         cfg["replay_fps"] = float(replay_fps)
         cfg["session_id"] = session_id
         cfg["session_start_global"] = float(session_start_global)
         cfg["replay_offset_ms"] = float(replay_offset_ms)
         cfg["replay_loop"] = bool(replay_loop)
+        cfg["archive_required"] = bool(archive_required)
         self.active_source_sessions[source_id] = session_id
         self.latest_stream_epoch_by_source[source_id] = -1
         self.control_flags[source_id] = {"recording": False}
@@ -446,15 +455,45 @@ class RuntimeSupervisor:
                 replay_offset_ms=float(sess_src.get("time_offset_ms") or 0.0),
                 replay_fps=float(sess_src.get("replay_fps") or 8.0),
                 replay_loop=replay_loop,
+                archive_required=bool(
+                    sess_src.get("archive_required")
+                ),
+                source_type_snapshot=sess_src.get(
+                    "source_type_snapshot"
+                ),
+                source_uri_snapshot=sess_src.get(
+                    "source_uri_snapshot"
+                ),
             )
 
     def stop_session(self, session_id: str) -> None:
         sources = self.control_repo.list_capture_session_sources(session_id)
         for sess_src in sources:
             self.stop_source(sess_src["source_id"])
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            self.drain_runtime_messages()
+            coverage_count = self.db.fetch_one(
+                """
+                SELECT COUNT(*) AS count
+                FROM session_media_coverage
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            )
+            if int(
+                (coverage_count["count"] if coverage_count else 0) or 0
+            ) >= len(sources):
+                break
+            time.sleep(0.05)
         self.drain_runtime_messages()
         self.flush_pending_handoffs(force=True, session_id=session_id)
-        self.control_repo.update_capture_session(session_id, ended_at=float(time.time()))
+        report = build_session_media_report(self.db, session_id)
+        self.control_repo.update_capture_session(
+            session_id,
+            ended_at=float(time.time()),
+            media_report=report,
+        )
 
     def stop_source(self, source_id: str) -> None:
         if hasattr(self, "active_source_sessions"):
@@ -467,7 +506,19 @@ class RuntimeSupervisor:
             return
         process, stop_event = data
         stop_event.set()
-        process.join(timeout=5)
+        process.join(
+            timeout=max(
+                8.0,
+                float(
+                    self.config.get(
+                        "runtime",
+                        "inference_result_ttl_seconds",
+                        default=5.0,
+                    )
+                )
+                + 3.0,
+            )
+        )
         if process.is_alive():
             process.terminate()
             process.join(timeout=2)
@@ -1070,13 +1121,49 @@ class RuntimeSupervisor:
                     immediate_tracklet_payloads.append(payload)
             elif message["kind"] == "RECORDING":
                 self.artifact_repo.add_recording(
+                    recording_id=message.get("recording_id"),
                     source_id=message["source_id"],
                     session_id=message.get("session_id"),
+                    camera_role=message.get("camera_role"),
+                    stream_epoch=message.get("stream_epoch"),
+                    segment_index=message.get("segment_index"),
                     segment_path=message["segment_path"],
                     started_at=message["started_at"],
                     ended_at=message["ended_at"],
                     frame_count=message["frame_count"],
                     size_bytes=message["size_bytes"],
+                    fps=message.get("fps"),
+                    codec=message.get("codec"),
+                    sha256=message.get("sha256"),
+                    corrupted=bool(message.get("corrupted", False)),
+                    immutable=bool(message.get("immutable", True)),
+                    metadata=message.get("metadata"),
+                    frames=message.get("frames"),
+                )
+            elif message["kind"] == "MEDIA_COVERAGE":
+                self.artifact_repo.upsert_media_coverage(
+                    session_id=message["session_id"],
+                    source_id=message["source_id"],
+                    archive_required=bool(
+                        message.get("archive_required")
+                    ),
+                    frames_acquired=int(
+                        message.get("frames_acquired") or 0
+                    ),
+                    frames_processed=int(
+                        message.get("frames_processed") or 0
+                    ),
+                    frames_archived=int(
+                        message.get("frames_archived") or 0
+                    ),
+                    segments_produced=int(
+                        message.get("segments_produced") or 0
+                    ),
+                    segments_corrupted=int(
+                        message.get("segments_corrupted") or 0
+                    ),
+                    bytes_used=int(message.get("bytes_used") or 0),
+                    details=dict(message.get("details") or {}),
                 )
 
     def drain_inference_results(self) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import queue
 import threading
@@ -202,51 +203,159 @@ def _annotate_frame(image, observations: list[Observation], camera_id: str, fps:
 
 
 class _SegmentRecorder:
-    def __init__(self, *, source_id: str, session_id: str, segment_seconds: int):
+    def __init__(
+        self,
+        *,
+        source_id: str,
+        session_id: str,
+        camera_role: str,
+        segment_seconds: int,
+        recordings_dir: Path = RECORDINGS_DIR,
+    ):
         self.source_id = source_id
         self.session_id = session_id
+        self.camera_role = camera_role
         self.segment_seconds = segment_seconds
+        self.recordings_dir = Path(recordings_dir)
         self.writer = None
         self.segment_started_at = 0.0
         self.segment_path: Path | None = None
+        self.recording_id: str | None = None
+        self.stream_epoch: int | None = None
+        self.segment_index = -1
+        self.segment_fps = 0.0
+        self.last_timestamp_global = 0.0
+        self.frames: list[dict[str, Any]] = []
+        self.frame_count = 0
+        self.frames_archived_total = 0
+        self.segments_produced = 0
+        self.segments_corrupted = 0
+        self.bytes_used = 0
+
+    def _open(self, frame, fps: float) -> None:
+        self.segment_index += 1
+        self.recording_id = str(uuid.uuid4())
+        self.stream_epoch = int(frame.stream_epoch)
+        self.segment_started_at = float(frame.timestamp_global)
+        self.last_timestamp_global = float(frame.timestamp_global)
+        self.segment_fps = max(1.0, float(fps))
+        self.segment_path = (
+            self.recordings_dir
+            / self.session_id
+            / self.source_id
+            / (
+                f"segment-{self.segment_index:06d}-"
+                f"epoch-{self.stream_epoch}-{self.recording_id[:8]}.mp4"
+            )
+        )
+        self.segment_path.parent.mkdir(parents=True, exist_ok=True)
+        height, width = frame.image.shape[:2]
+        self.writer = cv2.VideoWriter(
+            str(self.segment_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            self.segment_fps,
+            (width, height),
+        )
+        if not self.writer.isOpened():
+            self.writer.release()
+            self.writer = None
+            raise RuntimeError(
+                f"Impossible d'ouvrir le writer d'archive: {self.segment_path}"
+            )
+        self.frames = []
         self.frame_count = 0
 
-    def write(self, frame, fps: float, timestamp_global: float) -> dict[str, Any] | None:
-        now = float(timestamp_global)
-        if self.writer is None or (now - self.segment_started_at) >= float(self.segment_seconds):
-            finished = self.close()
-            self.segment_started_at = now
-            self.segment_path = RECORDINGS_DIR / self.source_id / f"{int(now)}.mp4"
-            self.segment_path.parent.mkdir(parents=True, exist_ok=True)
-            height, width = frame.shape[:2]
-            self.writer = cv2.VideoWriter(
-                str(self.segment_path),
-                cv2.VideoWriter_fourcc(*"mp4v"),
-                max(1.0, fps),
-                (width, height),
+    def write(self, frame, fps: float) -> dict[str, Any] | None:
+        now = float(frame.timestamp_global)
+        rotate = (
+            self.writer is not None
+            and (
+                (now - self.segment_started_at) >= float(self.segment_seconds)
+                or int(frame.stream_epoch) != int(self.stream_epoch or 0)
             )
-            self.frame_count = 0
-            if finished:
-                return finished
-        self.writer.write(frame)
+        )
+        finished = self.close() if rotate else None
+        if self.writer is None:
+            self._open(frame, fps)
+        if self.writer is None:
+            raise RuntimeError("Writer d'archive indisponible.")
+        segment_frame_index = self.frame_count
+        self.writer.write(frame.image)
+        self.frames.append(
+            {
+                "camera_role": self.camera_role,
+                "stream_epoch": int(frame.stream_epoch),
+                "frame_index": int(frame.frame_index),
+                "timestamp_local": float(frame.timestamp_local),
+                "timestamp_global": float(frame.timestamp_global),
+                "segment_frame_index": segment_frame_index,
+            }
+        )
         self.frame_count += 1
-        return None
+        self.frames_archived_total += 1
+        self.last_timestamp_global = now
+        return finished
 
     def close(self, ended_at: float | None = None) -> dict[str, Any] | None:
-        if self.writer is None or self.segment_path is None:
+        if (
+            self.writer is None
+            or self.segment_path is None
+            or self.recording_id is None
+        ):
             return None
         self.writer.release()
+        path = self.segment_path
+        size_bytes = path.stat().st_size if path.exists() else 0
+        corrupted = size_bytes <= 0
+        if not corrupted:
+            capture = cv2.VideoCapture(str(path))
+            ok, _ = capture.read()
+            capture.release()
+            corrupted = not ok
+        digest = None
+        if path.is_file() and size_bytes > 0:
+            hasher = hashlib.sha256()
+            with path.open("rb") as handle:
+                for block in iter(
+                    lambda: handle.read(1024 * 1024), b""
+                ):
+                    hasher.update(block)
+            digest = hasher.hexdigest()
+        self.segments_produced += 1
+        self.segments_corrupted += int(corrupted)
+        self.bytes_used += size_bytes
         payload = {
+            "recording_id": self.recording_id,
             "source_id": self.source_id,
             "session_id": self.session_id,
-            "segment_path": str(self.segment_path),
+            "camera_role": self.camera_role,
+            "stream_epoch": int(self.stream_epoch or 0),
+            "segment_index": self.segment_index,
+            "segment_path": relative_to_root(path),
             "started_at": self.segment_started_at,
-            "ended_at": float(ended_at if ended_at is not None else time.time()),
+            "ended_at": float(
+                ended_at
+                if ended_at is not None
+                else self.last_timestamp_global
+            ),
             "frame_count": self.frame_count,
-            "size_bytes": self.segment_path.stat().st_size if self.segment_path.exists() else 0,
+            "size_bytes": size_bytes,
+            "fps": self.segment_fps,
+            "codec": "mp4v",
+            "sha256": digest,
+            "corrupted": corrupted,
+            "immutable": True,
+            "metadata": {
+                "archive_kind": "dataset_traceability",
+                "validated_on_site": False,
+            },
+            "frames": list(self.frames),
         }
         self.writer = None
         self.segment_path = None
+        self.recording_id = None
+        self.stream_epoch = None
+        self.frames = []
         self.frame_count = 0
         return payload
 
@@ -282,8 +391,10 @@ def camera_worker_loop(
     recorder = _SegmentRecorder(
         source_id=source_id,
         session_id=session_id,
+        camera_role=camera_role,
         segment_seconds=int(config.get("runtime", "recording_segment_seconds", default=10)),
     )
+    archive_required = bool(source_config.get("archive_required", False))
     session_obs_dir = OBSERVATIONS_DIR / session_id
     session_obs_dir.mkdir(parents=True, exist_ok=True)
     observations_path = session_obs_dir / f"{source_id}.jsonl"
@@ -338,6 +449,24 @@ def camera_worker_loop(
                 time.sleep(0.01)
             if stop_event.is_set():
                 break
+            optional_recording = bool(
+                control_flags.get(source_id, {}).get("recording")
+            )
+            if archive_required or optional_recording:
+                finished = recorder.write(
+                    frame,
+                    max(float(frame.source_fps or 0.0), 1.0),
+                )
+                if finished:
+                    runtime_queue.put(
+                        {"kind": "RECORDING", **finished}
+                    )
+            elif recorder.writer is not None:
+                finished = recorder.close(frame.timestamp_global)
+                if finished:
+                    runtime_queue.put(
+                        {"kind": "RECORDING", **finished}
+                    )
             ttl_seconds = float(
                 config.get(
                     "runtime", "inference_result_ttl_seconds", default=5.0
@@ -404,6 +533,10 @@ def camera_worker_loop(
                 repo.update_source_state(source_id, status=SourceStatus.ERROR.value, last_error=result["error"], preview_path=str(preview_path))
                 continue
             observations = [Observation(**row) for row in result["observations"]]
+            for observation in observations:
+                observation.attributes["_stream_epoch"] = int(
+                    frame.stream_epoch
+                )
             with observations_path.open("a", encoding="utf-8") as handle:
                 handle.write(
                     json.dumps(
@@ -447,15 +580,6 @@ def camera_worker_loop(
             if frame_counter % 5 == 0:
                 annotated = _annotate_frame(frame.image, observations, camera_id, fps, status)
                 cv2.imwrite(str(preview_path), annotated, [int(cv2.IMWRITE_JPEG_QUALITY), int(config.get("runtime", "preview_jpeg_quality", default=82))])
-            if control_flags.get(source_id, {}).get("recording"):
-                finished = recorder.write(frame.image, max(fps, 1.0), frame.timestamp_global)
-                if finished:
-                    runtime_queue.put({"kind": "RECORDING", **finished})
-            elif recorder.writer is not None:
-                finished = recorder.close(frame.timestamp_global)
-                if finished:
-                    runtime_queue.put({"kind": "RECORDING", **finished})
-
             repo.update_source_state(
                 source_id,
                 status=status,
@@ -464,22 +588,30 @@ def camera_worker_loop(
                 last_frame_ts=frame.timestamp_global,
                 preview_path=relative_to_root(preview_path),
                 details_path=relative_to_root(observations_path),
-                recording_enabled=bool(control_flags.get(source_id, {}).get("recording")),
+                recording_enabled=archive_required
+                or bool(
+                    control_flags.get(source_id, {}).get("recording")
+                ),
                 metrics={
                     **acquisition.metrics(),
                     **_inference_metrics(inference_result_store, source_id),
+                    "archive_required": archive_required,
+                    "frames_archived": recorder.frames_archived_total,
+                    "segments_produced": recorder.segments_produced,
+                    "segments_corrupted": recorder.segments_corrupted,
+                    "archive_bytes": recorder.bytes_used,
                     "validated_on_site": False,
                 },
             )
         for tracklet in tracker.flush():
             runtime_queue.put({"kind": "TRACKLET", "tracklet": asdict(tracklet)})
-        finished = recorder.close()
-        if finished:
-            runtime_queue.put({"kind": "RECORDING", **finished})
         repo.update_source_state(source_id, status=SourceStatus.OFFLINE.value, fps=0.0, preview_path=relative_to_root(preview_path))
     except Exception as exc:  # pragma: no cover - runtime
         repo.update_source_state(source_id, status=SourceStatus.ERROR.value, fps=0.0, last_error=str(exc), preview_path=relative_to_root(preview_path))
     finally:
+        finished = recorder.close()
+        if finished:
+            runtime_queue.put({"kind": "RECORDING", **finished})
         for key in list(control_flags.keys()):
             if (
                 str(key).startswith("__inflight__:")
@@ -487,3 +619,24 @@ def camera_worker_loop(
             ):
                 control_flags.pop(key, None)
         acquisition.stop()
+        metrics = acquisition.metrics()
+        runtime_queue.put(
+            {
+                "kind": "MEDIA_COVERAGE",
+                "session_id": session_id,
+                "source_id": source_id,
+                "archive_required": archive_required,
+                "frames_acquired": metrics["frames_received"],
+                "frames_processed": metrics["frames_processed"],
+                "frames_archived": recorder.frames_archived_total,
+                "segments_produced": recorder.segments_produced,
+                "segments_corrupted": recorder.segments_corrupted,
+                "bytes_used": recorder.bytes_used,
+                "details": {
+                    **metrics,
+                    "source_type": source_config["source_type"],
+                    "camera_role": camera_role,
+                    "automatic_archive": archive_required,
+                },
+            }
+        )

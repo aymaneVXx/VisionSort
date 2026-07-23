@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pandas as pd
 import streamlit as st
 
@@ -47,6 +49,21 @@ def render(context: UIContext) -> None:
         for sess in sessions[:10]:
             with st.container(border=True):
                 st.write(f"**{sess['name']}** ({sess['id']}) - état `{sess.get('pipeline_state')}` - demo={bool(sess.get('demo_mode'))}")
+                media_report = json.loads(
+                    sess.get("media_report_json") or "{}"
+                )
+                if media_report:
+                    message = (
+                        f"Archive média: `{media_report.get('status', 'INCONNU')}` "
+                        f"— {media_report.get('totals', {}).get('segments_produced', 0)} "
+                        "segment(s)"
+                    )
+                    if media_report.get("valid"):
+                        st.success(message)
+                    else:
+                        st.error(message)
+                        for error in media_report.get("errors", []):
+                            st.caption(error)
                 cols = st.columns(3)
                 if cols[0].button("Démarrer session", key=f"start-session-{sess['id']}"):
                     context.repo.enqueue_command(CommandType.START_SESSION, {"session_id": sess["id"]})

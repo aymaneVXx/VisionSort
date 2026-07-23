@@ -13,6 +13,17 @@ from visionsort.core.types import GlobalParcel, Tracklet
 from visionsort.database.db import VisionSortDB, utc_now
 
 
+def _source_file_sha256(uri: str) -> str | None:
+    path = Path(uri)
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 class ControlRepository:
     def __init__(self, db: VisionSortDB):
         self.db = db
@@ -77,6 +88,26 @@ class ControlRepository:
         )
         rows: list[tuple[Any, ...]] = []
         for item in sources:
+            source = self.db.fetch_one(
+                "SELECT source_type, uri FROM sources WHERE id = ?",
+                (item["source_id"],),
+            )
+            if source is None:
+                raise RuntimeError(
+                    f"Source introuvable pour la session: {item['source_id']}"
+                )
+            source_type = str(source["source_type"]).upper()
+            source_uri = str(source["uri"])
+            archive_required = bool(
+                item.get(
+                    "archive_required",
+                    source_type in {"RTSP", "VIDEO_FILE"}
+                    or (
+                        not demo_mode
+                        and bool(config.get("archive_media", True))
+                    ),
+                )
+            )
             rows.append(
                 (
                     f"sesssrc-{uuid.uuid4().hex[:10]}",
@@ -85,6 +116,10 @@ class ControlRepository:
                     item["camera_role"],
                     float(item.get("time_offset_ms", 0.0)),
                     item.get("replay_fps"),
+                    source_type,
+                    source_uri,
+                    _source_file_sha256(source_uri),
+                    int(archive_required),
                     now,
                     now,
                 )
@@ -93,14 +128,25 @@ class ControlRepository:
             self.db.execute_many(
                 """
                 INSERT INTO capture_session_sources
-                (id, session_id, source_id, camera_role, time_offset_ms, replay_fps, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (id, session_id, source_id, camera_role, time_offset_ms,
+                 replay_fps, source_type_snapshot, source_uri_snapshot,
+                 source_sha256, archive_required, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
         return session_id
 
-    def update_capture_session(self, session_id: str, *, pipeline_state: str | None = None, started_at: float | None = None, ended_at: float | None = None, report_path: str | None = None) -> None:
+    def update_capture_session(
+        self,
+        session_id: str,
+        *,
+        pipeline_state: str | None = None,
+        started_at: float | None = None,
+        ended_at: float | None = None,
+        report_path: str | None = None,
+        media_report: dict[str, Any] | None = None,
+    ) -> None:
         fields: list[str] = []
         params: list[Any] = []
         if pipeline_state is not None:
@@ -115,6 +161,9 @@ class ControlRepository:
         if report_path is not None:
             fields.append("report_path = ?")
             params.append(report_path)
+        if media_report is not None:
+            fields.append("media_report_json = ?")
+            params.append(json.dumps(media_report))
         fields.append("updated_at = ?")
         params.append(utc_now())
         params.append(session_id)
@@ -248,6 +297,26 @@ class ControlRepository:
 
     def list_recordings(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self.db.fetch_all("SELECT * FROM recordings ORDER BY started_at DESC")]
+
+    def list_media_coverage(
+        self, session_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        if session_id is None:
+            rows = self.db.fetch_all(
+                """
+                SELECT * FROM session_media_coverage
+                ORDER BY updated_at DESC
+                """
+            )
+        else:
+            rows = self.db.fetch_all(
+                """
+                SELECT * FROM session_media_coverage
+                WHERE session_id = ? ORDER BY source_id
+                """,
+                (session_id,),
+            )
+        return [dict(row) for row in rows]
 
     def list_datasets(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self.db.fetch_all("SELECT * FROM datasets ORDER BY created_at DESC")]
@@ -589,16 +658,164 @@ class ArtifactRepository:
         ended_at: float,
         frame_count: int,
         size_bytes: int,
+        recording_id: str | None = None,
+        camera_role: str | None = None,
+        stream_epoch: int | None = None,
+        segment_index: int | None = None,
+        fps: float | None = None,
+        codec: str | None = None,
+        sha256: str | None = None,
+        corrupted: bool = False,
+        immutable: bool = True,
+        metadata: dict[str, Any] | None = None,
+        frames: list[dict[str, Any]] | None = None,
     ) -> str:
-        rec_id = str(uuid.uuid4())
+        rec_id = recording_id or str(uuid.uuid4())
+        now = utc_now()
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO recordings
+                (id, source_id, session_id, camera_role, stream_epoch,
+                 segment_index, segment_path, started_at, ended_at,
+                 frame_count, size_bytes, fps, codec, sha256, corrupted,
+                 immutable, metadata_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    rec_id,
+                    source_id,
+                    session_id,
+                    camera_role,
+                    stream_epoch,
+                    segment_index,
+                    segment_path,
+                    started_at,
+                    ended_at,
+                    frame_count,
+                    size_bytes,
+                    fps,
+                    codec,
+                    sha256,
+                    int(corrupted),
+                    int(immutable),
+                    json.dumps(metadata or {}),
+                    now,
+                ),
+            )
+            if session_id and frames:
+                conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO recording_frames
+                    (id, recording_id, session_id, source_id, camera_role,
+                     stream_epoch, frame_index, timestamp_local,
+                     timestamp_global, segment_frame_index, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            str(
+                                frame.get("id")
+                                or f"{rec_id}:{int(frame['segment_frame_index'])}"
+                            ),
+                            rec_id,
+                            session_id,
+                            source_id,
+                            str(frame.get("camera_role") or camera_role or ""),
+                            int(frame.get("stream_epoch") or 0),
+                            int(frame["frame_index"]),
+                            float(frame["timestamp_local"]),
+                            float(frame["timestamp_global"]),
+                            int(frame["segment_frame_index"]),
+                            now,
+                        )
+                        for frame in frames
+                    ],
+                )
+        return rec_id
+
+    def upsert_media_coverage(
+        self,
+        *,
+        session_id: str,
+        source_id: str,
+        archive_required: bool,
+        frames_acquired: int,
+        frames_processed: int,
+        frames_archived: int,
+        segments_produced: int,
+        segments_corrupted: int,
+        bytes_used: int,
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        required_frames = max(0, int(frames_processed))
+        archived = max(0, int(frames_archived))
+        ratio = (
+            min(1.0, archived / required_frames)
+            if required_frames
+            else (1.0 if not archive_required else 0.0)
+        )
+        frames_unarchived = max(0, int(frames_acquired) - archived)
+        status = (
+            "NOT_REQUIRED"
+            if not archive_required
+            else "COMPLETE"
+            if ratio >= 1.0 and segments_corrupted <= 0
+            else "INSUFFICIENT"
+        )
         self.db.execute(
             """
-            INSERT INTO recordings (id, source_id, session_id, segment_path, started_at, ended_at, frame_count, size_bytes, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO session_media_coverage
+            (session_id, source_id, archive_required, frames_acquired,
+             frames_processed, frames_archived, frames_unarchived,
+             segments_produced, segments_corrupted, bytes_used,
+             coverage_ratio, status, details_json, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id, source_id) DO UPDATE SET
+                archive_required = excluded.archive_required,
+                frames_acquired = excluded.frames_acquired,
+                frames_processed = excluded.frames_processed,
+                frames_archived = excluded.frames_archived,
+                frames_unarchived = excluded.frames_unarchived,
+                segments_produced = excluded.segments_produced,
+                segments_corrupted = excluded.segments_corrupted,
+                bytes_used = excluded.bytes_used,
+                coverage_ratio = excluded.coverage_ratio,
+                status = excluded.status,
+                details_json = excluded.details_json,
+                updated_at = excluded.updated_at
             """,
-            (rec_id, source_id, session_id, segment_path, started_at, ended_at, frame_count, size_bytes, utc_now()),
+            (
+                session_id,
+                source_id,
+                int(archive_required),
+                int(frames_acquired),
+                required_frames,
+                archived,
+                frames_unarchived,
+                int(segments_produced),
+                int(segments_corrupted),
+                int(bytes_used),
+                ratio,
+                status,
+                json.dumps(details or {}),
+                utc_now(),
+            ),
         )
-        return rec_id
+        return {
+            "session_id": session_id,
+            "source_id": source_id,
+            "archive_required": bool(archive_required),
+            "frames_acquired": int(frames_acquired),
+            "frames_processed": required_frames,
+            "frames_archived": archived,
+            "frames_unarchived": frames_unarchived,
+            "segments_produced": int(segments_produced),
+            "segments_corrupted": int(segments_corrupted),
+            "bytes_used": int(bytes_used),
+            "coverage_ratio": ratio,
+            "status": status,
+        }
 
     def upsert_dataset(
         self,

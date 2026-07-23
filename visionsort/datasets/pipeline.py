@@ -17,6 +17,10 @@ from visionsort.core.enums import AnnotationStatus
 from visionsort.core.paths import DATASETS_DIR, ROOT_DIR
 from visionsort.database.db import VisionSortDB
 from visionsort.database.repositories import ArtifactRepository
+from visionsort.media.archive import (
+    FrameArchiveKey,
+    FrameArchiveResolver,
+)
 from visionsort.tracking.engine import bbox_iou
 
 
@@ -167,7 +171,7 @@ def _frame_signals(
 
 def _collect_frames(
     db: VisionSortDB, session_id: str
-) -> dict[tuple[str, int], dict[str, Any]]:
+) -> dict[tuple[str, int, int], dict[str, Any]]:
     tracklets = [
         dict(row)
         for row in db.fetch_all(
@@ -175,7 +179,7 @@ def _collect_frames(
             (session_id,),
         )
     ]
-    frames: dict[tuple[str, int], dict[str, Any]] = {}
+    frames: dict[tuple[str, int, int], dict[str, Any]] = {}
     for tracklet in tracklets:
         observation_path = Path(str(tracklet["observation_path"]))
         if not observation_path.is_absolute():
@@ -190,7 +194,9 @@ def _collect_frames(
                 or tracklet["camera_id"]
             )
             frame_index = int(observation["frame_index"])
-            key = (source_id, frame_index)
+            extra = observation.get("extra") or {}
+            stream_epoch = int(extra.get("_stream_epoch") or 0)
+            key = (source_id, stream_epoch, frame_index)
             frame = frames.setdefault(
                 key,
                 {
@@ -198,6 +204,7 @@ def _collect_frames(
                     "camera_role": observation.get("camera_role")
                     or tracklet.get("camera_role"),
                     "frame_index": frame_index,
+                    "stream_epoch": stream_epoch,
                     "timestamp_global": float(
                         observation.get(
                             "timestamp_global", tracklet["ended_at_global"]
@@ -233,7 +240,7 @@ def _collect_frames(
 
 
 def _select_and_synchronize(
-    frames: dict[tuple[str, int], dict[str, Any]],
+    frames: dict[tuple[str, int, int], dict[str, Any]],
     *,
     sync_window_seconds: float = 0.25,
     sync_tolerance_seconds: float = 0.35,
@@ -632,16 +639,19 @@ def build_dataset(
             raise RuntimeError(
                 f"Les CaptureSessions doivent être terminées: {unfinished}"
             )
+    frame_resolver = FrameArchiveResolver(db)
+    media_reports = {
+        current_session_id: frame_resolver.assert_session_ready(
+            current_session_id
+        )
+        for current_session_id in selected_sessions
+    }
     dataset_id = f"dataset-{uuid.uuid4().hex[:8]}"
     root = DATASETS_DIR / dataset_id
     for split in ("train", "val", "test"):
         (root / "images" / split).mkdir(parents=True, exist_ok=True)
         (root / "labels" / split).mkdir(parents=True, exist_ok=True)
 
-    sources_by_id = {
-        str(row["id"]): dict(row)
-        for row in db.fetch_all("SELECT * FROM sources")
-    }
     manifest_path = root / "manifest.csv"
     seen_hashes: list[tuple[int, str]] = []
     dedup_groups_skipped = 0
@@ -654,15 +664,16 @@ def build_dataset(
         for sample_group_id, anchor_time, synchronized_frames in groups:
             prepared: list[tuple[dict[str, Any], Any, int]] = []
             for frame in synchronized_frames:
-                source = sources_by_id.get(str(frame["source_id"]))
-                if source is None:
-                    continue
-                capture = cv2.VideoCapture(str(source["uri"]))
-                capture.set(cv2.CAP_PROP_POS_FRAMES, int(frame["frame_index"]))
-                ok, image = capture.read()
-                capture.release()
-                if not ok:
-                    continue
+                image, media_provenance = frame_resolver.resolve(
+                    FrameArchiveKey(
+                        session_id=current_session_id,
+                        source_id=str(frame["source_id"]),
+                        stream_epoch=int(frame.get("stream_epoch") or 0),
+                        frame_index=int(frame["frame_index"]),
+                        timestamp_global=float(frame["timestamp_global"]),
+                    )
+                )
+                frame["media_provenance"] = media_provenance
                 prepared.append((frame, image, _ahash64(image)))
             if not prepared:
                 continue
@@ -699,7 +710,11 @@ def build_dataset(
                     "source_id": frame["source_id"],
                     "camera_role": role,
                     "frame_index": frame["frame_index"],
+                    "stream_epoch": int(
+                        frame.get("stream_epoch") or 0
+                    ),
                     "timestamp_global": frame["timestamp_global"],
+                    "media_provenance": frame["media_provenance"],
                     "sample_group_anchor": anchor_time,
                     "selection_signals": frame["selection_signals"],
                     "group_reasons": frame["group_reasons"],
@@ -815,6 +830,7 @@ def build_dataset(
         "manifest_sha256": _sha256_file(manifest_path),
         "sampling_code_version": generation["sampling_code_version"],
         "generation_config": generation,
+        "media_coverage": media_reports,
     }
     artifact_repo.upsert_dataset(
         dataset_id=dataset_id,
