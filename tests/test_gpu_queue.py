@@ -1,5 +1,6 @@
 from visionsort.core.config import AppConfig
 from visionsort.database.db import VisionSortDB, utc_now
+from visionsort.datasets.pipeline import compute_dataset_fingerprint
 from visionsort.database.repositories import ArtifactRepository, JobRepository
 from visionsort.runtime.supervisor import GPUResourceArbiter, RuntimeSupervisor
 
@@ -17,6 +18,10 @@ def test_training_is_queued_while_inference_sources_are_active(tmp_path):
                 'manifest.csv', 'data.yaml', '{}', ?, ?)
         """,
         (now, now),
+    )
+    db.execute(
+        "UPDATE datasets SET dataset_fingerprint = ? WHERE id = ?",
+        (compute_dataset_fingerprint(db, "ready"), "ready"),
     )
     supervisor = RuntimeSupervisor.__new__(RuntimeSupervisor)
     supervisor.db = db

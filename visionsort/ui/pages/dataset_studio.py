@@ -17,24 +17,84 @@ def render(context: UIContext) -> None:
     demo_warning(context)
 
     sessions = context.repo.list_capture_sessions()
-    session_options = {f"{s['name']} ({s['id']})": s for s in sessions}
-    selected = st.selectbox("CaptureSession", list(session_options) if session_options else [], index=0 if session_options else None)
-    session = session_options[selected] if selected else None
+    completed_sessions = [
+        session for session in sessions if session.get("ended_at") is not None
+    ]
+    session_options = {
+        f"{session['name']} ({session['id']})": session
+        for session in completed_sessions
+    }
+    selected_labels = st.multiselect(
+        "CaptureSessions terminées",
+        list(session_options),
+        help="Une session complète reste dans un seul split.",
+    )
+    selected_sessions = [session_options[label] for label in selected_labels]
+    session = selected_sessions[0] if selected_sessions else None
 
-    if session:
-        st.write(f"État pipeline: `{session.get('pipeline_state')}` | demo={bool(session.get('demo_mode'))} | validé site={bool(session.get('site_validated'))}")
+    if selected_sessions:
+        details: list[dict[str, object]] = []
+        for selected_session in selected_sessions:
+            sources = context.repo.list_capture_session_sources(
+                selected_session["id"]
+            )
+            started_at = selected_session.get("started_at")
+            ended_at = selected_session.get("ended_at")
+            details.append(
+                {
+                    "session_id": selected_session["id"],
+                    "name": selected_session["name"],
+                    "status": selected_session.get("pipeline_state"),
+                    "cameras": ", ".join(
+                        str(source.get("camera_role")) for source in sources
+                    ),
+                    "duration_s": (
+                        round(float(ended_at) - float(started_at), 2)
+                        if started_at is not None and ended_at is not None
+                        else None
+                    ),
+                }
+            )
+        st.dataframe(pd.DataFrame(details), use_container_width=True)
         steps = context.repo.list_pipeline_steps(session["id"])
         if steps:
             st.dataframe(pd.DataFrame(steps), use_container_width=True)
         model_ids = [row["id"] for row in context.repo.list_models()]
 
         col1, col2, col3, col4 = st.columns(4)
-        dataset_name = col1.text_input("Nom dataset", value="dataset_session")
+        dataset_name = col1.text_input("Nom dataset", value="dataset_project")
         pseudo_label_model_id = col4.selectbox("Modèle pseudo-label", model_ids, index=0 if model_ids else None)
+        automatic_splits = st.checkbox(
+            "Affectation automatique des splits",
+            value=True,
+            help="Avec au moins trois sessions, train, val et test sont tous attribués.",
+        )
+        split_assignments: dict[str, str] = {}
+        if not automatic_splits:
+            split_columns = st.columns(3)
+            for index, selected_session in enumerate(selected_sessions):
+                split_assignments[selected_session["id"]] = split_columns[
+                    index % 3
+                ].selectbox(
+                    f"Split — {selected_session['name']}",
+                    ["train", "val", "test"],
+                    key=f"split-{selected_session['id']}",
+                )
         if col2.button("1) Sample"):
             context.repo.enqueue_command(
                 CommandType.RUN_PIPELINE_STEP,
-                {"session_id": session["id"], "step": "SAMPLE", "params": {"name": dataset_name}},
+                {
+                    "session_id": session["id"],
+                    "step": "SAMPLE",
+                    "params": {
+                        "name": dataset_name,
+                        "session_ids": [
+                            selected_session["id"]
+                            for selected_session in selected_sessions
+                        ],
+                        "split_assignments": split_assignments,
+                    },
+                },
             )
             st.success("Step SAMPLE en file.")
         if col3.button("2) Auto-annotate"):

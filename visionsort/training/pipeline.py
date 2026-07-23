@@ -14,6 +14,10 @@ from visionsort.core.enums import ModelStatus, PipelineState
 from visionsort.core.paths import LOGS_DIR, MODELS_DIR, REPORTS_DIR, ROOT_DIR
 from visionsort.database.db import VisionSortDB, utc_now
 from visionsort.database.repositories import ArtifactRepository
+from visionsort.datasets.pipeline import (
+    validate_dataset_splits,
+    verify_dataset_fingerprint,
+)
 from visionsort.inference.engine import DemoDetectionBackend
 from visionsort.runtime.demo_assets import ensure_demo_assets
 
@@ -299,6 +303,35 @@ def _resolve_best_pt(results: Any, job_id: str) -> Path:
     )
 
 
+def _validate_training_dataset(db: VisionSortDB, dataset_id: str) -> None:
+    fingerprint = verify_dataset_fingerprint(db, dataset_id)
+    if not fingerprint["valid"]:
+        raise RuntimeError(
+            "Entraînement refusé: le dataset_fingerprint ne correspond plus "
+            "aux fichiers finalisés."
+        )
+    integrity = validate_dataset_splits(db, dataset_id)
+    if not integrity["valid"]:
+        raise RuntimeError(
+            f"Entraînement refusé: fuite entre splits ({integrity['leaks']})."
+        )
+    real_sessions = db.fetch_one(
+        """
+        SELECT COUNT(*) AS count
+        FROM dataset_sessions ds
+        JOIN capture_sessions cs ON cs.id = ds.session_id
+        WHERE ds.dataset_id = ? AND cs.demo_mode = 0
+        """,
+        (dataset_id,),
+    )
+    if int((real_sessions["count"] if real_sessions else 0) or 0) > 0 and not integrity[
+        "all_splits_nonempty"
+    ]:
+        raise RuntimeError(
+            "Entraînement réel refusé: train, val et test doivent être non vides."
+        )
+
+
 def training_worker_loop(
     db_path: str, job_id: str, recipe: dict[str, Any], demo_mode: bool
 ) -> None:
@@ -326,6 +359,11 @@ def training_worker_loop(
             "FAILED",
             error_text="Entraînement refusé: le dataset n'est pas DATASET_READY.",
         )
+        return
+    try:
+        _validate_training_dataset(db, str(row["dataset_id"]))
+    except RuntimeError as exc:
+        repo.update_training_job(job_id, "FAILED", error_text=str(exc))
         return
 
     effective_recipe = dict(recipe)
@@ -635,6 +673,7 @@ def create_training_job(
         raise RuntimeError(
             "Entraînement refusé: le dataset doit être explicitement DATASET_READY."
         )
+    _validate_training_dataset(db, dataset_id)
     model = db.fetch_one("SELECT id FROM model_registry WHERE id = ?", (model_id,))
     if model is None:
         raise RuntimeError("Modèle initial introuvable.")

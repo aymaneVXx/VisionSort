@@ -245,6 +245,26 @@ class ControlRepository:
     def list_datasets(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self.db.fetch_all("SELECT * FROM datasets ORDER BY created_at DESC")]
 
+    def list_dataset_sessions(self, dataset_id: str) -> list[dict[str, Any]]:
+        return [
+            dict(row)
+            for row in self.db.fetch_all(
+                """
+                SELECT ds.dataset_id, ds.session_id, ds.split, cs.name,
+                       cs.pipeline_state, cs.started_at, cs.ended_at,
+                       COUNT(css.id) AS camera_count,
+                       GROUP_CONCAT(css.camera_role) AS camera_roles
+                FROM dataset_sessions ds
+                JOIN capture_sessions cs ON cs.id = ds.session_id
+                LEFT JOIN capture_session_sources css ON css.session_id = ds.session_id
+                WHERE ds.dataset_id = ?
+                GROUP BY ds.dataset_id, ds.session_id, ds.split
+                ORDER BY ds.split, cs.created_at
+                """,
+                (dataset_id,),
+            )
+        ]
+
     def list_dataset_items(self, dataset_id: str, limit: int = 500) -> list[dict[str, Any]]:
         return [
             dict(row)
@@ -419,20 +439,101 @@ class ArtifactRepository:
         )
         return rec_id
 
-    def upsert_dataset(self, dataset_id: str, name: str, root_path: str, status: str, manifest_path: str, data_yaml_path: str, summary: dict[str, Any]) -> None:
+    def upsert_dataset(
+        self,
+        dataset_id: str,
+        name: str,
+        root_path: str,
+        status: str,
+        manifest_path: str,
+        data_yaml_path: str,
+        summary: dict[str, Any],
+        *,
+        task: str = "detection",
+        dataset_fingerprint: str | None = None,
+        finalized_at: str | None = None,
+        generation_config: dict[str, Any] | None = None,
+    ) -> None:
         now = utc_now()
+        existing = self.db.fetch_one(
+            """
+            SELECT status, task, dataset_fingerprint, finalized_at,
+                   generation_config_json
+            FROM datasets WHERE id = ?
+            """,
+            (dataset_id,),
+        )
+        if existing is not None and existing["status"] == "DATASET_READY":
+            raise RuntimeError(
+                "Dataset finalisé immuable: créez une nouvelle version pour toute correction."
+            )
+        if existing is not None:
+            task = str(existing["task"])
+            dataset_fingerprint = (
+                dataset_fingerprint or existing["dataset_fingerprint"]
+            )
+            finalized_at = finalized_at or existing["finalized_at"]
+            if generation_config is None:
+                generation_config = json.loads(
+                    existing["generation_config_json"] or "{}"
+                )
         self.db.execute(
             """
-            INSERT INTO datasets (id, name, root_path, status, manifest_path, data_yaml_path, summary_json, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO datasets
+            (id, name, root_path, task, status, manifest_path, data_yaml_path,
+             dataset_fingerprint, finalized_at, generation_config_json,
+             summary_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 status = excluded.status,
                 manifest_path = excluded.manifest_path,
                 data_yaml_path = excluded.data_yaml_path,
+                dataset_fingerprint = excluded.dataset_fingerprint,
+                finalized_at = excluded.finalized_at,
+                generation_config_json = excluded.generation_config_json,
                 summary_json = excluded.summary_json,
                 updated_at = excluded.updated_at
             """,
-            (dataset_id, name, root_path, status, manifest_path, data_yaml_path, json.dumps(summary), now, now),
+            (
+                dataset_id,
+                name,
+                root_path,
+                task,
+                status,
+                manifest_path,
+                data_yaml_path,
+                dataset_fingerprint,
+                finalized_at,
+                json.dumps(generation_config or {}),
+                json.dumps(summary),
+                now,
+                now,
+            ),
+        )
+
+    def set_dataset_sessions(
+        self, dataset_id: str, split_assignments: dict[str, str]
+    ) -> None:
+        dataset = self.db.fetch_one(
+            "SELECT status FROM datasets WHERE id = ?", (dataset_id,)
+        )
+        if dataset is None:
+            raise RuntimeError("Dataset introuvable.")
+        if dataset["status"] == "DATASET_READY":
+            raise RuntimeError("Les splits d'un dataset finalisé sont immuables.")
+        self.db.execute(
+            "DELETE FROM dataset_sessions WHERE dataset_id = ?", (dataset_id,)
+        )
+        now = utc_now()
+        self.db.execute_many(
+            """
+            INSERT INTO dataset_sessions (dataset_id, session_id, split, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            [
+                (dataset_id, session_id, split, now)
+                for session_id, split in sorted(split_assignments.items())
+            ],
         )
 
     def add_dataset_item(
@@ -483,6 +584,19 @@ class ArtifactRepository:
         return item_id
 
     def update_dataset_item(self, item_id: str, *, annotation_status: str | None = None, label_path: str | None = None, metadata: dict[str, Any] | None = None) -> None:
+        dataset = self.db.fetch_one(
+            """
+            SELECT d.status
+            FROM datasets d
+            JOIN dataset_items di ON di.dataset_id = d.id
+            WHERE di.id = ?
+            """,
+            (item_id,),
+        )
+        if dataset is not None and dataset["status"] == "DATASET_READY":
+            raise RuntimeError(
+                "Dataset finalisé immuable: créez une nouvelle version pour modifier cet item."
+            )
         fields: list[str] = []
         params: list[Any] = []
         if annotation_status is not None:

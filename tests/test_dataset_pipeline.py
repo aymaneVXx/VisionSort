@@ -1,12 +1,19 @@
 from pathlib import Path
 import json
 
+import cv2
+import numpy as np
+
 from visionsort.database.db import VisionSortDB, utc_now
 from visionsort.datasets.pipeline import (
     build_dataset,
+    compute_dataset_fingerprint,
+    resolve_split_assignments,
     stable_session_split,
     validate_dataset_splits,
+    verify_dataset_fingerprint,
 )
+from visionsort.database.repositories import ArtifactRepository
 from visionsort.runtime.demo_assets import ensure_demo_assets
 
 
@@ -229,3 +236,199 @@ def test_split_validator_detects_session_leakage(tmp_path):
     integrity = validate_dataset_splits(db, "dataset-leak")
     assert integrity["valid"] is False
     assert any(leak["kind"] == "session_id_cross_split" for leak in integrity["leaks"])
+
+
+def test_multi_session_dataset_persists_explicit_splits(tmp_path):
+    db = VisionSortDB(tmp_path / "multi.db")
+    db.initialize()
+    now = utc_now()
+    assignments = {
+        "session-train": "train",
+        "session-val": "val",
+        "session-test": "test",
+    }
+    for index, (session_id, split) in enumerate(assignments.items()):
+        source_id = f"source-{split}"
+        frame_index = 0
+        video_path = tmp_path / f"{split}.avi"
+        writer = cv2.VideoWriter(
+            str(video_path),
+            cv2.VideoWriter_fourcc(*"MJPG"),
+            8.0,
+            (64, 64),
+        )
+        image = np.zeros((64, 64, 3), dtype=np.uint8)
+        if index == 0:
+            image[:, :32] = 255
+        elif index == 1:
+            image[:32, :] = 255
+        else:
+            image[np.indices((64, 64)).sum(axis=0) % 2 == 0] = 255
+        writer.write(image)
+        writer.release()
+        db.execute(
+            """
+            INSERT INTO sources
+            (id, name, role, source_type, uri, model_id, tracker_id, enabled,
+             created_at, updated_at)
+            VALUES (?, ?, 'C1', 'REPLAY', ?, 'demo_synth_det', 'greedy_iou',
+                    1, ?, ?)
+            """,
+            (source_id, source_id, str(video_path), now, now),
+        )
+        db.execute(
+            """
+            INSERT INTO capture_sessions
+            (id, name, pipeline_state, demo_mode, site_validated, config_json,
+             started_at, ended_at, created_at, updated_at)
+            VALUES (?, ?, 'PROCESSED', 1, 0, '{}', 1.0, 2.0, ?, ?)
+            """,
+            (session_id, session_id, now, now),
+        )
+        db.execute(
+            """
+            INSERT INTO capture_session_sources
+            (id, session_id, source_id, camera_role, time_offset_ms, replay_fps,
+             created_at, updated_at)
+            VALUES (?, ?, ?, 'C1', 0, 8.0, ?, ?)
+            """,
+            (f"link-{split}", session_id, source_id, now, now),
+        )
+        observation_path = tmp_path / f"{session_id}.jsonl"
+        observation_path.write_text(
+            json.dumps(
+                {
+                    "session_id": session_id,
+                    "source_id": source_id,
+                    "camera_id": source_id,
+                    "camera_role": "C1",
+                    "local_track_id": 1,
+                    "frame_index": frame_index,
+                    "timestamp_global": float(index + 1),
+                    "class_name": "parcel",
+                    "confidence": 0.9,
+                    "bbox": [50, 50, 120, 100],
+                    "velocity": [1, 0],
+                    "model_id": "demo_synth_det",
+                    "tracker_id": "greedy_iou",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        db.execute(
+            """
+            INSERT INTO tracklets
+            (tracklet_id, parcel_id, session_id, source_id, camera_id, camera_role,
+             local_track_id, started_at_global, ended_at_global, class_name,
+             last_zone_id, frame_count, avg_speed, observation_path, summary_json,
+             match_result, model_id, tracker_id)
+            VALUES (?, ?, ?, ?, ?, 'C1', 1, ?, ?, 'parcel', 'c1_exit', 1,
+                    1.0, ?, '{}', 'UNMATCHED', 'demo_synth_det', 'greedy_iou')
+            """,
+            (
+                f"track-{split}",
+                f"parcel-{split}",
+                session_id,
+                source_id,
+                source_id,
+                float(index + 1),
+                float(index + 1),
+                str(observation_path),
+            ),
+        )
+
+    result = build_dataset(
+        db,
+        session_ids=list(assignments),
+        split_assignments=assignments,
+        name="multi-session",
+    )
+
+    stored = {
+        row["session_id"]: row["split"]
+        for row in db.fetch_all(
+            "SELECT session_id, split FROM dataset_sessions WHERE dataset_id = ?",
+            (result["dataset_id"],),
+        )
+    }
+    assert stored == assignments
+    assert result["split_integrity"]["all_splits_nonempty"] is True
+    assert resolve_split_assignments(list(assignments)).keys() == assignments.keys()
+
+
+def test_finalized_dataset_fingerprint_detects_tampering_and_locks_items(tmp_path):
+    db = VisionSortDB(tmp_path / "fingerprint.db")
+    db.initialize()
+    now = utc_now()
+    root = tmp_path / "dataset"
+    root.mkdir()
+    image = root / "image.jpg"
+    label = root / "label.txt"
+    manifest = root / "manifest.csv"
+    data_yaml = root / "data.yaml"
+    image.write_bytes(b"image-bytes")
+    label.write_text("0 0.5 0.5 0.2 0.2\n", encoding="utf-8")
+    manifest.write_text("item_id,split\nitem-1,test\n", encoding="utf-8")
+    data_yaml.write_text("path: .\ntrain: images/train\n", encoding="utf-8")
+    db.execute(
+        """
+        INSERT INTO capture_sessions
+        (id, name, pipeline_state, demo_mode, site_validated, config_json,
+         started_at, ended_at, created_at, updated_at)
+        VALUES ('session-fp', 'Fingerprint', 'PROCESSED', 1, 0, '{}',
+                1.0, 2.0, ?, ?)
+        """,
+        (now, now),
+    )
+    db.execute(
+        """
+        INSERT INTO datasets
+        (id, name, root_path, status, manifest_path, data_yaml_path,
+         generation_config_json, summary_json, created_at, updated_at)
+        VALUES ('dataset-fp', 'Fingerprint', ?, 'SAMPLED', ?, ?, '{"seed":7}',
+                '{}', ?, ?)
+        """,
+        (str(root), str(manifest), str(data_yaml), now, now),
+    )
+    db.execute(
+        """
+        INSERT INTO dataset_sessions (dataset_id, session_id, split, created_at)
+        VALUES ('dataset-fp', 'session-fp', 'test', ?)
+        """,
+        (now,),
+    )
+    db.execute(
+        """
+        INSERT INTO dataset_items
+        (id, dataset_id, session_id, sample_group_id, split, source_id,
+         camera_role, frame_index, timestamp_global, image_path, label_path,
+         annotation_status, reason, score, metadata_json, created_at)
+        VALUES ('item-1', 'dataset-fp', 'session-fp', 'group-1', 'test',
+                'source-1', 'C1', 1, 1.0, ?, ?, 'HUMAN_VALIDATED',
+                'test', 1.0, '{}', ?)
+        """,
+        (str(image), str(label), now),
+    )
+    fingerprint = compute_dataset_fingerprint(db, "dataset-fp")
+    db.execute(
+        """
+        UPDATE datasets
+        SET status = 'DATASET_READY', dataset_fingerprint = ?, finalized_at = ?
+        WHERE id = 'dataset-fp'
+        """,
+        (fingerprint, now),
+    )
+
+    assert verify_dataset_fingerprint(db, "dataset-fp")["valid"] is True
+    try:
+        ArtifactRepository(db).update_dataset_item(
+            "item-1", annotation_status="REJECTED"
+        )
+    except RuntimeError as exc:
+        assert "immuable" in str(exc)
+    else:
+        raise AssertionError("Une version finalisée ne doit pas être modifiable.")
+
+    label.write_text("0 0.4 0.4 0.1 0.1\n", encoding="utf-8")
+    assert verify_dataset_fingerprint(db, "dataset-fp")["valid"] is False

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from visionsort.core.enums import PipelineState
 from visionsort.core.paths import ROOT_DIR
 from visionsort.database.db import VisionSortDB, utc_now
+from visionsort.datasets.pipeline import compute_dataset_fingerprint
 from visionsort.training.pipeline import create_training_job, training_worker_loop
 import visionsort.training.pipeline as training_pipeline
 
@@ -38,6 +39,10 @@ def test_training_worker_demo_updates_session_and_report(tmp_path):
             now,
             now,
         ),
+    )
+    db.execute(
+        "UPDATE datasets SET dataset_fingerprint = ? WHERE id = ?",
+        (compute_dataset_fingerprint(db, "ds-train"), "ds-train"),
     )
 
     recipe = {
@@ -151,6 +156,10 @@ def test_ultralytics_training_copies_real_best_pt_to_immutable_version(
             now,
             now,
         ),
+    )
+    db.execute(
+        "UPDATE datasets SET dataset_fingerprint = ? WHERE id = ?",
+        (compute_dataset_fingerprint(db, "ds-real"), "ds-real"),
     )
     run_dir = tmp_path / "fake-run"
 

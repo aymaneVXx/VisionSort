@@ -20,6 +20,7 @@ from visionsort.database.db import VisionSortDB, utc_now
 from visionsort.database.repositories import ArtifactRepository, ControlRepository
 from visionsort.datasets.pipeline import (
     build_dataset,
+    compute_dataset_fingerprint,
     rewrite_training_manifest,
     validate_dataset_splits,
 )
@@ -84,9 +85,27 @@ def _finalize_dataset_status(
         raise RuntimeError(f"Fuite entre splits: {split_integrity['leaks']}")
     summary["split_integrity"] = split_integrity
     summary["trainable_manifest_rows"] = trainable_manifest_rows
+    linked_sessions = [
+        dict(row)
+        for row in db.fetch_all(
+            """
+            SELECT ds.session_id, ds.split, cs.demo_mode
+            FROM dataset_sessions ds
+            JOIN capture_sessions cs ON cs.id = ds.session_id
+            WHERE ds.dataset_id = ?
+            """,
+            (dataset_id,),
+        )
+    ]
+    real_dataset = any(not bool(row["demo_mode"]) for row in linked_sessions)
+    split_complete = bool(split_integrity["all_splits_nonempty"])
+    summary["real_split_ready"] = split_complete
+    summary["real_dataset"] = real_dataset
     status = (
         "REVIEW_PENDING"
-        if needs_review > 0 or trainable <= 0
+        if needs_review > 0
+        or trainable <= 0
+        or (real_dataset and not split_complete)
         else "DATASET_READY"
     )
     pipeline_state = (
@@ -94,6 +113,14 @@ def _finalize_dataset_status(
         if status == "REVIEW_PENDING"
         else PipelineState.DATASET_READY.value
     )
+    fingerprint = (
+        compute_dataset_fingerprint(db, dataset_id)
+        if status == "DATASET_READY"
+        else None
+    )
+    finalized_at = utc_now() if status == "DATASET_READY" else None
+    if fingerprint:
+        summary["dataset_fingerprint"] = fingerprint
     artifact_repo.upsert_dataset(
         dataset_id=dataset_id,
         name=dataset["name"],
@@ -102,12 +129,18 @@ def _finalize_dataset_status(
         manifest_path=dataset["manifest_path"],
         data_yaml_path=dataset["data_yaml_path"],
         summary=summary,
+        dataset_fingerprint=fingerprint,
+        finalized_at=finalized_at,
     )
-    control_repo.update_capture_session(
-        session_id,
-        pipeline_state=pipeline_state,
-        report_path=str(report_path.relative_to(ROOT_DIR)),
-    )
+    session_targets = [
+        str(row["session_id"]) for row in linked_sessions
+    ] or [session_id]
+    for target_session_id in session_targets:
+        control_repo.update_capture_session(
+            target_session_id,
+            pipeline_state=pipeline_state,
+            report_path=str(report_path.relative_to(ROOT_DIR)),
+        )
     return {
         "dataset_id": dataset_id,
         "dataset_status": status,
@@ -117,6 +150,8 @@ def _finalize_dataset_status(
         "rejected": rejected,
         "trainable": trainable,
         "split_integrity": split_integrity,
+        "dataset_fingerprint": fingerprint,
+        "real_split_ready": split_complete,
     }
 
 
@@ -201,10 +236,18 @@ def pipeline_worker_loop(db_path: str, session_id: str, step: str, params: dict[
             session = control_repo.get_capture_session(session_id)
             if session is None:
                 raise RuntimeError("Session introuvable.")
+            selected_session_ids = [
+                str(value)
+                for value in (params.get("session_ids") or [session_id])
+            ]
             existing_dataset_id = str(session.get("last_dataset_id") or "")
             force = bool(params.get("force", False))
             existing_dataset = db.fetch_one("SELECT * FROM datasets WHERE id = ?", (existing_dataset_id,)) if existing_dataset_id else None
-            if existing_dataset is not None and not force:
+            if (
+                existing_dataset is not None
+                and not force
+                and selected_session_ids == [session_id]
+            ):
                 dataset_id = str(existing_dataset["id"])
                 result = {
                     "dataset_id": dataset_id,
@@ -215,12 +258,32 @@ def pipeline_worker_loop(db_path: str, session_id: str, step: str, params: dict[
                     "reused_existing": True,
                 }
             else:
-                result = build_dataset(db, session_id=session_id, name=str(params.get("name") or "dataset_from_session"))
+                result = build_dataset(
+                    db,
+                    session_ids=selected_session_ids,
+                    split_assignments={
+                        str(key): str(value)
+                        for key, value in dict(
+                            params.get("split_assignments") or {}
+                        ).items()
+                    }
+                    or None,
+                    name=str(params.get("name") or "dataset_project"),
+                    task=str(params.get("task") or "detection"),
+                    generation_config=dict(params.get("generation_config") or {}),
+                )
                 dataset_id = str(result["dataset_id"])
-            db.execute(
-                "UPDATE capture_sessions SET pipeline_state = ?, last_dataset_id = ?, report_path = ?, updated_at = ? WHERE id = ?",
-                (PipelineState.SAMPLED.value, dataset_id, str(report_path.relative_to(ROOT_DIR)), utc_now(), session_id),
-            )
+            for target_session_id in selected_session_ids:
+                db.execute(
+                    "UPDATE capture_sessions SET pipeline_state = ?, last_dataset_id = ?, report_path = ?, updated_at = ? WHERE id = ?",
+                    (
+                        PipelineState.SAMPLED.value,
+                        dataset_id,
+                        str(report_path.relative_to(ROOT_DIR)),
+                        utc_now(),
+                        target_session_id,
+                    ),
+                )
             outputs = {"dataset_id": dataset_id, **result}
         elif step_name == "AUTO_ANNOTATE":
             session = control_repo.get_capture_session(session_id)

@@ -262,12 +262,25 @@ class VisionSortDB:
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
                     root_path TEXT NOT NULL,
+                    task TEXT NOT NULL DEFAULT 'detection',
                     status TEXT NOT NULL,
                     manifest_path TEXT,
                     data_yaml_path TEXT,
+                    dataset_fingerprint TEXT,
+                    finalized_at TEXT,
+                    generation_config_json TEXT NOT NULL DEFAULT '{}',
                     summary_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS dataset_sessions (
+                    dataset_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    split TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (dataset_id, session_id),
+                    FOREIGN KEY (dataset_id) REFERENCES datasets(id),
+                    FOREIGN KEY (session_id) REFERENCES capture_sessions(id)
                 );
                 CREATE TABLE IF NOT EXISTS dataset_items (
                     id TEXT PRIMARY KEY,
@@ -334,6 +347,7 @@ class VisionSortDB:
                 CREATE INDEX IF NOT EXISTS idx_commands_status ON commands(status);
                 CREATE INDEX IF NOT EXISTS idx_tracklets_camera ON tracklets(camera_id, local_track_id);
                 CREATE INDEX IF NOT EXISTS idx_pipeline_steps_session ON pipeline_step_runs(session_id, step, created_at);
+                CREATE INDEX IF NOT EXISTS idx_dataset_sessions_session ON dataset_sessions(session_id, dataset_id);
                 """
             )
             self._migrate(conn)
@@ -455,6 +469,31 @@ class VisionSortDB:
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_pipeline_step_idempotency ON pipeline_step_runs(idempotency_key)"
             )
             conn.execute("PRAGMA user_version = 3")
+
+        if version < 4:
+            add_column("datasets", "task TEXT NOT NULL DEFAULT 'detection'")
+            add_column("datasets", "dataset_fingerprint TEXT")
+            add_column("datasets", "finalized_at TEXT")
+            add_column(
+                "datasets", "generation_config_json TEXT NOT NULL DEFAULT '{}'"
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dataset_sessions (
+                    dataset_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    split TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (dataset_id, session_id),
+                    FOREIGN KEY (dataset_id) REFERENCES datasets(id),
+                    FOREIGN KEY (session_id) REFERENCES capture_sessions(id)
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_dataset_sessions_session ON dataset_sessions(session_id, dataset_id)"
+            )
+            conn.execute("PRAGMA user_version = 4")
 
     def fetch_all(self, query: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
         with self.connect() as conn:
