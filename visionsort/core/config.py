@@ -25,6 +25,7 @@ DEFAULT_CONFIG = {
         "recording_segment_seconds": 10,
         "details_flush_every": 10,
         "max_inference_queue": 8,
+        "inference_result_ttl_seconds": 5.0,
     },
     "gpu": {
         "allow_training_while_inference": False,

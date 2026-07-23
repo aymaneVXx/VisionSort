@@ -165,12 +165,17 @@ def inference_worker_loop(
                 result_queue.put(
                     {
                         "kind": "INFER_RESULT",
+                        "request_id": message["request_id"],
                         "session_id": message["session_id"],
+                        "source_id": message["source_id"],
                         "camera_id": message["camera_id"],
                         "camera_role": message.get("camera_role"),
+                        "stream_epoch": message["stream_epoch"],
                         "frame_index": message["frame_index"],
                         "timestamp_local": message["timestamp_local"],
                         "timestamp_global": message["timestamp_global"],
+                        "created_at": message["created_at"],
+                        "expires_at": message["expires_at"],
                         "observations": [
                             asdict(obs)
                             for obs in engine.predict(
@@ -185,9 +190,14 @@ def inference_worker_loop(
                 result_queue.put(
                     {
                         "kind": "INFER_ERROR",
+                        "request_id": message.get("request_id"),
                         "session_id": message.get("session_id"),
+                        "source_id": message.get("source_id"),
                         "camera_id": message["camera_id"],
+                        "stream_epoch": message.get("stream_epoch"),
                         "frame_index": message["frame_index"],
+                        "created_at": message.get("created_at"),
+                        "expires_at": message.get("expires_at"),
                         "error": str(exc),
                     }
                 )

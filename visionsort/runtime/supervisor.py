@@ -6,6 +6,7 @@ import queue
 import signal
 import sys
 import time
+import uuid
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -74,6 +75,8 @@ class RuntimeSupervisor:
         self.runtime_queue = self.ctx.Queue()
         self.inference_stop_event = self.ctx.Event()
         self.control_flags = self.manager.dict()
+        self.active_source_sessions: dict[str, str] = {}
+        self.latest_stream_epoch_by_source: dict[str, int] = {}
         self.camera_processes: dict[str, tuple[mp.Process, Any]] = {}
         self.training_processes: dict[str, mp.Process] = {}
         self.pipeline_processes: dict[str, mp.Process] = {}
@@ -203,7 +206,15 @@ class RuntimeSupervisor:
         self.active_model_id = None
         return False
 
-    def start_source(self, source_id: str, *, session_id: str, session_start_global: float, replay_offset_ms: float = 0.0) -> None:
+    def start_source(
+        self,
+        source_id: str,
+        *,
+        session_id: str,
+        session_start_global: float,
+        replay_offset_ms: float = 0.0,
+        replay_loop: bool = False,
+    ) -> None:
         row = self.db.fetch_one("SELECT * FROM sources WHERE id = ?", (source_id,))
         if row is None:
             raise RuntimeError("Source introuvable.")
@@ -227,6 +238,9 @@ class RuntimeSupervisor:
         cfg["session_id"] = session_id
         cfg["session_start_global"] = float(session_start_global)
         cfg["replay_offset_ms"] = float(replay_offset_ms)
+        cfg["replay_loop"] = bool(replay_loop)
+        self.active_source_sessions[source_id] = session_id
+        self.latest_stream_epoch_by_source[source_id] = -1
         self.control_flags[source_id] = {"recording": False}
         process = self.ctx.Process(
             target=camera_worker_loop,
@@ -267,12 +281,15 @@ class RuntimeSupervisor:
         sources = self.control_repo.list_capture_session_sources(session_id)
         if not sources:
             raise RuntimeError("Session sans caméras assignées.")
+        session_config = json.loads(session.get("config_json") or "{}")
+        replay_loop = bool(session_config.get("replay_loop", False))
         for sess_src in sources:
             self.start_source(
                 sess_src["source_id"],
                 session_id=session_id,
                 session_start_global=start_global,
                 replay_offset_ms=float(sess_src.get("time_offset_ms") or 0.0),
+                replay_loop=replay_loop,
             )
 
     def stop_session(self, session_id: str) -> None:
@@ -282,6 +299,10 @@ class RuntimeSupervisor:
         self.control_repo.update_capture_session(session_id, ended_at=float(time.time()))
 
     def stop_source(self, source_id: str) -> None:
+        if hasattr(self, "active_source_sessions"):
+            self.active_source_sessions.pop(source_id, None)
+        if hasattr(self, "latest_stream_epoch_by_source"):
+            self.latest_stream_epoch_by_source.pop(source_id, None)
         data = self.camera_processes.pop(source_id, None)
         if data is None:
             self.control_repo.update_source_state(source_id, status=SourceStatus.OFFLINE.value, fps=0.0)
@@ -617,6 +638,7 @@ class RuntimeSupervisor:
                 )
 
     def drain_inference_results(self) -> None:
+        self._cleanup_expired_inference_results()
         while True:
             try:
                 message = self.inference_result_queue.get_nowait()
@@ -624,10 +646,62 @@ class RuntimeSupervisor:
                 return
             if message["kind"] == "MODEL_READY":
                 self.inference_result_store["__model_ready__"] = message
-            elif message["kind"] == "INFER_RESULT":
-                self.inference_result_store[f"{message['camera_id']}:{message['frame_index']}"] = message
-            elif message["kind"] == "INFER_ERROR":
-                self.inference_result_store[f"{message['camera_id']}:{message['frame_index']}"] = {"error": message["error"]}
+                continue
+            if message["kind"] not in {"INFER_RESULT", "INFER_ERROR"}:
+                continue
+            source_id = str(message.get("source_id") or "")
+            request_id = str(message.get("request_id") or "")
+            try:
+                uuid.UUID(request_id)
+            except (ValueError, TypeError):
+                self._increment_inference_result_metric(source_id, "ignored")
+                continue
+            active_sessions = getattr(self, "active_source_sessions", None)
+            if active_sessions is not None and active_sessions.get(source_id) != str(
+                message.get("session_id")
+            ):
+                self._increment_inference_result_metric(source_id, "ignored")
+                continue
+            epoch = int(message.get("stream_epoch") or 0)
+            epochs = getattr(self, "latest_stream_epoch_by_source", None)
+            if epochs is not None:
+                latest_epoch = int(epochs.get(source_id, -1))
+                if epoch < latest_epoch:
+                    self._increment_inference_result_metric(source_id, "ignored")
+                    continue
+                epochs[source_id] = max(latest_epoch, epoch)
+            if time.time() > float(message.get("expires_at") or 0.0):
+                self._increment_inference_result_metric(source_id, "late")
+                continue
+            stored = dict(message)
+            stored["stored_at"] = time.time()
+            if message["kind"] == "INFER_ERROR":
+                stored["error"] = message["error"]
+            self.inference_result_store[request_id] = stored
+
+    def _increment_inference_result_metric(
+        self, source_id: str, metric: str
+    ) -> None:
+        key = f"__inference_metrics__:{source_id}"
+        current = dict(self.inference_result_store.get(key, {}))
+        current[metric] = int(current.get(metric, 0)) + 1
+        self.inference_result_store[key] = current
+
+    def _cleanup_expired_inference_results(
+        self, *, now: float | None = None
+    ) -> None:
+        current_time = float(now if now is not None else time.time())
+        for request_id, result in list(self.inference_result_store.items()):
+            if str(request_id).startswith("__"):
+                continue
+            if not isinstance(result, dict):
+                continue
+            expires_at = float(result.get("expires_at") or 0.0)
+            if expires_at and expires_at <= current_time:
+                self.inference_result_store.pop(request_id, None)
+                self._increment_inference_result_metric(
+                    str(result.get("source_id") or ""), "expired"
+                )
 
     def refresh_jobs(self) -> None:
         for source_id, (process, _) in list(self.camera_processes.items()):

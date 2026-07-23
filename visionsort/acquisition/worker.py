@@ -4,6 +4,7 @@ import json
 import queue
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import asdict
 from pathlib import Path
@@ -21,6 +22,52 @@ from visionsort.database.repositories import ControlRepository
 from visionsort.events.engine import ParcelEventEngine
 from visionsort.sources.frame_sources import build_source
 from visionsort.tracking.engine import build_tracker
+
+
+def build_inference_request(
+    *,
+    frame,
+    source_id: str,
+    ttl_seconds: float,
+) -> dict[str, Any]:
+    now = time.time()
+    return {
+        "kind": "INFER",
+        "request_id": str(uuid.uuid4()),
+        "session_id": frame.session_id,
+        "source_id": source_id,
+        "camera_id": frame.camera_id,
+        "camera_role": frame.camera_role,
+        "stream_epoch": int(frame.stream_epoch),
+        "frame_index": int(frame.frame_index),
+        "timestamp_local": float(frame.timestamp_local),
+        "timestamp_global": float(frame.timestamp_global),
+        "created_at": now,
+        "expires_at": now + max(0.1, float(ttl_seconds)),
+        "image": frame.image,
+    }
+
+
+def _increment_inference_metric(
+    inference_result_store,
+    source_id: str,
+    metric: str,
+) -> None:
+    key = f"__inference_metrics__:{source_id}"
+    current = dict(inference_result_store.get(key, {}))
+    current[metric] = int(current.get(metric, 0)) + 1
+    inference_result_store[key] = current
+
+
+def _inference_metrics(inference_result_store, source_id: str) -> dict[str, int]:
+    return {
+        str(key): int(value)
+        for key, value in dict(
+            inference_result_store.get(
+                f"__inference_metrics__:{source_id}", {}
+            )
+        ).items()
+    }
 
 
 class LatestFrameBuffer:
@@ -249,6 +296,7 @@ def camera_worker_loop(
         session_start_global=float(source_config["session_start_global"]),
         replay_fps=source_config.get("replay_fps", 8.0),
         replay_offset_ms=source_config.get("replay_offset_ms", 0.0),
+        loop=bool(source_config.get("replay_loop", False)),
     )
     preview_path = PREVIEWS_DIR / f"{source_id}.jpg"
     status = SourceStatus.CONNECTING.value
@@ -283,16 +331,16 @@ def camera_worker_loop(
                     )
                 continue
 
-            message = {
-                "kind": "INFER",
-                "session_id": session_id,
-                "camera_id": camera_id,
-                "camera_role": camera_role,
-                "frame_index": frame.frame_index,
-                "timestamp_local": frame.timestamp_local,
-                "timestamp_global": frame.timestamp_global,
-                "image": frame.image,
-            }
+            ttl_seconds = float(
+                config.get(
+                    "runtime", "inference_result_ttl_seconds", default=5.0
+                )
+            )
+            message = build_inference_request(
+                frame=frame,
+                source_id=source_id,
+                ttl_seconds=ttl_seconds,
+            )
             try:
                 inference_request_queue.put_nowait(message)
             except queue.Full:
@@ -307,12 +355,38 @@ def camera_worker_loop(
                 )
                 continue
 
-            result_key = f"{camera_id}:{frame.frame_index}"
-            started_wait = time.time()
-            while result_key not in inference_result_store and (time.time() - started_wait) < 3.0 and not stop_event.is_set():
+            request_id = str(message["request_id"])
+            while (
+                request_id not in inference_result_store
+                and time.time() < float(message["expires_at"])
+                and not stop_event.is_set()
+            ):
                 time.sleep(0.01)
-            result = inference_result_store.pop(result_key, None)
+            result = inference_result_store.pop(request_id, None)
             if result is None:
+                _increment_inference_metric(
+                    inference_result_store, source_id, "timed_out"
+                )
+                acquisition.mark_dropped()
+                continue
+            expected_context = (
+                session_id,
+                source_id,
+                camera_id,
+                int(frame.stream_epoch),
+                int(frame.frame_index),
+            )
+            result_context = (
+                result.get("session_id"),
+                result.get("source_id"),
+                result.get("camera_id"),
+                int(result.get("stream_epoch", -1)),
+                int(result.get("frame_index", -1)),
+            )
+            if result_context != expected_context:
+                _increment_inference_metric(
+                    inference_result_store, source_id, "ignored"
+                )
                 acquisition.mark_dropped()
                 continue
             if "error" in result:
@@ -327,6 +401,8 @@ def camera_worker_loop(
                             "source_id": source_id,
                             "camera_id": camera_id,
                             "camera_role": camera_role,
+                            "request_id": request_id,
+                            "stream_epoch": frame.stream_epoch,
                             "frame_index": frame.frame_index,
                             "timestamp_local": frame.timestamp_local,
                             "timestamp_global": frame.timestamp_global,
@@ -378,7 +454,11 @@ def camera_worker_loop(
                 preview_path=relative_to_root(preview_path),
                 details_path=relative_to_root(observations_path),
                 recording_enabled=bool(control_flags.get(source_id, {}).get("recording")),
-                metrics={**acquisition.metrics(), "validated_on_site": False},
+                metrics={
+                    **acquisition.metrics(),
+                    **_inference_metrics(inference_result_store, source_id),
+                    "validated_on_site": False,
+                },
             )
         for tracklet in tracker.flush():
             runtime_queue.put({"kind": "TRACKLET", "tracklet": asdict(tracklet)})

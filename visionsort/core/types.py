@@ -29,6 +29,7 @@ class Frame:
     timestamp_global: float
     image: np.ndarray
     source_fps: float = 0.0
+    stream_epoch: int = 0
 
 
 @dataclass(slots=True)
