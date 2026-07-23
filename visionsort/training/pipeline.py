@@ -353,6 +353,23 @@ def training_worker_loop(
             job_id, "FAILED", error_text="Dataset ou modèle introuvable."
         )
         return
+    dataset_task = str(dataset_row["task"] or "detection")
+    if dataset_task not in {"detection", "segmentation", "pose"}:
+        repo.update_training_job(
+            job_id,
+            "FAILED",
+            error_text=(
+                f"Pipeline d'entraînement indisponible pour la tâche {dataset_task}."
+            ),
+        )
+        return
+    if str(model_row["task"]) != dataset_task:
+        repo.update_training_job(
+            job_id,
+            "FAILED",
+            error_text="La tâche du modèle initial ne correspond pas au dataset.",
+        )
+        return
     if dataset_row["status"] != "DATASET_READY":
         repo.update_training_job(
             job_id,
@@ -666,7 +683,9 @@ def training_worker_loop(
 def create_training_job(
     db: VisionSortDB, dataset_id: str, model_id: str, recipe: dict[str, Any]
 ) -> str:
-    dataset = db.fetch_one("SELECT status FROM datasets WHERE id = ?", (dataset_id,))
+    dataset = db.fetch_one(
+        "SELECT status, task FROM datasets WHERE id = ?", (dataset_id,)
+    )
     if dataset is None:
         raise RuntimeError("Dataset introuvable.")
     if dataset["status"] != "DATASET_READY":
@@ -674,9 +693,20 @@ def create_training_job(
             "Entraînement refusé: le dataset doit être explicitement DATASET_READY."
         )
     _validate_training_dataset(db, dataset_id)
-    model = db.fetch_one("SELECT id FROM model_registry WHERE id = ?", (model_id,))
+    model = db.fetch_one(
+        "SELECT id, task FROM model_registry WHERE id = ?", (model_id,)
+    )
     if model is None:
         raise RuntimeError("Modèle initial introuvable.")
+    dataset_task = str(dataset["task"] or "detection")
+    if dataset_task not in {"detection", "segmentation", "pose"}:
+        raise RuntimeError(
+            f"Pipeline d'entraînement indisponible pour la tâche {dataset_task}."
+        )
+    if str(model["task"]) != dataset_task:
+        raise RuntimeError(
+            "La tâche du modèle initial ne correspond pas à celle du dataset."
+        )
     repo = ArtifactRepository(db)
     log_path = LOGS_DIR / f"training_{int(time.time())}.log"
     return repo.add_training_job(

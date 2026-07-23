@@ -7,6 +7,11 @@ from visionsort.annotations.auto import (
     build_auto_annotator,
 )
 from visionsort.annotations.quality import QualityGate
+from visionsort.annotations.review import (
+    export_review_cases,
+    import_review_annotations,
+    render_review_overlay,
+)
 
 __all__ = [
     "DetectionAutoAnnotator",
@@ -16,4 +21,7 @@ __all__ = [
     "MultiCameraReIDExporter",
     "QualityGate",
     "build_auto_annotator",
+    "render_review_overlay",
+    "export_review_cases",
+    "import_review_annotations",
 ]

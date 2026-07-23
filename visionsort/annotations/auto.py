@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+from itertools import combinations
 from pathlib import Path
 from typing import Any
 
 import cv2
 
+from visionsort.core.config import relative_to_root
 from visionsort.core.paths import ROOT_DIR
 from visionsort.database.db import VisionSortDB
 
@@ -186,8 +189,24 @@ class SegmentationAutoAnnotator(BaseAutoAnnotator):
         mask = detection.get("mask") or []
         if class_name not in names or len(mask) < 3:
             return None
+        points = [
+            (float(point[0]), float(point[1]))
+            for point in mask
+            if len(point) >= 2
+            and math.isfinite(float(point[0]))
+            and math.isfinite(float(point[1]))
+        ]
+        area = abs(
+            sum(
+                points[index - 1][0] * points[index][1]
+                - points[index][0] * points[index - 1][1]
+                for index in range(len(points))
+            )
+        ) / 2.0
+        if len(points) < 3 or area <= 1.0:
+            return None
         coordinates = " ".join(
-            f"{float(x) / width:.6f} {float(y) / height:.6f}" for x, y in mask
+            f"{x / width:.6f} {y / height:.6f}" for x, y in points
         )
         return f"{names[class_name]} {coordinates}"
 
@@ -228,6 +247,8 @@ class LocalTrackingExporter:
                         "dataset_item_id": item["id"],
                         "camera_id": item.get("source_id"),
                         "frame_index": item.get("frame_index"),
+                        "timestamp_global": item.get("timestamp_global"),
+                        "session_id": item.get("session_id"),
                         "track_identity": [
                             item.get("source_id"),
                             observation["local_track_id"],
@@ -244,21 +265,62 @@ class LocalTrackingExporter:
 
 
 class MultiCameraReIDExporter:
-    def export(self, items: list[dict[str, Any]], output_path: Path) -> int:
+    def export(
+        self,
+        items: list[dict[str, Any]],
+        output_path: Path,
+        *,
+        crops_dir: Path | None = None,
+    ) -> dict[str, Any]:
+        crops_dir = crops_dir or output_path.parent / "reid_crops"
+        crops_dir.mkdir(parents=True, exist_ok=True)
         rows: list[dict[str, Any]] = []
+        ambiguous = 0
+        missing_identity = 0
         for item in items:
             metadata = json.loads(item.get("metadata_json") or "{}")
-            for observation in metadata.get("observations", []):
+            image_path = Path(str(item["image_path"]))
+            if not image_path.is_absolute():
+                image_path = ROOT_DIR / image_path
+            image = cv2.imread(str(image_path))
+            for observation_index, observation in enumerate(
+                metadata.get("observations", [])
+            ):
+                if observation.get("class_name") != "parcel":
+                    continue
+                if observation.get("match_result") == "AMBIGUOUS":
+                    ambiguous += 1
+                    continue
                 global_id = observation.get("global_parcel_id")
                 if not global_id:
+                    missing_identity += 1
+                    continue
+                bbox = observation.get("bbox") or []
+                if image is None or len(bbox) != 4:
+                    missing_identity += 1
+                    continue
+                height, width = image.shape[:2]
+                x1, y1, x2, y2 = [int(round(float(value))) for value in bbox]
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(width, x2), min(height, y2)
+                if x2 <= x1 or y2 <= y1:
+                    missing_identity += 1
+                    continue
+                crop_path = crops_dir / f"{item['id']}_{observation_index}.jpg"
+                if not cv2.imwrite(str(crop_path), image[y1:y2, x1:x2]):
+                    missing_identity += 1
                     continue
                 rows.append(
                     {
                         "dataset_item_id": item["id"],
                         "global_parcel_id": global_id,
                         "camera_id": item.get("source_id"),
+                        "session_id": item.get("session_id"),
+                        "split": item.get("split"),
                         "local_track_id": observation.get("local_track_id"),
                         "timestamp_global": item.get("timestamp_global"),
+                        "bbox": bbox,
+                        "crop_path": relative_to_root(crop_path),
                         "embedding": observation.get("appearance_hint"),
                     }
                 )
@@ -266,7 +328,52 @@ class MultiCameraReIDExporter:
             "\n".join(json.dumps(row) for row in rows) + ("\n" if rows else ""),
             encoding="utf-8",
         )
-        return len(rows)
+        positive_pairs: list[dict[str, Any]] = []
+        negative_pairs: list[dict[str, Any]] = []
+        by_session: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            by_session.setdefault(str(row["session_id"]), []).append(row)
+        for session_id, session_rows in by_session.items():
+            for left, right in combinations(session_rows, 2):
+                if left["split"] != right["split"]:
+                    continue
+                pair = {
+                    "session_id": session_id,
+                    "left_crop": left["crop_path"],
+                    "right_crop": right["crop_path"],
+                    "left_camera": left["camera_id"],
+                    "right_camera": right["camera_id"],
+                }
+                if (
+                    left["global_parcel_id"] == right["global_parcel_id"]
+                    and left["camera_id"] != right["camera_id"]
+                ):
+                    positive_pairs.append({**pair, "label": 1})
+                elif left["global_parcel_id"] != right["global_parcel_id"]:
+                    negative_pairs.append({**pair, "label": 0})
+        pairs_path = output_path.with_name("reid_pairs.jsonl")
+        pairs = [*positive_pairs, *negative_pairs]
+        pairs_path.write_text(
+            "\n".join(json.dumps(pair) for pair in pairs)
+            + ("\n" if pairs else ""),
+            encoding="utf-8",
+        )
+        if ambiguous:
+            status = "NEEDS_REVIEW"
+        elif not positive_pairs or not negative_pairs or missing_identity:
+            status = "NOT_READY"
+        else:
+            status = "READY"
+        return {
+            "status": status,
+            "crops": len(rows),
+            "positive_pairs": len(positive_pairs),
+            "negative_pairs": len(negative_pairs),
+            "ambiguous_observations": ambiguous,
+            "missing_global_identity": missing_identity,
+            "manifest_path": relative_to_root(output_path),
+            "pairs_path": relative_to_root(pairs_path),
+        }
 
 
 def build_auto_annotator(

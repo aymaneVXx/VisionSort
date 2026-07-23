@@ -49,6 +49,8 @@ class ModelTask(str, Enum):
     DETECTION = "detection"
     SEGMENTATION = "segmentation"
     POSE = "pose"
+    LOCAL_TRACKING = "local_tracking"
+    REID_MULTICAMERA = "reid_multicamera"
 
 
 class ModelStatus(str, Enum):

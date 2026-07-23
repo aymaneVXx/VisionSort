@@ -3,6 +3,7 @@ import json
 
 import cv2
 import numpy as np
+import yaml
 
 from visionsort.database.db import VisionSortDB, utc_now
 from visionsort.datasets.pipeline import (
@@ -89,6 +90,24 @@ def test_build_dataset_from_tracklet_jsonl(tmp_path):
     assert summary["manifest_sha256"]
     assert summary["split_integrity"]["valid"] is True
     assert summary["split_assignment"] == stable_session_split("session-test")
+
+    pose_result = build_dataset(
+        db, session_id="session-test", name="pytest_pose", task="pose"
+    )
+    pose_dataset = db.fetch_one(
+        "SELECT * FROM datasets WHERE id = ?", (pose_result["dataset_id"],)
+    )
+    assert pose_dataset is not None
+    pose_yaml = yaml.safe_load(
+        Path(pose_dataset["data_yaml_path"]).read_text(encoding="utf-8")
+        if Path(pose_dataset["data_yaml_path"]).is_absolute()
+        else (Path.cwd() / pose_dataset["data_yaml_path"]).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert pose_yaml["task"] == "pose"
+    assert pose_yaml["kpt_shape"] == [17, 3]
+    assert len(pose_yaml["flip_idx"]) == 17
 
 
 def test_dataset_groups_every_visible_instance_in_the_same_frame(tmp_path):

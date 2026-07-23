@@ -593,6 +593,15 @@ def build_dataset(
     generation_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     artifact_repo = ArtifactRepository(db)
+    supported_tasks = {
+        "detection",
+        "segmentation",
+        "pose",
+        "local_tracking",
+        "reid_multicamera",
+    }
+    if task not in supported_tasks:
+        raise ValueError(f"Tâche dataset non supportée: {task}")
     selected_sessions = list(
         dict.fromkeys(
             str(value)
@@ -735,20 +744,40 @@ def build_dataset(
 
     rewrite_training_manifest(db, dataset_id, manifest_path)
     data_yaml_path = root / "data.yaml"
+    data_yaml: dict[str, Any] = {
+        "path": relative_to_root(root),
+        "train": "images/train",
+        "val": "images/val",
+        "test": "images/test",
+        "task": task,
+        "names": (
+            {0: "person"} if task == "pose" else {0: "parcel", 1: "person"}
+        ),
+    }
+    if task == "pose":
+        data_yaml["kpt_shape"] = [17, 3]
+        data_yaml["flip_idx"] = [
+            0,
+            2,
+            1,
+            4,
+            3,
+            6,
+            5,
+            8,
+            7,
+            10,
+            9,
+            12,
+            11,
+            14,
+            13,
+            16,
+            15,
+        ]
     data_yaml_path.write_text(
         yaml.safe_dump(
-            {
-                "path": relative_to_root(root),
-                "train": "images/train",
-                "val": "images/val",
-                "test": "images/test",
-                "names": {
-                    0: "parcel",
-                    1: "person",
-                    2: "left_wrist",
-                    3: "right_wrist",
-                },
-            },
+            data_yaml,
             sort_keys=False,
         ),
         encoding="utf-8",
@@ -772,6 +801,7 @@ def build_dataset(
         ),
         "dedup_groups_skipped": dedup_groups_skipped,
         "validated_on_site": False,
+        "task": task,
         "selection_strategy": generation["selection_strategy"],
         "session_id": selected_sessions[0],
         "session_ids": selected_sessions,
