@@ -1121,7 +1121,7 @@ class ArtifactRepository:
     def update_dataset_item(self, item_id: str, *, annotation_status: str | None = None, label_path: str | None = None, metadata: dict[str, Any] | None = None) -> None:
         dataset = self.db.fetch_one(
             """
-            SELECT d.status, d.task, d.data_yaml_path,
+            SELECT d.id AS dataset_id, d.status, d.task, d.data_yaml_path,
                    di.label_path, di.metadata_json
             FROM datasets d
             JOIN dataset_items di ON di.dataset_id = d.id
@@ -1133,38 +1133,23 @@ class ArtifactRepository:
             raise RuntimeError(
                 "Dataset finalisé immuable: créez une nouvelle version pour modifier cet item."
             )
-        if (
-            dataset is not None
-            and annotation_status == "HUMAN_VALIDATED"
-            and str(dataset["task"]) == "pose"
-        ):
-            from visionsort.annotations.validators import PoseLabelValidator
+        if dataset is not None and annotation_status == "HUMAN_VALIDATED":
+            from visionsort.datasets.integrity import (
+                DatasetIntegrityValidator,
+            )
 
-            effective_label_path = label_path or dataset["label_path"]
-            if not effective_label_path:
-                raise RuntimeError(
-                    "Validation Pose refusée: aucun fichier label."
-                )
-            effective_metadata = (
-                metadata
-                if metadata is not None
-                else json.loads(dataset["metadata_json"] or "{}")
+            validation_errors = DatasetIntegrityValidator(
+                self.db, str(dataset["dataset_id"])
+            ).validate_item_label(
+                item_id,
+                label_path=label_path or dataset["label_path"],
+                metadata=metadata,
             )
-            expected = effective_metadata.get("instance_count")
-            if expected is None:
-                expected = effective_metadata.get("pseudo_label_count")
-            report = PoseLabelValidator(
-                str(dataset["data_yaml_path"] or "")
-            ).validate(
-                str(effective_label_path),
-                expected_instances=(
-                    int(expected) if expected is not None else None
-                ),
-            )
-            if not report.valid:
+            if validation_errors:
+                task_name = str(dataset["task"]).capitalize()
                 raise RuntimeError(
-                    "Validation Pose refusée: "
-                    + " ".join(report.errors)
+                    f"Validation {task_name} refusée: "
+                    + " ".join(validation_errors)
                 )
         fields: list[str] = []
         params: list[Any] = []

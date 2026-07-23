@@ -269,6 +269,18 @@ def test_visual_review_overlay_export_and_reimport(tmp_path):
     db.initialize()
     now = utc_now()
     dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    (dataset_root / "data.yaml").write_text(
+        "path: .\n"
+        "train: images/train\n"
+        "val: images/val\n"
+        "test: images/test\n"
+        "task: detection\n"
+        "names:\n"
+        "  0: parcel\n"
+        "  1: person\n",
+        encoding="utf-8",
+    )
     db.execute(
         """
         INSERT INTO datasets

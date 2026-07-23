@@ -17,6 +17,7 @@ from visionsort.core.enums import AnnotationStatus
 from visionsort.core.paths import DATASETS_DIR, ROOT_DIR
 from visionsort.database.db import VisionSortDB
 from visionsort.database.repositories import ArtifactRepository
+from visionsort.datasets.integrity import DatasetIntegrityValidator
 from visionsort.media.archive import (
     FrameArchiveKey,
     FrameArchiveResolver,
@@ -449,10 +450,18 @@ def compute_dataset_fingerprint(db: VisionSortDB, dataset_id: str) -> str:
     dataset = db.fetch_one("SELECT * FROM datasets WHERE id = ?", (dataset_id,))
     if dataset is None:
         raise RuntimeError("Dataset introuvable.")
+    integrity = DatasetIntegrityValidator(db, dataset_id).validate()
+    if not integrity["valid"]:
+        raise RuntimeError(
+            "Fingerprint refusé: intégrité du dataset invalide. "
+            f"Rapport: {integrity['report_path']}. "
+            + " ".join(integrity["errors"][:5])
+        )
     files: list[dict[str, str]] = []
     for item in db.fetch_all(
         """
-        SELECT id, image_path, label_path
+        SELECT id, session_id, split, source_id, frame_index,
+               annotation_status, image_path, label_path
         FROM dataset_items WHERE dataset_id = ? ORDER BY id
         """,
         (dataset_id,),
@@ -461,17 +470,25 @@ def compute_dataset_fingerprint(db: VisionSortDB, dataset_id: str) -> str:
             ("image", item["image_path"]),
             ("label", item["label_path"]),
         ):
-            if not value:
+            if not value and kind == "label":
                 continue
+            if not value:
+                raise RuntimeError(
+                    f"Fingerprint refusé: {kind} absent pour {item['id']}."
+                )
             path = Path(str(value))
             if not path.is_absolute():
                 path = ROOT_DIR / path
+            if not path.is_file():
+                raise RuntimeError(
+                    f"Fingerprint refusé: fichier absent {path}."
+                )
             files.append(
                 {
                     "kind": kind,
                     "item_id": str(item["id"]),
                     "path": str(value),
-                    "sha256": _sha256_file(path) if path.exists() else "MISSING",
+                    "sha256": _sha256_file(path),
                 }
             )
     for kind, column in (
@@ -480,18 +497,65 @@ def compute_dataset_fingerprint(db: VisionSortDB, dataset_id: str) -> str:
     ):
         value = dataset[column]
         if not value:
-            continue
+            raise RuntimeError(
+                f"Fingerprint refusé: {kind} non référencé."
+            )
         path = Path(str(value))
         if not path.is_absolute():
             path = ROOT_DIR / path
+        if not path.is_file():
+            raise RuntimeError(
+                f"Fingerprint refusé: fichier absent {path}."
+            )
         files.append(
             {
                 "kind": kind,
                 "item_id": "",
                 "path": str(value),
-                "sha256": _sha256_file(path) if path.exists() else "MISSING",
+                "sha256": _sha256_file(path),
             }
         )
+    dataset_root = Path(str(dataset["root_path"]))
+    if not dataset_root.is_absolute():
+        dataset_root = ROOT_DIR / dataset_root
+    for artifact_name in (
+        "tracking_manifest.jsonl",
+        "reid_manifest.jsonl",
+        "reid_pairs.jsonl",
+    ):
+        artifact_path = dataset_root / artifact_name
+        if artifact_path.is_file():
+            files.append(
+                {
+                    "kind": "task_artifact",
+                    "item_id": "",
+                    "path": relative_to_root(artifact_path),
+                    "sha256": _sha256_file(artifact_path),
+                }
+            )
+    if str(dataset["task"]) == "reid_multicamera":
+        reid_manifest = dataset_root / "reid_manifest.jsonl"
+        for row in _load_track_observations(reid_manifest):
+            crop_value = row.get("crop_path")
+            if not crop_value:
+                raise RuntimeError(
+                    "Fingerprint refusé: crop ReID non référencé."
+                )
+            crop_path = Path(str(crop_value))
+            if not crop_path.is_absolute():
+                crop_path = ROOT_DIR / crop_path
+            if not crop_path.is_file():
+                raise RuntimeError(
+                    f"Fingerprint refusé: crop ReID absent {crop_path}."
+                )
+            files.append(
+                {
+                    "kind": "reid_crop",
+                    "item_id": str(row.get("dataset_item_id") or ""),
+                    "path": str(crop_value),
+                    "sha256": _sha256_file(crop_path),
+                }
+            )
     sessions = [
         {
             "session_id": str(row["session_id"]),
@@ -509,8 +573,35 @@ def compute_dataset_fingerprint(db: VisionSortDB, dataset_id: str) -> str:
         "dataset_id": dataset_id,
         "task": str(dataset["task"]),
         "generation_config": json.loads(dataset["generation_config_json"] or "{}"),
+        "generation_strategy_version": "visionsort-dataset-v4",
         "sessions": sessions,
-        "files": files,
+        "items": [
+            {
+                "id": str(row["id"]),
+                "session_id": str(row["session_id"] or ""),
+                "split": str(row["split"] or ""),
+                "source_id": str(row["source_id"] or ""),
+                "frame_index": int(row["frame_index"] or 0),
+                "annotation_status": str(row["annotation_status"]),
+            }
+            for row in db.fetch_all(
+                """
+                SELECT id, session_id, split, source_id, frame_index,
+                       annotation_status
+                FROM dataset_items
+                WHERE dataset_id = ? ORDER BY id
+                """,
+                (dataset_id,),
+            )
+        ],
+        "files": sorted(
+            files,
+            key=lambda value: (
+                value["kind"],
+                value["item_id"],
+                value["path"],
+            ),
+        ),
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -526,7 +617,15 @@ def verify_dataset_fingerprint(
     if dataset is None:
         raise RuntimeError("Dataset introuvable.")
     expected = dataset["dataset_fingerprint"]
-    actual = compute_dataset_fingerprint(db, dataset_id)
+    try:
+        actual = compute_dataset_fingerprint(db, dataset_id)
+    except RuntimeError as exc:
+        return {
+            "valid": False,
+            "expected": expected,
+            "actual": None,
+            "error": str(exc),
+        }
     return {
         "valid": bool(expected) and str(expected) == actual,
         "expected": expected,

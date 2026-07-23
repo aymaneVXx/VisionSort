@@ -486,16 +486,25 @@ def _parse_label_studio(content: bytes) -> dict[str, list[dict[str, Any]]]:
                     ]
                     for point in value.get("points") or []
                 ]
-                detections.append(
-                    {
-                        "class_name": (value.get("polygonlabels") or ["parcel"])[0],
+                result_id = str(result.get("id") or "")
+                box_id = (
+                    f"box-{result_id.removeprefix('polygon-')}"
+                    if result_id.startswith("polygon-")
+                    else ""
+                )
+                detection = detections_by_result_id.get(box_id)
+                if detection is None:
+                    detection = {
+                        "class_name": (
+                            value.get("polygonlabels") or ["parcel"]
+                        )[0],
                         "confidence": 1.0,
                         "bbox": _bbox_from_points(points),
-                        "mask": points,
                         "original_width": int(round(original_width)),
                         "original_height": int(round(original_height)),
                     }
-                )
+                    detections.append(detection)
+                detection["mask"] = points
         for result in results:
             if result.get("type") != "keypointlabels":
                 continue

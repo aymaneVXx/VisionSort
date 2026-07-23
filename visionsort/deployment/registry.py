@@ -60,6 +60,35 @@ def promote_model(db: VisionSortDB, model_id: str) -> None:
         raise RuntimeError(
             "Promotion refusée: test figé, critères configurés et seuils validés requis."
         )
+    if row["created_from_job_id"]:
+        training_job = db.fetch_one(
+            """
+            SELECT dataset_id FROM training_jobs WHERE id = ?
+            """,
+            (row["created_from_job_id"],),
+        )
+        if training_job is None:
+            raise RuntimeError(
+                "Promotion refusée: job d'entraînement introuvable."
+            )
+        from visionsort.datasets.integrity import DatasetIntegrityValidator
+        from visionsort.datasets.pipeline import verify_dataset_fingerprint
+
+        integrity = DatasetIntegrityValidator(
+            db, str(training_job["dataset_id"])
+        ).validate()
+        if not integrity["valid"]:
+            raise RuntimeError(
+                "Promotion refusée: intégrité du dataset invalide. "
+                + " ".join(integrity["errors"][:5])
+            )
+        fingerprint = verify_dataset_fingerprint(
+            db, str(training_job["dataset_id"])
+        )
+        if not fingerprint["valid"]:
+            raise RuntimeError(
+                "Promotion refusée: fingerprint du dataset invalide."
+            )
     with db.connect() as conn:
         conn.execute(
             """

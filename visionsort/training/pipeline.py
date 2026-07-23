@@ -18,6 +18,7 @@ from visionsort.datasets.pipeline import (
     validate_dataset_splits,
     verify_dataset_fingerprint,
 )
+from visionsort.datasets.integrity import DatasetIntegrityValidator
 from visionsort.inference.engine import DemoDetectionBackend, resolve_model_artifact
 from visionsort.runtime.demo_assets import ensure_demo_assets
 
@@ -338,6 +339,14 @@ def _resolve_best_pt(results: Any, job_id: str) -> Path:
 
 
 def _validate_training_dataset(db: VisionSortDB, dataset_id: str) -> None:
+    strict_integrity = DatasetIntegrityValidator(
+        db, dataset_id
+    ).validate()
+    if not strict_integrity["valid"]:
+        raise RuntimeError(
+            "Entraînement refusé: intégrité stricte invalide. "
+            + " ".join(strict_integrity["errors"][:5])
+        )
     fingerprint = verify_dataset_fingerprint(db, dataset_id)
     if not fingerprint["valid"]:
         raise RuntimeError(

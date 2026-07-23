@@ -177,6 +177,25 @@ def render(context: UIContext) -> None:
     )
     if ds.get("manifest_path"):
         st.caption(f"Manifest: `{ds['manifest_path']}`")
+    integrity = summary.get("integrity_report") or {}
+    if integrity:
+        message = (
+            f"Intégrité: {integrity.get('checked_items', 0)} item(s) "
+            f"contrôlé(s), tâche `{integrity.get('task')}`."
+        )
+        if integrity.get("valid"):
+            st.success(message)
+        else:
+            st.error(message)
+            with st.expander(
+                "Raisons empêchant DATASET_READY", expanded=True
+            ):
+                for error in integrity.get("errors") or []:
+                    st.write(f"- {error}")
+                if integrity.get("report_path"):
+                    st.caption(
+                        f"Rapport: `{integrity['report_path']}`"
+                    )
 
     needs_review = [it for it in items if it.get("annotation_status") == AnnotationStatus.NEEDS_REVIEW.value]
     st.subheader(f"Review ({len(needs_review)} NEEDS_REVIEW)")

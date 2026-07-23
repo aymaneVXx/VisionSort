@@ -1,5 +1,8 @@
 import json
 
+import cv2
+import numpy as np
+
 from visionsort.core.enums import CommandType
 from visionsort.database.db import VisionSortDB, utc_now
 from visionsort.database.repositories import ArtifactRepository, ControlRepository
@@ -11,6 +14,20 @@ def test_supervisor_update_dataset_item_triggers_finalize(tmp_path):
     db.initialize()
     repo = ControlRepository(db)
     now = utc_now()
+    root = tmp_path / "dataset-cmd"
+    root.mkdir()
+    image = root / "img.jpg"
+    label = root / "lbl.txt"
+    data_yaml = root / "data.yaml"
+    cv2.imwrite(
+        str(image), np.zeros((32, 32, 3), dtype=np.uint8)
+    )
+    label.write_text("0 0.5 0.5 0.2 0.2\n", encoding="utf-8")
+    data_yaml.write_text(
+        "path: .\ntrain: images/train\nval: images/val\n"
+        "test: images/test\ntask: detection\nnames:\n  0: parcel\n",
+        encoding="utf-8",
+    )
 
     db.execute(
         """
@@ -27,10 +44,10 @@ def test_supervisor_update_dataset_item_triggers_finalize(tmp_path):
         (
             "dataset-cmd",
             "Dataset Cmd",
-            "data/datasets/dataset-cmd",
+            str(root),
             "REVIEW_PENDING",
-            "data/datasets/dataset-cmd/manifest.csv",
-            "data/datasets/dataset-cmd/data.yaml",
+            str(root / "manifest.csv"),
+            str(data_yaml),
             "{}",
             now,
             now,
@@ -39,9 +56,18 @@ def test_supervisor_update_dataset_item_triggers_finalize(tmp_path):
     db.execute(
         """
         INSERT INTO dataset_items (id, dataset_id, session_id, sample_group_id, split, source_id, camera_role, frame_index, timestamp_global, image_path, label_path, annotation_status, reason, score, metadata_json, created_at)
-        VALUES (?, ?, ?, NULL, 'train', 'src1', 'C1', 1, 1.0, 'img.jpg', 'lbl.txt', ?, 'manual', 0.5, '{}', ?)
+        VALUES (?, ?, ?, NULL, 'train', 'src1', 'C1', 1, 1.0, ?, ?, ?,
+                'manual', 0.5, '{"instance_count":1}', ?)
         """,
-        ("item-cmd", "dataset-cmd", "session-cmd", "NEEDS_REVIEW", now),
+        (
+            "item-cmd",
+            "dataset-cmd",
+            "session-cmd",
+            str(image),
+            str(label),
+            "NEEDS_REVIEW",
+            now,
+        ),
     )
 
     supervisor = RuntimeSupervisor()

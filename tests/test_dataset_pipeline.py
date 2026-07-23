@@ -10,6 +10,7 @@ from visionsort.datasets.pipeline import (
     build_dataset,
     compute_dataset_fingerprint,
     resolve_split_assignments,
+    rewrite_training_manifest,
     stable_session_split,
     validate_dataset_splits,
     verify_dataset_fingerprint,
@@ -386,10 +387,20 @@ def test_finalized_dataset_fingerprint_detects_tampering_and_locks_items(tmp_pat
     label = root / "label.txt"
     manifest = root / "manifest.csv"
     data_yaml = root / "data.yaml"
-    image.write_bytes(b"image-bytes")
+    cv2.imwrite(
+        str(image), np.zeros((32, 32, 3), dtype=np.uint8)
+    )
     label.write_text("0 0.5 0.5 0.2 0.2\n", encoding="utf-8")
-    manifest.write_text("item_id,split\nitem-1,test\n", encoding="utf-8")
-    data_yaml.write_text("path: .\ntrain: images/train\n", encoding="utf-8")
+    data_yaml.write_text(
+        "path: .\n"
+        "train: images/train\n"
+        "val: images/val\n"
+        "test: images/test\n"
+        "task: detection\n"
+        "names:\n"
+        "  0: parcel\n",
+        encoding="utf-8",
+    )
     db.execute(
         """
         INSERT INTO capture_sessions
@@ -425,10 +436,11 @@ def test_finalized_dataset_fingerprint_detects_tampering_and_locks_items(tmp_pat
          annotation_status, reason, score, metadata_json, created_at)
         VALUES ('item-1', 'dataset-fp', 'session-fp', 'group-1', 'test',
                 'source-1', 'C1', 1, 1.0, ?, ?, 'HUMAN_VALIDATED',
-                'test', 1.0, '{}', ?)
+                    'test', 1.0, '{"instance_count":1}', ?)
         """,
         (str(image), str(label), now),
     )
+    rewrite_training_manifest(db, "dataset-fp", manifest)
     fingerprint = compute_dataset_fingerprint(db, "dataset-fp")
     db.execute(
         """

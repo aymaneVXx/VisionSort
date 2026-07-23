@@ -2,12 +2,86 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import cv2
+import numpy as np
+
 from visionsort.core.enums import PipelineState
 from visionsort.core.paths import ROOT_DIR
 from visionsort.database.db import VisionSortDB, utc_now
-from visionsort.datasets.pipeline import compute_dataset_fingerprint
+from visionsort.datasets.pipeline import (
+    compute_dataset_fingerprint,
+    rewrite_training_manifest,
+)
 from visionsort.training.pipeline import create_training_job, training_worker_loop
 import visionsort.training.pipeline as training_pipeline
+
+
+def _add_ready_item(
+    db: VisionSortDB,
+    root: Path,
+    dataset_id: str,
+    *,
+    session_id: str | None = None,
+    split: str = "train",
+) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    image = root / "image.jpg"
+    label = root / "label.txt"
+    manifest = root / "manifest.csv"
+    data_yaml = root / "data.yaml"
+    cv2.imwrite(
+        str(image), np.zeros((32, 32, 3), dtype=np.uint8)
+    )
+    label.write_text("0 0.5 0.5 0.2 0.2\n", encoding="utf-8")
+    data_yaml.write_text(
+        "path: .\n"
+        "train: images/train\n"
+        "val: images/val\n"
+        "test: images/test\n"
+        "task: detection\n"
+        "names:\n"
+        "  0: parcel\n",
+        encoding="utf-8",
+    )
+    db.execute(
+        """
+        UPDATE datasets
+        SET root_path = ?, manifest_path = ?, data_yaml_path = ?
+        WHERE id = ?
+        """,
+        (str(root), str(manifest), str(data_yaml), dataset_id),
+    )
+    now = utc_now()
+    db.execute(
+        """
+        INSERT INTO dataset_items
+        (id, dataset_id, session_id, sample_group_id, split, source_id,
+         camera_role, frame_index, timestamp_global, image_path, label_path,
+         annotation_status, reason, score, metadata_json, created_at)
+        VALUES (?, ?, ?, 'group-ready', ?, 'source-ready', 'C1', 1, 1.0,
+                ?, ?, 'HUMAN_VALIDATED', 'ready', 1.0,
+                '{"instance_count":1}', ?)
+        """,
+        (
+            f"item-{dataset_id}",
+            dataset_id,
+            session_id,
+            split,
+            str(image),
+            str(label),
+            now,
+        ),
+    )
+    if session_id:
+        db.execute(
+            """
+            INSERT INTO dataset_sessions
+            (dataset_id, session_id, split, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (dataset_id, session_id, split, now),
+        )
+    rewrite_training_manifest(db, dataset_id, manifest)
 
 
 def test_training_worker_demo_updates_session_and_report(tmp_path):
@@ -39,6 +113,12 @@ def test_training_worker_demo_updates_session_and_report(tmp_path):
             now,
             now,
         ),
+    )
+    _add_ready_item(
+        db,
+        tmp_path / "ds-train",
+        "ds-train",
+        session_id="session-train",
     )
     db.execute(
         "UPDATE datasets SET dataset_fingerprint = ? WHERE id = ?",
@@ -155,7 +235,6 @@ def test_ultralytics_training_copies_real_best_pt_to_immutable_version(
     db.initialize()
     now = utc_now()
     data_yaml = tmp_path / "data.yaml"
-    data_yaml.write_text("path: .\ntrain: images/train\nval: images/val\ntest: images/test\n", encoding="utf-8")
     base_weights = tmp_path / "base.pt"
     base_weights.write_bytes(b"base-weights")
     db.execute(
@@ -187,6 +266,9 @@ def test_ultralytics_training_copies_real_best_pt_to_immutable_version(
             now,
             now,
         ),
+    )
+    _add_ready_item(
+        db, tmp_path / "ds-real", "ds-real", split="test"
     )
     db.execute(
         "UPDATE datasets SET dataset_fingerprint = ? WHERE id = ?",
