@@ -16,7 +16,7 @@ if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from visionsort.acquisition.worker import camera_worker_loop
-from visionsort.core.config import load_config
+from visionsort.core.config import AppConfig, load_config
 from visionsort.core.enums import (
     CommandStatus,
     CommandType,
@@ -66,10 +66,16 @@ class GPUResourceArbiter:
 
 
 class RuntimeSupervisor:
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        db_path: str | Path | None = None,
+        config: AppConfig | None = None,
+    ):
         ensure_project_dirs()
-        self.config = load_config()
-        self.db = VisionSortDB(DB_PATH)
+        self.config = config or load_config()
+        self.db_path = Path(db_path or DB_PATH)
+        self.db = VisionSortDB(self.db_path)
         self.db.initialize()
         self.control_repo = ControlRepository(self.db)
         self.event_repo = EventRepository(self.db)
@@ -91,6 +97,7 @@ class RuntimeSupervisor:
         self.training_processes: dict[str, mp.Process] = {}
         self.pipeline_processes: dict[str, mp.Process] = {}
         self.active_model_id: str | None = None
+        self._shutdown_complete = False
         self.arbiter = GPUResourceArbiter(
             allow_training_while_inference=bool(self.config.get("gpu", "allow_training_while_inference", default=False)),
             max_concurrent_live_sources=int(self.config.get("gpu", "max_concurrent_live_sources", default=3)),
@@ -123,7 +130,7 @@ class RuntimeSupervisor:
                 self.inference_request_queue,
                 self.inference_result_queue,
                 self.inference_stop_event,
-                str(DB_PATH),
+                str(self.db_path),
                 self.config.values,
             ),
             daemon=True,
@@ -243,6 +250,8 @@ class RuntimeSupervisor:
         )
 
     def shutdown(self) -> None:
+        if self._shutdown_complete:
+            return
         for source_id in list(self.camera_processes):
             self.stop_source(source_id)
         self.drain_runtime_messages()
@@ -252,12 +261,26 @@ class RuntimeSupervisor:
                 process.terminate()
                 process.join(timeout=3)
             self.job_repo.mark_job_stopped(JobType.TRAINING.value, job_id, status="STOPPED")
+            self.training_processes.pop(job_id, None)
+        for job_key, process in list(self.pipeline_processes.items()):
+            process.join(timeout=3)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=3)
+            self.job_repo.mark_job_stopped(
+                JobType.DATASET.value, job_key, status="STOPPED"
+            )
+            self.pipeline_processes.pop(job_key, None)
         self.inference_stop_event.set()
         if self.inference_process.is_alive():
-            self.inference_process.terminate()
             self.inference_process.join(timeout=3)
+            if self.inference_process.is_alive():
+                self.inference_process.terminate()
+                self.inference_process.join(timeout=3)
         self.job_repo.mark_job_stopped(JobType.GPU_INFERENCE.value, "shared", status="STOPPED")
         self.job_repo.mark_job_stopped(JobType.SUPERVISOR.value, "main", status="STOPPED")
+        self._shutdown_complete = True
+        self.manager.shutdown()
 
     def sync_inference_sources(self) -> None:
         sources = {row["id"]: dict(row) for row in self.db.fetch_all("SELECT * FROM sources")}
@@ -344,6 +367,7 @@ class RuntimeSupervisor:
         session_id: str,
         session_start_global: float,
         replay_offset_ms: float = 0.0,
+        replay_fps: float = 8.0,
         replay_loop: bool = False,
     ) -> None:
         row = self.db.fetch_one("SELECT * FROM sources WHERE id = ?", (source_id,))
@@ -365,7 +389,7 @@ class RuntimeSupervisor:
         stop_event = self.ctx.Event()
         cfg = dict(row)
         cfg["model_id"] = runtime_model_id
-        cfg["replay_fps"] = 8.0
+        cfg["replay_fps"] = float(replay_fps)
         cfg["session_id"] = session_id
         cfg["session_start_global"] = float(session_start_global)
         cfg["replay_offset_ms"] = float(replay_offset_ms)
@@ -377,7 +401,7 @@ class RuntimeSupervisor:
             target=camera_worker_loop,
             args=(
                 cfg,
-                str(DB_PATH),
+                str(self.db_path),
                 self.config.values,
                 self.inference_request_queue,
                 self.inference_result_store,
@@ -420,6 +444,7 @@ class RuntimeSupervisor:
                 session_id=session_id,
                 session_start_global=start_global,
                 replay_offset_ms=float(sess_src.get("time_offset_ms") or 0.0),
+                replay_fps=float(sess_src.get("replay_fps") or 8.0),
                 replay_loop=replay_loop,
             )
 
@@ -503,7 +528,7 @@ class RuntimeSupervisor:
                 )
         process = self.ctx.Process(
             target=training_worker_loop,
-            args=(str(DB_PATH), job_id, payload, self.config.demo_mode),
+            args=(str(self.db_path), job_id, payload, self.config.demo_mode),
             daemon=True,
             name=f"visionsort-training-{job_id}",
         )
@@ -521,7 +546,7 @@ class RuntimeSupervisor:
         job_key = f"{session_id}:{step_name}:{int(time.time() * 1000)}"
         process = self.ctx.Process(
             target=pipeline_worker_loop,
-            args=(str(DB_PATH), session_id, step_name, params),
+            args=(str(self.db_path), session_id, step_name, params),
             daemon=True,
             name=f"visionsort-pipeline-{job_key}",
         )

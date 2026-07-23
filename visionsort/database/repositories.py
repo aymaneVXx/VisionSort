@@ -175,6 +175,13 @@ class ControlRepository:
     ) -> None:
         current = self.db.fetch_one("SELECT * FROM source_state WHERE source_id = ?", (source_id,))
         metrics_json = json.dumps(metrics if metrics is not None else json.loads(current["metrics_json"]) if current else {})
+        recording_value = (
+            int(recording_enabled)
+            if recording_enabled is not None
+            else int(current["recording_enabled"])
+            if current is not None
+            else 0
+        )
         status_value = status.value if isinstance(status, SourceStatus) else str(status)
         self.db.execute(
             """
@@ -200,7 +207,7 @@ class ControlRepository:
                 last_frame_ts,
                 preview_path,
                 details_path,
-                None if recording_enabled is None else int(recording_enabled),
+                recording_value,
                 metrics_json,
                 utc_now(),
             ),
