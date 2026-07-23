@@ -18,6 +18,7 @@ DEFAULT_CONFIG = {
         "timezone": "UTC",
     },
     "runtime": {
+        "model_selection": "active_registry",
         "poll_interval_seconds": 1.0,
         "max_buffer_size": 3,
         "preview_jpeg_quality": 82,
@@ -29,6 +30,18 @@ DEFAULT_CONFIG = {
         "allow_training_while_inference": False,
         "max_concurrent_live_sources": 3,
         "device": "auto",
+        "training_policy": "queue",
+    },
+    "model_promotion": {
+        "require_frozen_test": True,
+        "criteria": {
+            "precision_min": 0.50,
+            "recall_min": 0.50,
+            "map50_min": 0.50,
+            "count_accuracy_min": 0.80,
+            "merge_rate_max": 0.15,
+            "fps_min": 5.0,
+        },
     },
     "tracking": {
         "site_topology": {

@@ -1,3 +1,5 @@
+import json
+
 from visionsort.core.enums import ModelStatus, PipelineState
 from visionsort.database.db import VisionSortDB, utc_now
 from visionsort.deployment.registry import promote_model, rollback_to_previous_active, set_model_status
@@ -66,7 +68,14 @@ def test_promote_and_rollback_model_registry(tmp_path):
             ModelStatus.CANDIDATE.value,
             0,
             "{}",
-            '{"precision":0.9}',
+            json.dumps(
+                {
+                    "precision": 0.9,
+                    "promotion_eligible": True,
+                    "promotion_criteria": {"precision_min": 0.5},
+                    "test": {"status": "COMPLETED", "frozen": True},
+                }
+            ),
             "demo_synth_det",
             "job-a",
             now,
@@ -96,3 +105,26 @@ def test_promote_and_rollback_model_registry(tmp_path):
     assert rolled_back == "archived-base"
     assert archived is not None
     assert archived["is_active"] == 1
+
+
+def test_promotion_refuses_candidate_without_frozen_test_and_criteria(tmp_path):
+    db = VisionSortDB(tmp_path / "guard.db")
+    db.initialize()
+    now = utc_now()
+    db.execute(
+        """
+        INSERT INTO model_registry
+        (id, name, task, backend, weights_path, status, is_active, notes_json,
+         metrics_json, parent_model_id, created_from_job_id, created_at, updated_at)
+        VALUES ('unsafe-candidate', 'Unsafe', 'detection', 'demo', '', 'CANDIDATE',
+                0, '{}', '{"precision":0.99}', NULL, NULL, ?, ?)
+        """,
+        (now, now),
+    )
+
+    try:
+        promote_model(db, "unsafe-candidate")
+    except RuntimeError as exc:
+        assert "test figé" in str(exc)
+    else:
+        raise AssertionError("La promotion aurait dû être refusée.")

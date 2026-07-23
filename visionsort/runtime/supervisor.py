@@ -166,6 +166,28 @@ class RuntimeSupervisor:
             time.sleep(0.1)
         raise RuntimeError(f"Chargement du modèle expiré: {model_id}")
 
+    def runtime_model_id(self, configured_model_id: str) -> str:
+        if (
+            self.config.get(
+                "runtime", "model_selection", default="active_registry"
+            )
+            != "active_registry"
+        ):
+            return configured_model_id
+        active = self.db.fetch_one(
+            "SELECT id FROM model_registry WHERE is_active = 1 ORDER BY updated_at DESC LIMIT 1"
+        )
+        return str(active["id"]) if active is not None else configured_model_id
+
+    def reload_runtime_model(self, model_id: str) -> bool:
+        inference_process = getattr(self, "inference_process", None)
+        if inference_process is not None and inference_process.is_alive():
+            self.active_model_id = None
+            self.ensure_model_loaded(model_id)
+            return True
+        self.active_model_id = None
+        return False
+
     def start_source(self, source_id: str, *, session_id: str, session_start_global: float, replay_offset_ms: float = 0.0) -> None:
         row = self.db.fetch_one("SELECT * FROM sources WHERE id = ?", (source_id,))
         if row is None:
@@ -175,11 +197,17 @@ class RuntimeSupervisor:
         allowed, reason = self.arbiter.can_start_source(active_sources, training_active)
         if not allowed:
             raise RuntimeError(reason)
-        if self.camera_processes and any(self.db.fetch_one("SELECT model_id FROM sources WHERE id = ?", (sid,))["model_id"] != row["model_id"] for sid in self.camera_processes):
+        runtime_model_id = self.runtime_model_id(str(row["model_id"]))
+        if (
+            self.camera_processes
+            and self.active_model_id is not None
+            and self.active_model_id != runtime_model_id
+        ):
             raise RuntimeError("Toutes les sources actives doivent partager le même model_id pour le worker GPU unique.")
-        self.ensure_model_loaded(row["model_id"])
+        self.ensure_model_loaded(runtime_model_id)
         stop_event = self.ctx.Event()
         cfg = dict(row)
+        cfg["model_id"] = runtime_model_id
         cfg["replay_fps"] = 8.0
         cfg["session_id"] = session_id
         cfg["session_start_global"] = float(session_start_global)
@@ -202,7 +230,17 @@ class RuntimeSupervisor:
         )
         process.start()
         self.camera_processes[source_id] = (process, stop_event)
-        self.job_repo.upsert_job_run(JobType.CAMERA.value, source_id, process.pid or 0, "RUNNING", {"role": row["role"], "model_id": row["model_id"]})
+        self.job_repo.upsert_job_run(
+            JobType.CAMERA.value,
+            source_id,
+            process.pid or 0,
+            "RUNNING",
+            {
+                "role": row["role"],
+                "configured_model_id": row["model_id"],
+                "runtime_model_id": runtime_model_id,
+            },
+        )
         self.control_repo.update_source_state(source_id, status=SourceStatus.CONNECTING.value, fps=0.0)
 
     def start_session(self, session_id: str) -> None:
@@ -256,9 +294,36 @@ class RuntimeSupervisor:
     def start_training(self, payload: dict[str, Any]) -> str:
         active_sources = len(self.camera_processes)
         allowed, reason = self.arbiter.can_start_training(active_sources)
+        job_id = create_training_job(
+            self.db, payload["dataset_id"], payload["model_id"], payload
+        )
         if not allowed:
-            raise RuntimeError(reason)
-        job_id = create_training_job(self.db, payload["dataset_id"], payload["model_id"], payload)
+            if (
+                self.config.get("gpu", "training_policy", default="queue")
+                != "queue"
+            ):
+                self.artifact_repo.update_training_job(
+                    job_id, "FAILED", error_text=reason
+                )
+                raise RuntimeError(reason)
+            self.job_repo.upsert_job_run(
+                JobType.TRAINING.value,
+                job_id,
+                0,
+                "QUEUED",
+                {
+                    "model_id": payload["model_id"],
+                    "reason": reason,
+                    "priority": int(payload.get("priority", 0)),
+                },
+            )
+            return job_id
+        self.launch_training_job(job_id, payload)
+        return job_id
+
+    def launch_training_job(
+        self, job_id: str, payload: dict[str, Any]
+    ) -> None:
         dataset = self.db.fetch_one("SELECT summary_json FROM datasets WHERE id = ?", (payload["dataset_id"],))
         if dataset and dataset["summary_json"]:
             session_id = json.loads(dataset["summary_json"]).get("session_id")
@@ -277,7 +342,6 @@ class RuntimeSupervisor:
         self.training_processes[job_id] = process
         self.job_repo.upsert_job_run(JobType.TRAINING.value, job_id, process.pid or 0, "RUNNING", {"model_id": payload["model_id"]})
         self.artifact_repo.update_training_job(job_id, "RUNNING")
-        return job_id
 
     def start_pipeline_step(self, *, session_id: str, step: str, params: dict[str, Any]) -> str:
         step_name = str(step).upper()
@@ -401,7 +465,12 @@ class RuntimeSupervisor:
                     result_payload["job_key"] = job_key
             elif command_type == CommandType.PROMOTE_MODEL.value:
                 promote_model(self.db, payload["model_id"])
-                result_payload = {"model_id": payload["model_id"], "status": "CHAMPION"}
+                reloaded = self.reload_runtime_model(payload["model_id"])
+                result_payload = {
+                    "model_id": payload["model_id"],
+                    "status": "CHAMPION",
+                    "runtime_reloaded": reloaded,
+                }
             elif command_type == CommandType.REJECT_MODEL.value:
                 set_model_status(self.db, payload["model_id"], "REJECTED")
                 result_payload = {"model_id": payload["model_id"], "status": "REJECTED"}
@@ -410,9 +479,22 @@ class RuntimeSupervisor:
                 result_payload = {"model_id": payload["model_id"], "status": "ARCHIVED"}
             elif command_type == CommandType.ACTIVATE_MODEL.value:
                 activate_model(self.db, payload["model_id"])
-                result_payload = {"model_id": payload["model_id"]}
+                reloaded = self.reload_runtime_model(payload["model_id"])
+                result_payload = {
+                    "model_id": payload["model_id"],
+                    "runtime_reloaded": reloaded,
+                }
             elif command_type == CommandType.ROLLBACK_MODEL.value:
-                result_payload = {"model_id": rollback_to_previous_active(self.db)}
+                rollback_model_id = rollback_to_previous_active(self.db)
+                reloaded = (
+                    self.reload_runtime_model(rollback_model_id)
+                    if rollback_model_id
+                    else False
+                )
+                result_payload = {
+                    "model_id": rollback_model_id,
+                    "runtime_reloaded": reloaded,
+                }
             elif command_type == CommandType.BOOTSTRAP_DEMO.value:
                 self.bootstrap_demo_sources()
                 result_payload = {"demo_mode": self.config.demo_mode}
@@ -483,12 +565,33 @@ class RuntimeSupervisor:
                 self.camera_processes.pop(source_id, None)
         for job_id, process in list(self.training_processes.items()):
             if not process.is_alive():
-                self.job_repo.mark_job_stopped(JobType.TRAINING.value, job_id, status="EXITED")
+                training_job = self.db.fetch_one(
+                    "SELECT status FROM training_jobs WHERE id = ?", (job_id,)
+                )
+                terminal_status = (
+                    str(training_job["status"])
+                    if training_job is not None
+                    else "FAILED"
+                )
+                self.job_repo.mark_job_stopped(
+                    JobType.TRAINING.value, job_id, status=terminal_status
+                )
                 self.training_processes.pop(job_id, None)
         for job_key, process in list(self.pipeline_processes.items()):
             if not process.is_alive():
                 self.job_repo.mark_job_stopped(JobType.DATASET.value, job_key, status="EXITED")
                 self.pipeline_processes.pop(job_key, None)
+        if not self.camera_processes and not any(
+            process.is_alive() for process in self.training_processes.values()
+        ):
+            queued = self.db.fetch_one(
+                "SELECT * FROM training_jobs WHERE status = 'QUEUED' ORDER BY created_at ASC LIMIT 1"
+            )
+            if queued is not None:
+                self.launch_training_job(
+                    str(queued["id"]),
+                    json.loads(queued["recipe_json"] or "{}"),
+                )
 
     def run_forever(self) -> None:
         self.start()

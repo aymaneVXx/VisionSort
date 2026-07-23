@@ -21,8 +21,20 @@ def promote_model(db: VisionSortDB, model_id: str) -> None:
     row = db.fetch_one("SELECT * FROM model_registry WHERE id = ?", (model_id,))
     if row is None:
         raise RuntimeError("Modèle introuvable.")
-    if row["status"] == ModelStatus.REJECTED.value:
-        raise RuntimeError("Impossible de promouvoir un modèle rejeté.")
+    if row["status"] != ModelStatus.CANDIDATE.value:
+        raise RuntimeError("Seul un modèle CANDIDATE peut être promu.")
+    metrics = json.loads(row["metrics_json"] or "{}")
+    test_metrics = metrics.get("test") or {}
+    criteria = metrics.get("promotion_criteria") or {}
+    if (
+        not metrics.get("promotion_eligible")
+        or test_metrics.get("status") != "COMPLETED"
+        or not test_metrics.get("frozen")
+        or not criteria
+    ):
+        raise RuntimeError(
+            "Promotion refusée: test figé, critères configurés et seuils validés requis."
+        )
     with db.connect() as conn:
         conn.execute(
             "UPDATE model_registry SET status = ?, updated_at = ? WHERE status = ?",
