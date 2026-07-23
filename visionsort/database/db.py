@@ -80,13 +80,13 @@ DEFAULT_TRACKERS = [
     },
     {
         "id": "bytetrack_cpu",
-        "name": "ByteTrack CPU Wrapper",
+        "name": "Ultralytics ByteTrack (CPU)",
         "implementation": "ultralytics_bytetrack",
         "notes_json": json.dumps({"validated_on_site": False}),
     },
     {
         "id": "botsort_cpu",
-        "name": "BoT-SORT CPU Wrapper",
+        "name": "Ultralytics BoT-SORT (CPU)",
         "implementation": "ultralytics_botsort",
         "notes_json": json.dumps({"validated_on_site": False}),
     },

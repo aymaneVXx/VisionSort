@@ -294,31 +294,47 @@ class RuntimeSupervisor:
         return job_key
 
     def handle_tracklet(self, payload: dict[str, Any]) -> None:
-        tracklet = Tracklet(**payload)
+        self.handle_tracklets([payload])
+
+    def handle_tracklets(self, payloads: list[dict[str, Any]]) -> None:
+        tracklets = [Tracklet(**payload) for payload in payloads]
         self.global_tracker.source_roles = self._source_roles()
-        parcel_id, result, reasons, candidate = self.global_tracker.process_tracklet(tracklet)
-        self.tracking_repo.upsert_tracklet(tracklet, parcel_id=parcel_id or None, match_result=result.value)
-        if parcel_id:
-            parcel = self.global_tracker.parcels[parcel_id]
-            self.tracking_repo.upsert_global_parcel(parcel)
-        event_type = "handoff_ambiguous" if result == MatchResult.AMBIGUOUS else "handoff_matched" if result == MatchResult.MATCHED else "tracklet_unmatched"
-        self.event_repo.add_event(
-            event_type,
-            {
-                "tracklet_id": tracklet.tracklet_id,
-                "reasons": reasons,
-                "candidate": asdict(candidate) if candidate else None,
-                "validated_on_site": False,
-            },
-            parcel_id=parcel_id or None,
-            camera_id=tracklet.camera_id,
-            severity="warning" if result == MatchResult.AMBIGUOUS else "info",
-            session_id=tracklet.session_id,
-            source_id=tracklet.source_id,
-            timestamp_global=tracklet.ended_at_global,
-            model_id=tracklet.model_id,
-            tracker_id=tracklet.tracker_id,
-        )
+        outcomes = self.global_tracker.process_tracklets(tracklets)
+        for tracklet, (parcel_id, result, reasons, candidate) in zip(
+            tracklets, outcomes, strict=True
+        ):
+            self.tracking_repo.upsert_tracklet(
+                tracklet,
+                parcel_id=parcel_id or None,
+                match_result=result.value,
+            )
+            if parcel_id:
+                parcel = self.global_tracker.parcels[parcel_id]
+                self.tracking_repo.upsert_global_parcel(parcel)
+            event_type = (
+                "handoff_ambiguous"
+                if result == MatchResult.AMBIGUOUS
+                else "handoff_matched"
+                if result == MatchResult.MATCHED
+                else "tracklet_unmatched"
+            )
+            self.event_repo.add_event(
+                event_type,
+                {
+                    "tracklet_id": tracklet.tracklet_id,
+                    "reasons": reasons,
+                    "candidate": asdict(candidate) if candidate else None,
+                    "validated_on_site": False,
+                },
+                parcel_id=parcel_id or None,
+                camera_id=tracklet.camera_id,
+                severity="warning" if result == MatchResult.AMBIGUOUS else "info",
+                session_id=tracklet.session_id,
+                source_id=tracklet.source_id,
+                timestamp_global=tracklet.ended_at_global,
+                model_id=tracklet.model_id,
+                tracker_id=tracklet.tracker_id,
+            )
 
     def handle_command(self, command: dict[str, Any]) -> None:
         payload = json.loads(command["payload_json"])
@@ -412,10 +428,13 @@ class RuntimeSupervisor:
             self.event_repo.add_event("command_failed", {"command_type": command_type, "error": str(exc)}, severity="error")
 
     def drain_runtime_messages(self) -> None:
+        tracklet_payloads: list[dict[str, Any]] = []
         while True:
             try:
                 message = self.runtime_queue.get_nowait()
             except queue.Empty:
+                if tracklet_payloads:
+                    self.handle_tracklets(tracklet_payloads)
                 return
             if message["kind"] == "EVENT":
                 self.event_repo.add_event(
@@ -432,7 +451,7 @@ class RuntimeSupervisor:
                     tracker_id=message.get("tracker_id"),
                 )
             elif message["kind"] == "TRACKLET":
-                self.handle_tracklet(message["tracklet"])
+                tracklet_payloads.append(message["tracklet"])
             elif message["kind"] == "RECORDING":
                 self.artifact_repo.add_recording(
                     source_id=message["source_id"],

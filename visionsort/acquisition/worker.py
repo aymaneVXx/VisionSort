@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import queue
+import threading
 import time
+from collections import deque
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -13,12 +16,123 @@ from visionsort.core.config import relative_to_root
 from visionsort.core.enums import SourceStatus
 from visionsort.core.paths import OBSERVATIONS_DIR, PREVIEWS_DIR, RECORDINGS_DIR
 from visionsort.core.types import Observation
-from visionsort.core.types import Observation
 from visionsort.database.db import VisionSortDB
 from visionsort.database.repositories import ControlRepository
 from visionsort.events.engine import ParcelEventEngine
 from visionsort.sources.frame_sources import build_source
 from visionsort.tracking.engine import build_tracker
+
+
+class LatestFrameBuffer:
+    """Continuously acquire frames while consumers process only the freshest one."""
+
+    def __init__(
+        self,
+        source,
+        *,
+        capacity: int = 3,
+        source_type: str = "REPLAY",
+        reconnect_delay_s: float = 1.0,
+    ):
+        self.source = source
+        self.capacity = max(1, int(capacity))
+        self.source_type = str(source_type).upper()
+        self.reconnect_delay_s = max(0.0, float(reconnect_delay_s))
+        self._frames: deque = deque(maxlen=self.capacity)
+        self._condition = threading.Condition()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.finished = False
+        self.error: Exception | None = None
+        self.frames_received = 0
+        self.frames_processed = 0
+        self.frames_dropped = 0
+        self.reconnections = 0
+
+    def start(self) -> None:
+        self.source.open()
+        self._thread = threading.Thread(
+            target=self._acquire,
+            daemon=True,
+            name="visionsort-frame-acquisition",
+        )
+        self._thread.start()
+
+    def _acquire(self) -> None:
+        try:
+            while not self._stop.is_set():
+                try:
+                    frame = self.source.read()
+                except Exception as exc:
+                    if self.source_type != "RTSP":
+                        raise
+                    self.reconnections += 1
+                    self.source.close()
+                    if self._stop.wait(self.reconnect_delay_s):
+                        break
+                    self.source.open()
+                    continue
+                if frame is None:
+                    if self.source_type != "RTSP":
+                        break
+                    self.reconnections += 1
+                    if self._stop.wait(self.reconnect_delay_s):
+                        break
+                    continue
+                with self._condition:
+                    self.frames_received += 1
+                    if len(self._frames) == self.capacity:
+                        self.frames_dropped += 1
+                    self._frames.append(frame)
+                    self._condition.notify()
+        except Exception as exc:  # pragma: no cover - exercised by runtime integration
+            self.error = exc
+        finally:
+            with self._condition:
+                self.finished = True
+                self._condition.notify_all()
+
+    def take_latest(self, timeout: float = 0.5):
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._condition:
+            while not self._frames and not self.finished and self.error is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._condition.wait(remaining)
+            if not self._frames:
+                return None
+            latest = self._frames.pop()
+            if self._frames:
+                self.frames_dropped += len(self._frames)
+                self._frames.clear()
+            return latest
+
+    def mark_processed(self) -> None:
+        with self._condition:
+            self.frames_processed += 1
+
+    def mark_dropped(self) -> None:
+        with self._condition:
+            self.frames_dropped += 1
+
+    def metrics(self) -> dict[str, int]:
+        with self._condition:
+            return {
+                "frames_received": self.frames_received,
+                "frames_processed": self.frames_processed,
+                "frames_dropped": self.frames_dropped,
+                "reconnections": self.reconnections,
+                "buffered_frames": len(self._frames),
+            }
+
+    def stop(self) -> None:
+        self._stop.set()
+        self.source.close()
+        with self._condition:
+            self._condition.notify_all()
+        if self._thread is not None:
+            self._thread.join(timeout=3.0)
 
 
 def _annotate_frame(image, observations: list[Observation], camera_id: str, fps: float, status: str):
@@ -140,21 +254,34 @@ def camera_worker_loop(
     status = SourceStatus.CONNECTING.value
     frame_counter = 0
     fps_window_started = time.time()
-    dropped_frames = 0
-    repo.update_source_state(source_id, status=status, fps=0.0, metrics={"dropped_frames": dropped_frames})
+    acquisition = LatestFrameBuffer(
+        source,
+        capacity=int(config.get("runtime", "max_buffer_size", default=3)),
+        source_type=source_config["source_type"],
+        reconnect_delay_s=1.0,
+    )
+    repo.update_source_state(source_id, status=status, fps=0.0, metrics=acquisition.metrics())
     try:
-        source.open()
+        acquisition.start()
         status = SourceStatus.REPLAY.value if source_config["source_type"] == "REPLAY" else SourceStatus.LIVE.value
         repo.update_source_state(source_id, status=status, fps=0.0, preview_path=str(preview_path))
         while not stop_event.is_set():
-            frame = source.read()
+            frame = acquisition.take_latest(timeout=0.5)
             if frame is None:
-                if source_config["source_type"] == "RTSP":
+                if acquisition.error is not None:
+                    raise acquisition.error
+                if acquisition.finished:
+                    break
+                if source_config["source_type"] == "RTSP" and acquisition.reconnections:
                     status = SourceStatus.RECONNECTING.value
-                    repo.update_source_state(source_id, status=status, fps=0.0, preview_path=str(preview_path))
-                    time.sleep(1.0)
-                    continue
-                break
+                    repo.update_source_state(
+                        source_id,
+                        status=status,
+                        fps=0.0,
+                        preview_path=str(preview_path),
+                        metrics=acquisition.metrics(),
+                    )
+                continue
 
             message = {
                 "kind": "INFER",
@@ -169,14 +296,14 @@ def camera_worker_loop(
             try:
                 inference_request_queue.put_nowait(message)
             except queue.Full:
-                dropped_frames += 1
+                acquisition.mark_dropped()
                 repo.update_source_state(
                     source_id,
                     status=SourceStatus.DEGRADED.value,
                     fps=0.0,
                     preview_path=str(preview_path),
                     last_frame_ts=frame.timestamp_global,
-                    metrics={"dropped_frames": dropped_frames},
+                    metrics=acquisition.metrics(),
                 )
                 continue
 
@@ -186,7 +313,7 @@ def camera_worker_loop(
                 time.sleep(0.01)
             result = inference_result_store.pop(result_key, None)
             if result is None:
-                dropped_frames += 1
+                acquisition.mark_dropped()
                 continue
             if "error" in result:
                 repo.update_source_state(source_id, status=SourceStatus.ERROR.value, last_error=result["error"], preview_path=str(preview_path))
@@ -205,7 +332,7 @@ def camera_worker_loop(
                             "timestamp_global": frame.timestamp_global,
                             "model_id": observations[0].model_id if observations else None,
                             "tracker_id": tracker_id,
-                            "observations": [obs.__dict__ for obs in observations],
+                            "observations": [asdict(obs) for obs in observations],
                             "validated_on_site": False,
                         }
                     )
@@ -217,15 +344,17 @@ def camera_worker_loop(
                 timestamp_global=frame.timestamp_global,
                 image_size=(int(frame.image.shape[1]), int(frame.image.shape[0])),
                 observations=observations,
+                image=frame.image,
             )
             parcel_tracks = [item for item in track_obs if item.class_name == "parcel"]
             context_tracks = [item for item in track_obs if item.class_name != "parcel"]
             for event in event_engine.update(camera_id, parcel_tracks, context_tracks):
                 runtime_queue.put({"kind": "EVENT", "session_id": session_id, "source_id": source_id, **event})
             for tracklet in finalized:
-                runtime_queue.put({"kind": "TRACKLET", "tracklet": tracklet.__dict__})
+                runtime_queue.put({"kind": "TRACKLET", "tracklet": asdict(tracklet)})
 
             now = time.time()
+            acquisition.mark_processed()
             frame_counter += 1
             fps = frame_counter / max(now - fps_window_started, 1e-6)
             if frame_counter % 5 == 0:
@@ -249,10 +378,10 @@ def camera_worker_loop(
                 preview_path=relative_to_root(preview_path),
                 details_path=relative_to_root(observations_path),
                 recording_enabled=bool(control_flags.get(source_id, {}).get("recording")),
-                metrics={"dropped_frames": dropped_frames, "validated_on_site": False},
+                metrics={**acquisition.metrics(), "validated_on_site": False},
             )
         for tracklet in tracker.flush():
-            runtime_queue.put({"kind": "TRACKLET", "tracklet": tracklet.__dict__})
+            runtime_queue.put({"kind": "TRACKLET", "tracklet": asdict(tracklet)})
         finished = recorder.close()
         if finished:
             runtime_queue.put({"kind": "RECORDING", **finished})
@@ -260,4 +389,4 @@ def camera_worker_loop(
     except Exception as exc:  # pragma: no cover - runtime
         repo.update_source_state(source_id, status=SourceStatus.ERROR.value, fps=0.0, last_error=str(exc), preview_path=relative_to_root(preview_path))
     finally:
-        source.close()
+        acquisition.stop()

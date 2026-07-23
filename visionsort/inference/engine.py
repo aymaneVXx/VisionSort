@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import queue
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -170,7 +171,14 @@ def inference_worker_loop(
                         "frame_index": message["frame_index"],
                         "timestamp_local": message["timestamp_local"],
                         "timestamp_global": message["timestamp_global"],
-                        "observations": [obs.__dict__ for obs in engine.predict(message["camera_id"], message["frame_index"], message["image"])],
+                        "observations": [
+                            asdict(obs)
+                            for obs in engine.predict(
+                                message["camera_id"],
+                                message["frame_index"],
+                                message["image"],
+                            )
+                        ],
                     }
                 )
             except Exception as exc:  # pragma: no cover - runtime

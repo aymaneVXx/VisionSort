@@ -40,19 +40,43 @@ class ParcelEventEngine:
         persons = [track for track in context_tracks if track.class_name == "person"]
         events: list[dict[str, Any]] = []
         for parcel_track in parcel_tracks:
-            parcel_key = str(parcel_track.extra.get("parcel_hint") or f"{camera_id}:{parcel_track.local_track_id}")
+            parcel_key = f"{camera_id}:{parcel_track.local_track_id}"
             evidence = self.parcels.setdefault(parcel_key, ParcelEvidence(parcel_key=parcel_key))
             evidence.last_timestamp = parcel_track.timestamp_global
             evidence.last_bbox = parcel_track.bbox
 
-            parcel_center = bbox_center(parcel_track.bbox)
-            closest_wrist = min((euclidean(parcel_center, bbox_center(w.bbox)) for w in wrists), default=10.0)
+            iw = float(parcel_track.extra.get("_image_w") or 1.0)
+            ih = float(parcel_track.extra.get("_image_h") or 1.0)
+            parcel_center_px = bbox_center(parcel_track.bbox)
+            parcel_center = (parcel_center_px[0] / iw, parcel_center_px[1] / ih)
+            wrist_points: list[tuple[float, float]] = []
+            for wrist in wrists:
+                wx, wy = bbox_center(wrist.bbox)
+                wrist_points.append((wx / iw, wy / ih))
+            for person in persons:
+                keypoints = person.extra.get("keypoints") or []
+                for keypoint_index in (9, 10):  # COCO left/right wrist
+                    if keypoint_index >= len(keypoints):
+                        continue
+                    x, y, *confidence = keypoints[keypoint_index]
+                    if confidence and float(confidence[0]) <= 0.0:
+                        continue
+                    x_value, y_value = float(x), float(y)
+                    if x_value > 1.0 or y_value > 1.0:
+                        x_value, y_value = x_value / iw, y_value / ih
+                    wrist_points.append((x_value, y_value))
+            closest_wrist = min(
+                (euclidean(parcel_center, point) for point in wrist_points),
+                default=10.0,
+            )
             hand_overlap = max((bbox_iou(parcel_track.bbox, w.bbox) for w in wrists), default=0.0)
             person_overlap = max((bbox_iou(parcel_track.bbox, p.bbox) for p in persons), default=0.0)
-            speed = math.sqrt(parcel_track.velocity[0] ** 2 + parcel_track.velocity[1] ** 2)
-            iw = parcel_track.extra.get("_image_w")
-            ih = parcel_track.extra.get("_image_h")
-            current_zone = zone_for_bbox(parcel_track.bbox, zones, image_size=(int(iw), int(ih)) if iw and ih else None)
+            speed = math.sqrt((parcel_track.velocity[0] / iw) ** 2 + (parcel_track.velocity[1] / ih) ** 2)
+            current_zone = zone_for_bbox(
+                parcel_track.bbox,
+                zones,
+                image_size=(int(iw), int(ih)),
+            )
             exit_signal = 1.0 if current_zone and "exit" in current_zone else 0.0
             destination_signal = 1.0 if current_zone and current_zone.startswith("zone_") else 0.0
             stillness = max(0.0, 1.0 - min(speed / 0.25, 1.0))
@@ -118,12 +142,20 @@ class ParcelEventEngine:
             "tracker_id": track.tracker_id,
             "payload": {
                 "bbox": track.bbox,
+                "bbox_normalized": (
+                    track.bbox[0] / float(track.extra.get("_image_w") or 1.0),
+                    track.bbox[1] / float(track.extra.get("_image_h") or 1.0),
+                    track.bbox[2] / float(track.extra.get("_image_w") or 1.0),
+                    track.bbox[3] / float(track.extra.get("_image_h") or 1.0),
+                ),
                 "state": evidence.state.value,
                 "pickup_score": evidence.pickup_score,
                 "carry_score": evidence.carry_score,
                 "drop_score": evidence.drop_score,
                 "destination_zone": evidence.destination_zone,
                 "validated_on_site": False,
+                "site_validation_status": "NON_VALIDÉ_SUR_SITE",
+                "coordinates_normalized": True,
             },
         }
 
