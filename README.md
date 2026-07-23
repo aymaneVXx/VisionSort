@@ -19,6 +19,8 @@ VisionSort est une plateforme locale Python + Streamlit pour piloter un cycle co
 - Les observations détaillées sont stockées en `JSONL`, avec export `Parquet` possible via un step pipeline dédié.
 - L’inférence est conçue autour d’un worker partagé par modèle sélectionné.
 - Chaque caméra conserve son tracker local indépendant.
+- `bytetrack_cpu` et `botsort_cpu` utilisent les implémentations natives Ultralytics; `greedy_iou` reste une option de démonstration explicite.
+- L'acquisition utilise un buffer borné `latest frame wins` et ne bloque plus sur le temps d'inférence.
 - Le mode simulé est explicite: aucun résultat démo ne doit être utilisé silencieusement hors `DEMO_MODE=1`.
 
 ## Modules Principaux
@@ -26,6 +28,7 @@ VisionSort est une plateforme locale Python + Streamlit pour piloter un cycle co
 - `app.py` : point d’entrée Streamlit
 - `visionsort/runtime/supervisor.py` : supervisor persistant et gestion des commandes
 - `visionsort/runtime/pipeline_worker.py` : steps pipeline (`PROCESS_SESSION`, `SAMPLE`, `AUTO_ANNOTATE`, `FINALIZE_DATASET`, `EXPORT_OBSERVATIONS_PARQUET`)
+- `visionsort/runtime/e2e.py` : validation CPU complète avec backends simulés explicitement
 - `visionsort/acquisition/worker.py` : boucle caméra/source, previews, enregistrement, observations JSONL
 - `visionsort/inference/engine.py` : backends de modèles et provenance modèle/version
 - `visionsort/tracking/engine.py` : trackers locaux, tracklets, matching multicaméra
@@ -153,20 +156,26 @@ Des rapports JSON machine-readable sont produits dans `data/runtime/reports/`.
 - tracklets persistés
 - matching multicam `MATCHED / AMBIGUOUS / UNMATCHED`
 - événements prise/transport/dépôt en logique Replay
-- génération de datasets YOLO depuis tracklets
-- split stable et déduplication basique d’images
+- regroupement de toutes les instances par frame et groupes synchronisés C1/C2/C3
+- split immuable par session, déduplication et contrôles anti-fuite
+- annotateurs séparés détection, segmentation et pose, plus manifests tracking/ReID
 - pseudo-annotation et review `NEEDS_REVIEW`
 - training hors Streamlit
 - évaluation post-training
 - registre modèles avec `CANDIDATE / CHAMPION / REJECTED / ARCHIVED`
 - activation, promotion et rollback
+- jobs idempotents et reprenables, verrou anti-doublon, annulation persistée
+- artefacts `best.pt` copiés dans un répertoire de version immuable
+- activation suivie d'un rechargement contrôlé du worker d'inférence
 
 ## Limites Connues
 
 - Les règles multicaméra, prise et dépôt sont testables en Replay mais non validées sur site.
 - Le backend `demo_synth_det` reste réservé à `DEMO_MODE`.
 - Les modèles Ultralytics peuvent nécessiter le téléchargement des poids au premier lancement.
-- ByteTrack et BoT-SORT sont explicitement limités par l’environnement runtime disponible.
+- ByteTrack et BoT-SORT exigent `lap` et restent à valider sur les flux réels du site.
+- Un dataset mono-session appartient volontairement à un seul split; plusieurs sessions sont nécessaires pour un entraînement réel train/val/test sans fuite.
+- Le checkpoint produit par le scénario E2E démo est explicitement simulé; seul le chemin Ultralytics produit de vrais poids.
 - L’export Parquet dépend de `pandas` + `pyarrow`.
 - La validation RTSP réelle, la calibration géométrique et les réglages métier nécessitent encore les vraies caméras.
 
@@ -183,3 +192,15 @@ Run rapide :
 ```powershell
 python -m pytest
 ```
+
+Scénario end-to-end CPU explicite :
+
+```powershell
+$env:DEMO_MODE="1"
+python -m visionsort.runtime.e2e --db data/runtime/e2e.db --report data/runtime/reports/e2e.json
+```
+
+Ce scénario traite les trois Replay, construit et revoit le dataset, lance
+l'entraînement démo, crée/active un candidat et vérifie son utilisation lors
+d'une seconde session. Le rapport conserve `NON_VALIDÉ_SUR_SITE` pour tout ce
+qui dépend encore des vraies caméras.
