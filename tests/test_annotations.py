@@ -55,7 +55,8 @@ def test_task_specific_annotators_emit_yolo_formats(tmp_path):
         {
             "class_name": "person",
             "bbox": [0, 0, 20, 40],
-            "keypoints": [[10, 20, 0.9], [15, 25, 0.1]],
+            "keypoints": [[10, 20, 0.9]] * 16
+            + [[15, 25, 0.1]],
         },
         names,
         100,

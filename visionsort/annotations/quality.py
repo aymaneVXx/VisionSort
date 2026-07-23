@@ -6,6 +6,7 @@ from typing import Any
 
 from visionsort.core.enums import AnnotationStatus
 from visionsort.tracking.engine import bbox_iou
+from visionsort.annotations.validators import validate_pose_detections
 
 
 class QualityGate:
@@ -100,6 +101,13 @@ class QualityGate:
         mask_quality = (
             sum(mask_scores) / len(mask_scores) if mask_scores else 1.0
         )
+        pose_errors = (
+            validate_pose_detections(
+                detections, width=width, height=height
+            )
+            if task == "pose" and detections
+            else []
+        )
         stats = {
             "count": len(detections),
             "previous_count": previous_count,
@@ -115,10 +123,19 @@ class QualityGate:
             "model_agreement": model_agreement,
             "mask_quality": mask_quality,
             "invalid_instances": invalid,
+            "pose_errors": pose_errors,
         }
         self.previous_by_source[source_id] = [dict(item) for item in detections]
 
-        if invalid > 0 or (task == "segmentation" and detections and mask_quality <= 0.0):
+        if (
+            invalid > 0
+            or (
+                task == "segmentation"
+                and detections
+                and mask_quality <= 0.0
+            )
+            or bool(pose_errors)
+        ):
             return AnnotationStatus.REJECTED.value, stats
         review_reasons = [
             not detections,

@@ -1121,7 +1121,8 @@ class ArtifactRepository:
     def update_dataset_item(self, item_id: str, *, annotation_status: str | None = None, label_path: str | None = None, metadata: dict[str, Any] | None = None) -> None:
         dataset = self.db.fetch_one(
             """
-            SELECT d.status
+            SELECT d.status, d.task, d.data_yaml_path,
+                   di.label_path, di.metadata_json
             FROM datasets d
             JOIN dataset_items di ON di.dataset_id = d.id
             WHERE di.id = ?
@@ -1132,6 +1133,39 @@ class ArtifactRepository:
             raise RuntimeError(
                 "Dataset finalisé immuable: créez une nouvelle version pour modifier cet item."
             )
+        if (
+            dataset is not None
+            and annotation_status == "HUMAN_VALIDATED"
+            and str(dataset["task"]) == "pose"
+        ):
+            from visionsort.annotations.validators import PoseLabelValidator
+
+            effective_label_path = label_path or dataset["label_path"]
+            if not effective_label_path:
+                raise RuntimeError(
+                    "Validation Pose refusée: aucun fichier label."
+                )
+            effective_metadata = (
+                metadata
+                if metadata is not None
+                else json.loads(dataset["metadata_json"] or "{}")
+            )
+            expected = effective_metadata.get("instance_count")
+            if expected is None:
+                expected = effective_metadata.get("pseudo_label_count")
+            report = PoseLabelValidator(
+                str(dataset["data_yaml_path"] or "")
+            ).validate(
+                str(effective_label_path),
+                expected_instances=(
+                    int(expected) if expected is not None else None
+                ),
+            )
+            if not report.valid:
+                raise RuntimeError(
+                    "Validation Pose refusée: "
+                    + " ".join(report.errors)
+                )
         fields: list[str] = []
         params: list[Any] = []
         if annotation_status is not None:

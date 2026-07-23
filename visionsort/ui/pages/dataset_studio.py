@@ -11,6 +11,7 @@ from visionsort.annotations import (
     import_review_annotations,
     render_review_overlay,
 )
+from visionsort.annotations.validators import PoseLabelValidator
 from visionsort.core.enums import AnnotationStatus, CommandType
 from visionsort.core.paths import ROOT_DIR
 from visionsort.database.repositories import ArtifactRepository
@@ -254,14 +255,20 @@ def render(context: UIContext) -> None:
     if uploaded is not None and st.button(
         "Importer et valider humainement", key=f"import-{ds['id']}"
     ):
-        result = import_review_annotations(
-            context.db,
-            ArtifactRepository(context.db),
-            dataset_id=ds["id"],
-            content=uploaded.getvalue(),
-            filename=uploaded.name,
-        )
-        st.success(f"{result['updated_items']} item(s) réimporté(s).")
+        try:
+            result = import_review_annotations(
+                context.db,
+                ArtifactRepository(context.db),
+                dataset_id=ds["id"],
+                content=uploaded.getvalue(),
+                filename=uploaded.name,
+            )
+        except RuntimeError as exc:
+            st.error(str(exc))
+        else:
+            st.success(
+                f"{result['updated_items']} item(s) réimporté(s)."
+            )
 
     position = int(
         st.number_input(
@@ -310,8 +317,33 @@ def render(context: UIContext) -> None:
                 "provenance": details["provenance"],
             }
         )
+        pose_report = None
+        if str(ds.get("task")) == "pose":
+            label_path = item.get("label_path")
+            if label_path:
+                pose_report = PoseLabelValidator(
+                    str(ds.get("data_yaml_path") or "")
+                ).validate(str(label_path))
+            if pose_report is None or not pose_report.valid:
+                st.error("Validation Pose impossible pour cet item.")
+                for error in (
+                    pose_report.errors
+                    if pose_report is not None
+                    else ["Aucun fichier label Pose."]
+                ):
+                    st.caption(error)
         actions = st.columns(2)
-        if actions[0].button("Valider humainement", key=f"accept-{item['id']}"):
+        if actions[0].button(
+            "Valider humainement",
+            key=f"accept-{item['id']}",
+            disabled=bool(
+                pose_report is not None and not pose_report.valid
+            )
+            or (
+                str(ds.get("task")) == "pose"
+                and pose_report is None
+            ),
+        ):
             context.repo.enqueue_command(
                 CommandType.UPDATE_DATASET_ITEM,
                 {

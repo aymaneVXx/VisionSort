@@ -226,12 +226,29 @@ class PoseAutoAnnotator(BaseAutoAnnotator):
     ) -> str | None:
         base = super()._label_line(detection, names, width, height)
         keypoints = detection.get("keypoints") or []
-        if base is None or not keypoints:
+        if (
+            base is None
+            or len(keypoints) != 17
+            or any(len(point) != 3 for point in keypoints)
+        ):
             return None
         values: list[str] = []
         for point in keypoints:
             x, y = float(point[0]), float(point[1])
             confidence = float(point[2]) if len(point) > 2 else 1.0
+            if (
+                not all(
+                    math.isfinite(value)
+                    for value in (x, y, confidence)
+                )
+                or x < 0
+                or y < 0
+                or x > width
+                or y > height
+                or confidence < 0
+                or confidence > 2
+            ):
+                return None
             visibility = 2 if confidence > 0.5 else 1 if confidence > 0.0 else 0
             values.extend((f"{x / width:.6f}", f"{y / height:.6f}", str(visibility)))
         return f"{base} {' '.join(values)}"
