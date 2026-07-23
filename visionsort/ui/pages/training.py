@@ -92,5 +92,12 @@ def render(context: UIContext) -> None:
                         st.code(report_abs.read_text(encoding='utf-8'), language="json")
             if job.get("error_text"):
                 st.error(str(job["error_text"]))
+            if job["status"] in {"QUEUED", "RUNNING"}:
+                if st.button("Annuler le job", key=f"cancel-training-{job['id']}"):
+                    context.repo.enqueue_command(
+                        CommandType.CANCEL_JOB,
+                        {"job_type": "TRAINING", "job_key": job["id"]},
+                    )
+                    st.info("Commande d'annulation envoyée.")
 
     st.dataframe(pd.DataFrame(jobs), use_container_width=True)

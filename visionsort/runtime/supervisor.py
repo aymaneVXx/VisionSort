@@ -125,11 +125,26 @@ class RuntimeSupervisor:
         )
 
     def start(self) -> None:
+        self.recover_interrupted_jobs()
         self.bootstrap_demo_sources()
         if not self.inference_process.is_alive():
             self.inference_process.start()
             self.job_repo.upsert_job_run(JobType.GPU_INFERENCE.value, "shared", self.inference_process.pid or 0, "RUNNING", {"active_model_id": self.active_model_id})
         self.job_repo.upsert_job_run(JobType.SUPERVISOR.value, "main", mp.current_process().pid or 0, "RUNNING", {"demo_mode": self.config.demo_mode})
+
+    def recover_interrupted_jobs(self) -> None:
+        self.db.execute(
+            "UPDATE training_jobs SET status = 'QUEUED', error_text = 'Repris après redémarrage supervisor', updated_at = ? WHERE status = 'RUNNING'",
+            (utc_now(),),
+        )
+        self.db.execute(
+            "UPDATE pipeline_step_runs SET status = 'FAILED', error_text = 'Interrompu; étape reprenable', ended_at = ?, updated_at = ? WHERE status = 'RUNNING'",
+            (time.time(), utc_now()),
+        )
+        self.db.execute(
+            "UPDATE job_runs SET status = 'FAILED', updated_at = ? WHERE status = 'RUNNING'",
+            (utc_now(),),
+        )
 
     def shutdown(self) -> None:
         for source_id in list(self.camera_processes):
@@ -345,6 +360,10 @@ class RuntimeSupervisor:
 
     def start_pipeline_step(self, *, session_id: str, step: str, params: dict[str, Any]) -> str:
         step_name = str(step).upper()
+        prefix = f"{session_id}:{step_name}:"
+        for existing_key, existing_process in self.pipeline_processes.items():
+            if existing_key.startswith(prefix) and existing_process.is_alive():
+                return existing_key
         job_key = f"{session_id}:{step_name}:{int(time.time() * 1000)}"
         process = self.ctx.Process(
             target=pipeline_worker_loop,
@@ -357,16 +376,61 @@ class RuntimeSupervisor:
         self.job_repo.upsert_job_run(JobType.DATASET.value, job_key, process.pid or 0, "RUNNING", {"session_id": session_id, "step": step_name})
         return job_key
 
+    def cancel_job(self, job_type: str, job_key: str) -> None:
+        normalized = str(job_type).upper()
+        if normalized == JobType.TRAINING.value:
+            process = self.training_processes.pop(job_key, None)
+            if process is not None and process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+            self.artifact_repo.update_training_job(
+                job_key, "CANCELLED", error_text="Annulé par utilisateur"
+            )
+            self.job_repo.mark_job_stopped(
+                JobType.TRAINING.value, job_key, status="CANCELLED"
+            )
+            return
+        if normalized == JobType.DATASET.value:
+            process = self.pipeline_processes.pop(job_key, None)
+            if process is not None and process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+            parts = job_key.split(":", 2)
+            if len(parts) >= 2:
+                self.artifact_repo.cancel_pipeline_step(parts[0], parts[1])
+            self.job_repo.mark_job_stopped(
+                JobType.DATASET.value, job_key, status="CANCELLED"
+            )
+            return
+        raise RuntimeError(f"Type de job non annulable: {job_type}")
+
     def handle_tracklet(self, payload: dict[str, Any]) -> None:
         self.handle_tracklets([payload])
 
     def handle_tracklets(self, payloads: list[dict[str, Any]]) -> None:
         tracklets = [Tracklet(**payload) for payload in payloads]
         self.global_tracker.source_roles = self._source_roles()
-        outcomes = self.global_tracker.process_tracklets(tracklets)
-        for tracklet, (parcel_id, result, reasons, candidate) in zip(
-            tracklets, outcomes, strict=True
-        ):
+        parcel_tracklets = [
+            tracklet for tracklet in tracklets if tracklet.class_name == "parcel"
+        ]
+        parcel_outcomes = self.global_tracker.process_tracklets(parcel_tracklets)
+        outcomes_by_id = {
+            tracklet.tracklet_id: outcome
+            for tracklet, outcome in zip(
+                parcel_tracklets, parcel_outcomes, strict=True
+            )
+        }
+        for tracklet in tracklets:
+            if tracklet.class_name != "parcel":
+                self.tracking_repo.upsert_tracklet(
+                    tracklet,
+                    parcel_id=None,
+                    match_result=MatchResult.UNMATCHED.value,
+                )
+                continue
+            parcel_id, result, reasons, candidate = outcomes_by_id[
+                tracklet.tracklet_id
+            ]
             self.tracking_repo.upsert_tracklet(
                 tracklet,
                 parcel_id=parcel_id or None,
@@ -449,6 +513,13 @@ class RuntimeSupervisor:
             elif command_type == CommandType.RUN_PIPELINE_STEP.value:
                 job_key = self.start_pipeline_step(session_id=payload["session_id"], step=payload["step"], params=payload.get("params", {}))
                 result_payload = {"job_key": job_key}
+            elif command_type == CommandType.CANCEL_JOB.value:
+                self.cancel_job(payload["job_type"], payload["job_key"])
+                result_payload = {
+                    "job_type": payload["job_type"],
+                    "job_key": payload["job_key"],
+                    "status": "CANCELLED",
+                }
             elif command_type == CommandType.UPDATE_DATASET_ITEM.value:
                 self.artifact_repo.update_dataset_item(
                     payload["item_id"],
@@ -579,7 +650,25 @@ class RuntimeSupervisor:
                 self.training_processes.pop(job_id, None)
         for job_key, process in list(self.pipeline_processes.items()):
             if not process.is_alive():
-                self.job_repo.mark_job_stopped(JobType.DATASET.value, job_key, status="EXITED")
+                parts = job_key.split(":", 2)
+                step_run = (
+                    self.db.fetch_one(
+                        """
+                        SELECT status FROM pipeline_step_runs
+                        WHERE session_id = ? AND step = ?
+                        ORDER BY created_at DESC LIMIT 1
+                        """,
+                        (parts[0], parts[1]),
+                    )
+                    if len(parts) >= 2
+                    else None
+                )
+                terminal_status = (
+                    str(step_run["status"]) if step_run is not None else "FAILED"
+                )
+                self.job_repo.mark_job_stopped(
+                    JobType.DATASET.value, job_key, status=terminal_status
+                )
                 self.pipeline_processes.pop(job_key, None)
         if not self.camera_processes and not any(
             process.is_alive() for process in self.training_processes.values()

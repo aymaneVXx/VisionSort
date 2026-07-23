@@ -291,6 +291,8 @@ class VisionSortDB:
                     id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL,
                     step TEXT NOT NULL,
+                    idempotency_key TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 1,
                     status TEXT NOT NULL,
                     inputs_json TEXT NOT NULL DEFAULT '{}',
                     outputs_json TEXT NOT NULL DEFAULT '{}',
@@ -443,6 +445,16 @@ class VisionSortDB:
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_pipeline_steps_session ON pipeline_step_runs(session_id, step, created_at)")
             conn.execute("PRAGMA user_version = 2")
+
+        if version < 3:
+            add_column("pipeline_step_runs", "idempotency_key TEXT")
+            add_column(
+                "pipeline_step_runs", "attempt_count INTEGER NOT NULL DEFAULT 1"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_pipeline_step_idempotency ON pipeline_step_runs(idempotency_key)"
+            )
+            conn.execute("PRAGMA user_version = 3")
 
     def fetch_all(self, query: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
         with self.connect() as conn:

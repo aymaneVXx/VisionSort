@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 import uuid
@@ -324,7 +325,7 @@ class TrackingRepository:
             INSERT INTO tracklets
             (tracklet_id, parcel_id, session_id, source_id, camera_id, camera_role, local_track_id, started_at_local, ended_at_local, started_at_global, ended_at_global,
              class_name, last_zone_id, frame_count, avg_speed, observation_path, summary_json, match_result, model_id, tracker_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(tracklet_id) DO UPDATE SET
                 parcel_id = excluded.parcel_id,
                 ended_at_local = excluded.ended_at_local,
@@ -498,16 +499,85 @@ class ArtifactRepository:
         params.append(item_id)
         self.db.execute(f"UPDATE dataset_items SET {', '.join(fields)} WHERE id = ?", tuple(params))
 
-    def start_pipeline_step(self, session_id: str, step: str, inputs: dict[str, Any], log_path: str | None = None) -> str:
-        step_id = str(uuid.uuid4())
-        now = utc_now()
-        self.db.execute(
-            """
-            INSERT INTO pipeline_step_runs
-            (id, session_id, step, status, inputs_json, outputs_json, error_text, log_path, started_at, ended_at, created_at, updated_at)
-            VALUES (?, ?, ?, 'RUNNING', ?, '{}', NULL, ?, ?, NULL, ?, ?)
-            """,
-            (step_id, session_id, step, json.dumps(inputs), log_path, time.time(), now, now),
+    def claim_pipeline_step(
+        self,
+        session_id: str,
+        step: str,
+        inputs: dict[str, Any],
+        *,
+        log_path: str | None = None,
+        stale_after_seconds: float = 3600.0,
+    ) -> tuple[str, bool, dict[str, Any]]:
+        normalized_inputs = json.dumps(
+            inputs, sort_keys=True, separators=(",", ":")
+        )
+        explicit_key = inputs.get("idempotency_key")
+        force = bool(inputs.get("force", False))
+        idempotency_key = str(explicit_key) if explicit_key else hashlib.sha256(
+            f"{session_id}:{step}:{normalized_inputs}".encode("utf-8")
+        ).hexdigest()
+        if force and not explicit_key:
+            idempotency_key = f"{idempotency_key}:{uuid.uuid4().hex}"
+        now_iso = utc_now()
+        now_ts = time.time()
+        with self.db.connect() as conn:
+            existing = conn.execute(
+                "SELECT * FROM pipeline_step_runs WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                outputs = json.loads(existing["outputs_json"] or "{}")
+                if existing["status"] == "COMPLETED":
+                    return str(existing["id"]), False, outputs
+                started_at = float(existing["started_at"] or 0.0)
+                if (
+                    existing["status"] == "RUNNING"
+                    and now_ts - started_at < stale_after_seconds
+                ):
+                    return str(existing["id"]), False, outputs
+                conn.execute(
+                    """
+                    UPDATE pipeline_step_runs
+                    SET status = 'RUNNING', attempt_count = attempt_count + 1,
+                        outputs_json = '{}', error_text = NULL, log_path = ?,
+                        started_at = ?, ended_at = NULL, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (log_path, now_ts, now_iso, existing["id"]),
+                )
+                return str(existing["id"]), True, {}
+            step_id = str(uuid.uuid4())
+            conn.execute(
+                """
+                INSERT INTO pipeline_step_runs
+                (id, session_id, step, idempotency_key, attempt_count, status,
+                 inputs_json, outputs_json, error_text, log_path, started_at,
+                 ended_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 1, 'RUNNING', ?, '{}', NULL, ?, ?, NULL, ?, ?)
+                """,
+                (
+                    step_id,
+                    session_id,
+                    step,
+                    idempotency_key,
+                    normalized_inputs,
+                    log_path,
+                    now_ts,
+                    now_iso,
+                    now_iso,
+                ),
+            )
+            return step_id, True, {}
+
+    def start_pipeline_step(
+        self,
+        session_id: str,
+        step: str,
+        inputs: dict[str, Any],
+        log_path: str | None = None,
+    ) -> str:
+        step_id, _, _ = self.claim_pipeline_step(
+            session_id, step, inputs, log_path=log_path
         )
         return step_id
 
@@ -515,6 +585,21 @@ class ArtifactRepository:
         self.db.execute(
             "UPDATE pipeline_step_runs SET status = ?, outputs_json = ?, error_text = ?, ended_at = ?, updated_at = ? WHERE id = ?",
             (status, json.dumps(outputs or {}), error_text, time.time(), utc_now(), step_id),
+        )
+
+    def cancel_pipeline_step(self, session_id: str, step: str) -> None:
+        self.db.execute(
+            """
+            UPDATE pipeline_step_runs
+            SET status = 'CANCELLED', error_text = 'Annulé par utilisateur',
+                ended_at = ?, updated_at = ?
+            WHERE id = (
+                SELECT id FROM pipeline_step_runs
+                WHERE session_id = ? AND step = ? AND status = 'RUNNING'
+                ORDER BY created_at DESC LIMIT 1
+            )
+            """,
+            (time.time(), utc_now(), session_id, step),
         )
 
     def add_training_job(self, dataset_id: str, model_id: str, status: str, recipe: dict[str, Any], log_path: str) -> str:

@@ -128,7 +128,28 @@ def pipeline_worker_loop(db_path: str, session_id: str, step: str, params: dict[
     log_dir = REPORTS_DIR / session_id
     log_dir.mkdir(parents=True, exist_ok=True)
     report_path = log_dir / f"{int(time.time())}_{step_name}.json"
-    step_id = artifact_repo.start_pipeline_step(session_id, step_name, params, log_path=str(report_path.relative_to(ROOT_DIR)))
+    claim_params = dict(params)
+    if step_name == "FINALIZE_DATASET":
+        session = control_repo.get_capture_session(session_id) or {}
+        dataset_id_for_revision = str(
+            params.get("dataset_id") or session.get("last_dataset_id") or ""
+        )
+        revision_rows = db.fetch_all(
+            "SELECT id, annotation_status, label_path FROM dataset_items WHERE dataset_id = ? ORDER BY id",
+            (dataset_id_for_revision,),
+        )
+        claim_params["_dataset_revision"] = [
+            [row["id"], row["annotation_status"], row["label_path"]]
+            for row in revision_rows
+        ]
+    step_id, should_run, _ = artifact_repo.claim_pipeline_step(
+        session_id,
+        step_name,
+        claim_params,
+        log_path=str(report_path.relative_to(ROOT_DIR)),
+    )
+    if not should_run:
+        return
     started = time.time()
     try:
         outputs: dict[str, Any] = {}
@@ -365,10 +386,32 @@ def pipeline_worker_loop(db_path: str, session_id: str, step: str, params: dict[
         else:
             raise RuntimeError(f"Step pipeline inconnue: {step_name}")
 
-        report = {"session_id": session_id, "step": step_name, "status": "COMPLETED", "started_at": started, "ended_at": time.time(), "inputs": params, "outputs": outputs}
+        ended_at = time.time()
+        report = {
+            "session_id": session_id,
+            "step": step_name,
+            "status": "COMPLETED",
+            "started_at": started,
+            "ended_at": ended_at,
+            "duration_seconds": ended_at - started,
+            "configuration_version": "pipeline-v3",
+            "inputs": params,
+            "outputs": outputs,
+        }
         report_path.write_text(json.dumps(report, ensure_ascii=True), encoding="utf-8")
         artifact_repo.finish_pipeline_step(step_id, status="COMPLETED", outputs={"report_path": str(report_path.relative_to(ROOT_DIR)), **outputs})
     except Exception as exc:  # pragma: no cover - runtime
-        report = {"session_id": session_id, "step": step_name, "status": "FAILED", "started_at": started, "ended_at": time.time(), "inputs": params, "error": str(exc)}
+        ended_at = time.time()
+        report = {
+            "session_id": session_id,
+            "step": step_name,
+            "status": "FAILED",
+            "started_at": started,
+            "ended_at": ended_at,
+            "duration_seconds": ended_at - started,
+            "configuration_version": "pipeline-v3",
+            "inputs": params,
+            "error": str(exc),
+        }
         report_path.write_text(json.dumps(report, ensure_ascii=True), encoding="utf-8")
         artifact_repo.finish_pipeline_step(step_id, status="FAILED", outputs={"report_path": str(report_path.relative_to(ROOT_DIR))}, error_text=str(exc))

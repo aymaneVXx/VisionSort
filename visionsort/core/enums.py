@@ -34,6 +34,15 @@ class CommandStatus(str, Enum):
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class JobStatus(str, Enum):
+    QUEUED = "QUEUED"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 
 class ModelTask(str, Enum):
@@ -99,6 +108,7 @@ class CommandType(str, Enum):
     START_SESSION = "START_SESSION"
     STOP_SESSION = "STOP_SESSION"
     RUN_PIPELINE_STEP = "RUN_PIPELINE_STEP"
+    CANCEL_JOB = "CANCEL_JOB"
     UPDATE_DATASET_ITEM = "UPDATE_DATASET_ITEM"
     START_SOURCE = "START_SOURCE"
     STOP_SOURCE = "STOP_SOURCE"
