@@ -49,6 +49,8 @@ class ModelTask(str, Enum):
     DETECTION = "detection"
     SEGMENTATION = "segmentation"
     POSE = "pose"
+    LOCAL_TRACKING = "local_tracking"
+    REID_MULTICAMERA = "reid_multicamera"
 
 
 class ModelStatus(str, Enum):
@@ -110,6 +112,8 @@ class CommandType(str, Enum):
     RUN_PIPELINE_STEP = "RUN_PIPELINE_STEP"
     CANCEL_JOB = "CANCEL_JOB"
     UPDATE_DATASET_ITEM = "UPDATE_DATASET_ITEM"
+    RESOLVE_HANDOFF = "RESOLVE_HANDOFF"
+    REJECT_HANDOFF = "REJECT_HANDOFF"
     START_SOURCE = "START_SOURCE"
     STOP_SOURCE = "STOP_SOURCE"
     START_RECORDING = "START_RECORDING"

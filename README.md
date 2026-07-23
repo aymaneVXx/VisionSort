@@ -29,6 +29,7 @@ VisionSort est une plateforme locale Python + Streamlit pour piloter un cycle co
 - `visionsort/runtime/supervisor.py` : supervisor persistant et gestion des commandes
 - `visionsort/runtime/pipeline_worker.py` : steps pipeline (`PROCESS_SESSION`, `SAMPLE`, `AUTO_ANNOTATE`, `FINALIZE_DATASET`, `EXPORT_OBSERVATIONS_PARQUET`)
 - `visionsort/runtime/e2e.py` : validation CPU complète avec backends simulés explicitement
+- `visionsort/runtime/supervisor_e2e.py` : validation multiprocessus via commandes SQLite et `RuntimeSupervisor`
 - `visionsort/acquisition/worker.py` : boucle caméra/source, previews, enregistrement, observations JSONL
 - `visionsort/inference/engine.py` : backends de modèles et provenance modèle/version
 - `visionsort/tracking/engine.py` : trackers locaux, tracklets, matching multicaméra
@@ -172,7 +173,7 @@ Des rapports JSON machine-readable sont produits dans `data/runtime/reports/`.
 
 - Les règles multicaméra, prise et dépôt sont testables en Replay mais non validées sur site.
 - Le backend `demo_synth_det` reste réservé à `DEMO_MODE`.
-- Les modèles Ultralytics peuvent nécessiter le téléchargement des poids au premier lancement.
+- Les poids Ultralytics doivent être présents localement et leur empreinte vérifiable avant chargement; le runtime ne masque pas de téléchargement automatique.
 - ByteTrack et BoT-SORT exigent `lap` et restent à valider sur les flux réels du site.
 - Un dataset mono-session appartient volontairement à un seul split; plusieurs sessions sont nécessaires pour un entraînement réel train/val/test sans fuite.
 - Le checkpoint produit par le scénario E2E démo est explicitement simulé; seul le chemin Ultralytics produit de vrais poids.
@@ -204,3 +205,16 @@ Ce scénario traite les trois Replay, construit et revoit le dataset, lance
 l'entraînement démo, crée/active un candidat et vérifie son utilisation lors
 d'une seconde session. Le rapport conserve `NON_VALIDÉ_SUR_SITE` pour tout ce
 qui dépend encore des vraies caméras.
+
+Scénario end-to-end multiprocessus via le superviseur :
+
+```powershell
+$env:DEMO_MODE="1"
+python -m visionsort.runtime.supervisor_e2e --db data/runtime/supervisor-e2e.db --report data/runtime/reports/supervisor-e2e.json
+```
+
+Il enregistre les Replay par commandes SQLite, exécute trois sessions isolées
+pour les splits train/val/test, pilote sampling, annotation, entraînement,
+promotion et activation, puis vérifie le modèle actif dans une nouvelle
+session. La CI exécute installation, compilation et tests sous Python 3.10 et
+3.12; les deux scénarios E2E sont lancés sous Python 3.12.

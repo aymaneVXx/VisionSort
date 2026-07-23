@@ -71,6 +71,11 @@ def test_promote_and_rollback_model_registry(tmp_path):
             json.dumps(
                 {
                     "precision": 0.9,
+                    "recall": 0.9,
+                    "mAP50": 0.9,
+                    "count_accuracy": 0.9,
+                    "merge_rate": 0.01,
+                    "fps": 20.0,
                     "promotion_eligible": True,
                     "promotion_criteria": {"precision_min": 0.5},
                     "test": {"status": "COMPLETED", "frozen": True},
@@ -125,6 +130,6 @@ def test_promotion_refuses_candidate_without_frozen_test_and_criteria(tmp_path):
     try:
         promote_model(db, "unsafe-candidate")
     except RuntimeError as exc:
-        assert "test figé" in str(exc)
+        assert "Promotion refusée" in str(exc)
     else:
         raise AssertionError("La promotion aurait dû être refusée.")

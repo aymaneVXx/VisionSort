@@ -175,6 +175,13 @@ class ControlRepository:
     ) -> None:
         current = self.db.fetch_one("SELECT * FROM source_state WHERE source_id = ?", (source_id,))
         metrics_json = json.dumps(metrics if metrics is not None else json.loads(current["metrics_json"]) if current else {})
+        recording_value = (
+            int(recording_enabled)
+            if recording_enabled is not None
+            else int(current["recording_enabled"])
+            if current is not None
+            else 0
+        )
         status_value = status.value if isinstance(status, SourceStatus) else str(status)
         self.db.execute(
             """
@@ -200,7 +207,7 @@ class ControlRepository:
                 last_frame_ts,
                 preview_path,
                 details_path,
-                None if recording_enabled is None else int(recording_enabled),
+                recording_value,
                 metrics_json,
                 utc_now(),
             ),
@@ -245,6 +252,26 @@ class ControlRepository:
     def list_datasets(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self.db.fetch_all("SELECT * FROM datasets ORDER BY created_at DESC")]
 
+    def list_dataset_sessions(self, dataset_id: str) -> list[dict[str, Any]]:
+        return [
+            dict(row)
+            for row in self.db.fetch_all(
+                """
+                SELECT ds.dataset_id, ds.session_id, ds.split, cs.name,
+                       cs.pipeline_state, cs.started_at, cs.ended_at,
+                       COUNT(css.id) AS camera_count,
+                       GROUP_CONCAT(css.camera_role) AS camera_roles
+                FROM dataset_sessions ds
+                JOIN capture_sessions cs ON cs.id = ds.session_id
+                LEFT JOIN capture_session_sources css ON css.session_id = ds.session_id
+                WHERE ds.dataset_id = ?
+                GROUP BY ds.dataset_id, ds.session_id, ds.split
+                ORDER BY ds.split, cs.created_at
+                """,
+                (dataset_id,),
+            )
+        ]
+
     def list_dataset_items(self, dataset_id: str, limit: int = 500) -> list[dict[str, Any]]:
         return [
             dict(row)
@@ -268,6 +295,23 @@ class ControlRepository:
 
     def list_jobs(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self.db.fetch_all("SELECT * FROM job_runs ORDER BY started_at DESC")]
+
+    def list_handoff_hypotheses(
+        self, status: str | None = None
+    ) -> list[dict[str, Any]]:
+        if status is None:
+            rows = self.db.fetch_all(
+                "SELECT * FROM handoff_hypotheses ORDER BY created_at DESC"
+            )
+        else:
+            rows = self.db.fetch_all(
+                """
+                SELECT * FROM handoff_hypotheses
+                WHERE status = ? ORDER BY created_at DESC
+                """,
+                (status,),
+            )
+        return [dict(row) for row in rows]
 
 
 class EventRepository:
@@ -394,6 +438,143 @@ class TrackingRepository:
         )
 
 
+class HandoffHypothesisRepository:
+    def __init__(self, db: VisionSortDB):
+        self.db = db
+
+    def create(
+        self,
+        *,
+        session_id: str,
+        incoming_tracklet_id: str,
+        candidates: list[dict[str, Any]],
+        expiry_seconds: float,
+    ) -> str:
+        existing = self.db.fetch_one(
+            """
+            SELECT id FROM handoff_hypotheses
+            WHERE session_id = ? AND incoming_tracklet_id = ? AND status = 'PENDING'
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (session_id, incoming_tracklet_id),
+        )
+        if existing is not None:
+            return str(existing["id"])
+        hypothesis_id = f"hypothesis-{uuid.uuid4().hex[:12]}"
+        now = utc_now()
+        self.db.execute(
+            """
+            INSERT INTO handoff_hypotheses
+            (id, session_id, incoming_tracklet_id, candidates_json, status,
+             resolution_json, expires_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 'PENDING', NULL, ?, ?, ?)
+            """,
+            (
+                hypothesis_id,
+                session_id,
+                incoming_tracklet_id,
+                json.dumps(candidates),
+                time.time() + max(1.0, float(expiry_seconds)),
+                now,
+                now,
+            ),
+        )
+        return hypothesis_id
+
+    def get(self, hypothesis_id: str) -> dict[str, Any] | None:
+        row = self.db.fetch_one(
+            "SELECT * FROM handoff_hypotheses WHERE id = ?", (hypothesis_id,)
+        )
+        return dict(row) if row else None
+
+    def pending(self, session_id: str | None = None) -> list[dict[str, Any]]:
+        self.expire()
+        if session_id is None:
+            rows = self.db.fetch_all(
+                """
+                SELECT * FROM handoff_hypotheses
+                WHERE status = 'PENDING' ORDER BY created_at
+                """
+            )
+        else:
+            rows = self.db.fetch_all(
+                """
+                SELECT * FROM handoff_hypotheses
+                WHERE status = 'PENDING' AND session_id = ? ORDER BY created_at
+                """,
+                (session_id,),
+            )
+        return [dict(row) for row in rows]
+
+    def resolve(
+        self,
+        hypothesis_id: str,
+        *,
+        outgoing_tracklet_id: str,
+        resolution: dict[str, Any],
+    ) -> None:
+        row = self.get(hypothesis_id)
+        if row is None or row["status"] != "PENDING":
+            raise RuntimeError("Hypothèse de handoff non résoluble.")
+        candidates = json.loads(row["candidates_json"] or "[]")
+        if outgoing_tracklet_id not in {
+            str(candidate["from_tracklet_id"]) for candidate in candidates
+        }:
+            raise RuntimeError("Le tracklet choisi ne fait pas partie des candidats.")
+        self.db.execute(
+            """
+            UPDATE handoff_hypotheses
+            SET status = 'RESOLVED', resolution_json = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                json.dumps(
+                    {
+                        **resolution,
+                        "outgoing_tracklet_id": outgoing_tracklet_id,
+                    }
+                ),
+                utc_now(),
+                hypothesis_id,
+            ),
+        )
+
+    def reject(
+        self, hypothesis_id: str, *, reason: str = "rejet humain"
+    ) -> None:
+        row = self.get(hypothesis_id)
+        if row is None or row["status"] != "PENDING":
+            raise RuntimeError("Hypothèse de handoff non rejetable.")
+        self.db.execute(
+            """
+            UPDATE handoff_hypotheses
+            SET status = 'REJECTED', resolution_json = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (json.dumps({"reason": reason}), utc_now(), hypothesis_id),
+        )
+
+    def expire(self, *, now: float | None = None) -> int:
+        current = float(now if now is not None else time.time())
+        count = self.db.fetch_one(
+            """
+            SELECT COUNT(*) AS count FROM handoff_hypotheses
+            WHERE status = 'PENDING' AND expires_at <= ?
+            """,
+            (current,),
+        )
+        self.db.execute(
+            """
+            UPDATE handoff_hypotheses
+            SET status = 'EXPIRED',
+                resolution_json = '{"reason":"fenêtre de résolution expirée"}',
+                updated_at = ?
+            WHERE status = 'PENDING' AND expires_at <= ?
+            """,
+            (utc_now(), current),
+        )
+        return int((count["count"] if count else 0) or 0)
+
 class ArtifactRepository:
     def __init__(self, db: VisionSortDB):
         self.db = db
@@ -419,20 +600,101 @@ class ArtifactRepository:
         )
         return rec_id
 
-    def upsert_dataset(self, dataset_id: str, name: str, root_path: str, status: str, manifest_path: str, data_yaml_path: str, summary: dict[str, Any]) -> None:
+    def upsert_dataset(
+        self,
+        dataset_id: str,
+        name: str,
+        root_path: str,
+        status: str,
+        manifest_path: str,
+        data_yaml_path: str,
+        summary: dict[str, Any],
+        *,
+        task: str = "detection",
+        dataset_fingerprint: str | None = None,
+        finalized_at: str | None = None,
+        generation_config: dict[str, Any] | None = None,
+    ) -> None:
         now = utc_now()
+        existing = self.db.fetch_one(
+            """
+            SELECT status, task, dataset_fingerprint, finalized_at,
+                   generation_config_json
+            FROM datasets WHERE id = ?
+            """,
+            (dataset_id,),
+        )
+        if existing is not None and existing["status"] == "DATASET_READY":
+            raise RuntimeError(
+                "Dataset finalisé immuable: créez une nouvelle version pour toute correction."
+            )
+        if existing is not None:
+            task = str(existing["task"])
+            dataset_fingerprint = (
+                dataset_fingerprint or existing["dataset_fingerprint"]
+            )
+            finalized_at = finalized_at or existing["finalized_at"]
+            if generation_config is None:
+                generation_config = json.loads(
+                    existing["generation_config_json"] or "{}"
+                )
         self.db.execute(
             """
-            INSERT INTO datasets (id, name, root_path, status, manifest_path, data_yaml_path, summary_json, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO datasets
+            (id, name, root_path, task, status, manifest_path, data_yaml_path,
+             dataset_fingerprint, finalized_at, generation_config_json,
+             summary_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 status = excluded.status,
                 manifest_path = excluded.manifest_path,
                 data_yaml_path = excluded.data_yaml_path,
+                dataset_fingerprint = excluded.dataset_fingerprint,
+                finalized_at = excluded.finalized_at,
+                generation_config_json = excluded.generation_config_json,
                 summary_json = excluded.summary_json,
                 updated_at = excluded.updated_at
             """,
-            (dataset_id, name, root_path, status, manifest_path, data_yaml_path, json.dumps(summary), now, now),
+            (
+                dataset_id,
+                name,
+                root_path,
+                task,
+                status,
+                manifest_path,
+                data_yaml_path,
+                dataset_fingerprint,
+                finalized_at,
+                json.dumps(generation_config or {}),
+                json.dumps(summary),
+                now,
+                now,
+            ),
+        )
+
+    def set_dataset_sessions(
+        self, dataset_id: str, split_assignments: dict[str, str]
+    ) -> None:
+        dataset = self.db.fetch_one(
+            "SELECT status FROM datasets WHERE id = ?", (dataset_id,)
+        )
+        if dataset is None:
+            raise RuntimeError("Dataset introuvable.")
+        if dataset["status"] == "DATASET_READY":
+            raise RuntimeError("Les splits d'un dataset finalisé sont immuables.")
+        self.db.execute(
+            "DELETE FROM dataset_sessions WHERE dataset_id = ?", (dataset_id,)
+        )
+        now = utc_now()
+        self.db.execute_many(
+            """
+            INSERT INTO dataset_sessions (dataset_id, session_id, split, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            [
+                (dataset_id, session_id, split, now)
+                for session_id, split in sorted(split_assignments.items())
+            ],
         )
 
     def add_dataset_item(
@@ -483,6 +745,19 @@ class ArtifactRepository:
         return item_id
 
     def update_dataset_item(self, item_id: str, *, annotation_status: str | None = None, label_path: str | None = None, metadata: dict[str, Any] | None = None) -> None:
+        dataset = self.db.fetch_one(
+            """
+            SELECT d.status
+            FROM datasets d
+            JOIN dataset_items di ON di.dataset_id = d.id
+            WHERE di.id = ?
+            """,
+            (item_id,),
+        )
+        if dataset is not None and dataset["status"] == "DATASET_READY":
+            raise RuntimeError(
+                "Dataset finalisé immuable: créez une nouvelle version pour modifier cet item."
+            )
         fields: list[str] = []
         params: list[Any] = []
         if annotation_status is not None:

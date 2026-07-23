@@ -19,7 +19,7 @@ class SourceSettings:
     session_start_global: float
     replay_fps: float = 8.0
     replay_offset_ms: float = 0.0
-    loop: bool = True
+    loop: bool = False
     reconnect_delay_s: float = 2.0
 
 
@@ -28,14 +28,21 @@ class OpenCVSourceBase:
         self.settings = settings
         self.capture: cv2.VideoCapture | None = None
         self.frame_index = 0
+        self.stream_epoch = 0
+        self._opened_once = False
+        self._replay_epoch_offset = 0.0
         self._video_fps = 0.0
         self._video_t0_local = 0.0
 
     def open(self) -> None:
         self.capture = cv2.VideoCapture(self.settings.uri)
-        self.frame_index = 0
         if not self.capture or not self.capture.isOpened():
             raise RuntimeError(f"Impossible d'ouvrir la source {self.settings.uri}")
+        if self._opened_once:
+            self.stream_epoch += 1
+        else:
+            self.frame_index = 0
+            self._opened_once = True
         try:
             self._video_fps = float(self.capture.get(cv2.CAP_PROP_FPS) or 0.0)
         except Exception:
@@ -65,7 +72,12 @@ class OpenCVSourceBase:
     def _build_frame(self, image) -> Frame:
         timestamp_local = self._current_local_ts()
         offset_s = float(self.settings.replay_offset_ms) / 1000.0
-        timestamp_global = float(self.settings.session_start_global) + (timestamp_local - self._video_t0_local) + offset_s
+        timestamp_global = (
+            float(self.settings.session_start_global)
+            + self._replay_epoch_offset
+            + (timestamp_local - self._video_t0_local)
+            + offset_s
+        )
         frame = Frame(
             session_id=self.settings.session_id,
             camera_id=self.settings.camera_id,
@@ -75,6 +87,7 @@ class OpenCVSourceBase:
             timestamp_global=timestamp_global,
             image=image,
             source_fps=self._video_fps or self.settings.replay_fps,
+            stream_epoch=self.stream_epoch,
         )
         self.frame_index += 1
         return frame
@@ -100,8 +113,14 @@ class ReplaySource(OpenCVSourceBase):
                 return None
             if self.capture is None:
                 return None
+            self._replay_epoch_offset += max(
+                self._current_local_ts(),
+                float(self.frame_index)
+                / max(self._video_fps or self.settings.replay_fps, 1.0),
+            )
             self.capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
             self.frame_index = 0
+            self.stream_epoch += 1
             ok, image = self._read_raw()
             if not ok:
                 return None
@@ -126,6 +145,7 @@ class RTSPSource(OpenCVSourceBase):
                 timestamp_global=timestamp_global,
                 image=image,
                 source_fps=self._video_fps or 0.0,
+                stream_epoch=self.stream_epoch,
             )
             self.frame_index += 1
             return frame
@@ -145,6 +165,7 @@ class RTSPSource(OpenCVSourceBase):
             timestamp_global=timestamp_global,
             image=image,
             source_fps=self._video_fps or 0.0,
+            stream_epoch=self.stream_epoch,
         )
         self.frame_index += 1
         return frame
@@ -160,6 +181,7 @@ def build_source(
     session_start_global: float,
     replay_fps: float = 8.0,
     replay_offset_ms: float = 0.0,
+    loop: bool = False,
 ) -> OpenCVSourceBase:
     settings = SourceSettings(
         session_id=session_id,
@@ -169,6 +191,7 @@ def build_source(
         session_start_global=session_start_global,
         replay_fps=replay_fps,
         replay_offset_ms=replay_offset_ms,
+        loop=loop,
     )
     normalized = source_type.upper()
     if normalized == SourceType.REPLAY.value:

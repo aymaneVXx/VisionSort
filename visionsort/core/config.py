@@ -25,6 +25,7 @@ DEFAULT_CONFIG = {
         "recording_segment_seconds": 10,
         "details_flush_every": 10,
         "max_inference_queue": 8,
+        "inference_result_ttl_seconds": 5.0,
     },
     "gpu": {
         "allow_training_while_inference": False,
@@ -44,6 +45,10 @@ DEFAULT_CONFIG = {
         },
     },
     "tracking": {
+        "handoff_window_seconds": 0.75,
+        "handoff_buffer_max_items": 1000,
+        "handoff_expiry_seconds": 30.0,
+        "hypothesis_expiry_seconds": 120.0,
         "site_topology": {
             "edges": [
                 {"from_role": "C1", "to_role": "C2", "min_transit_s": 0.5, "max_transit_s": 10.0},

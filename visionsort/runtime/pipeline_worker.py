@@ -20,6 +20,7 @@ from visionsort.database.db import VisionSortDB, utc_now
 from visionsort.database.repositories import ArtifactRepository, ControlRepository
 from visionsort.datasets.pipeline import (
     build_dataset,
+    compute_dataset_fingerprint,
     rewrite_training_manifest,
     validate_dataset_splits,
 )
@@ -69,6 +70,7 @@ def _finalize_dataset_status(
     if dataset is None:
         raise RuntimeError("Dataset introuvable.")
     summary = _load_json_dict(dataset["summary_json"])
+    dataset_task = str(dataset["task"] or "detection")
     summary["review_counts"] = {
         "needs_review": needs_review,
         "auto_accepted": auto_accepted,
@@ -84,9 +86,44 @@ def _finalize_dataset_status(
         raise RuntimeError(f"Fuite entre splits: {split_integrity['leaks']}")
     summary["split_integrity"] = split_integrity
     summary["trainable_manifest_rows"] = trainable_manifest_rows
+    linked_sessions = [
+        dict(row)
+        for row in db.fetch_all(
+            """
+            SELECT ds.session_id, ds.split, cs.demo_mode
+            FROM dataset_sessions ds
+            JOIN capture_sessions cs ON cs.id = ds.session_id
+            WHERE ds.dataset_id = ?
+            """,
+            (dataset_id,),
+        )
+    ]
+    real_dataset = any(not bool(row["demo_mode"]) for row in linked_sessions)
+    split_complete = bool(split_integrity["all_splits_nonempty"])
+    summary["real_split_ready"] = split_complete
+    summary["real_dataset"] = real_dataset
+    task_artifacts_ready = True
+    task_readiness_reason = None
+    if dataset_task == "local_tracking":
+        task_artifacts_ready = int(summary.get("tracking_manifest_rows") or 0) > 0
+        if not task_artifacts_ready:
+            task_readiness_reason = "tracking_manifest vide"
+    elif dataset_task == "reid_multicamera":
+        task_artifacts_ready = (
+            (summary.get("reid") or {}).get("status") == "READY"
+        )
+        if not task_artifacts_ready:
+            task_readiness_reason = (
+                "associations globales ou paires ReID insuffisantes"
+            )
+    summary["task_artifacts_ready"] = task_artifacts_ready
+    summary["task_readiness_reason"] = task_readiness_reason
     status = (
         "REVIEW_PENDING"
-        if needs_review > 0 or trainable <= 0
+        if needs_review > 0
+        or trainable <= 0
+        or (real_dataset and not split_complete)
+        or not task_artifacts_ready
         else "DATASET_READY"
     )
     pipeline_state = (
@@ -94,6 +131,14 @@ def _finalize_dataset_status(
         if status == "REVIEW_PENDING"
         else PipelineState.DATASET_READY.value
     )
+    fingerprint = (
+        compute_dataset_fingerprint(db, dataset_id)
+        if status == "DATASET_READY"
+        else None
+    )
+    finalized_at = utc_now() if status == "DATASET_READY" else None
+    if fingerprint:
+        summary["dataset_fingerprint"] = fingerprint
     artifact_repo.upsert_dataset(
         dataset_id=dataset_id,
         name=dataset["name"],
@@ -102,12 +147,18 @@ def _finalize_dataset_status(
         manifest_path=dataset["manifest_path"],
         data_yaml_path=dataset["data_yaml_path"],
         summary=summary,
+        dataset_fingerprint=fingerprint,
+        finalized_at=finalized_at,
     )
-    control_repo.update_capture_session(
-        session_id,
-        pipeline_state=pipeline_state,
-        report_path=str(report_path.relative_to(ROOT_DIR)),
-    )
+    session_targets = [
+        str(row["session_id"]) for row in linked_sessions
+    ] or [session_id]
+    for target_session_id in session_targets:
+        control_repo.update_capture_session(
+            target_session_id,
+            pipeline_state=pipeline_state,
+            report_path=str(report_path.relative_to(ROOT_DIR)),
+        )
     return {
         "dataset_id": dataset_id,
         "dataset_status": status,
@@ -117,6 +168,10 @@ def _finalize_dataset_status(
         "rejected": rejected,
         "trainable": trainable,
         "split_integrity": split_integrity,
+        "dataset_fingerprint": fingerprint,
+        "real_split_ready": split_complete,
+        "task_artifacts_ready": task_artifacts_ready,
+        "task_readiness_reason": task_readiness_reason,
     }
 
 
@@ -201,10 +256,18 @@ def pipeline_worker_loop(db_path: str, session_id: str, step: str, params: dict[
             session = control_repo.get_capture_session(session_id)
             if session is None:
                 raise RuntimeError("Session introuvable.")
+            selected_session_ids = [
+                str(value)
+                for value in (params.get("session_ids") or [session_id])
+            ]
             existing_dataset_id = str(session.get("last_dataset_id") or "")
             force = bool(params.get("force", False))
             existing_dataset = db.fetch_one("SELECT * FROM datasets WHERE id = ?", (existing_dataset_id,)) if existing_dataset_id else None
-            if existing_dataset is not None and not force:
+            if (
+                existing_dataset is not None
+                and not force
+                and selected_session_ids == [session_id]
+            ):
                 dataset_id = str(existing_dataset["id"])
                 result = {
                     "dataset_id": dataset_id,
@@ -215,12 +278,32 @@ def pipeline_worker_loop(db_path: str, session_id: str, step: str, params: dict[
                     "reused_existing": True,
                 }
             else:
-                result = build_dataset(db, session_id=session_id, name=str(params.get("name") or "dataset_from_session"))
+                result = build_dataset(
+                    db,
+                    session_ids=selected_session_ids,
+                    split_assignments={
+                        str(key): str(value)
+                        for key, value in dict(
+                            params.get("split_assignments") or {}
+                        ).items()
+                    }
+                    or None,
+                    name=str(params.get("name") or "dataset_project"),
+                    task=str(params.get("task") or "detection"),
+                    generation_config=dict(params.get("generation_config") or {}),
+                )
                 dataset_id = str(result["dataset_id"])
-            db.execute(
-                "UPDATE capture_sessions SET pipeline_state = ?, last_dataset_id = ?, report_path = ?, updated_at = ? WHERE id = ?",
-                (PipelineState.SAMPLED.value, dataset_id, str(report_path.relative_to(ROOT_DIR)), utc_now(), session_id),
-            )
+            for target_session_id in selected_session_ids:
+                db.execute(
+                    "UPDATE capture_sessions SET pipeline_state = ?, last_dataset_id = ?, report_path = ?, updated_at = ? WHERE id = ?",
+                    (
+                        PipelineState.SAMPLED.value,
+                        dataset_id,
+                        str(report_path.relative_to(ROOT_DIR)),
+                        utc_now(),
+                        target_session_id,
+                    ),
+                )
             outputs = {"dataset_id": dataset_id, **result}
         elif step_name == "AUTO_ANNOTATE":
             session = control_repo.get_capture_session(session_id)
@@ -232,6 +315,7 @@ def pipeline_worker_loop(db_path: str, session_id: str, step: str, params: dict[
             dataset = db.fetch_one("SELECT * FROM datasets WHERE id = ?", (dataset_id,))
             if dataset is None:
                 raise RuntimeError("Dataset introuvable.")
+            dataset_task = str(dataset["task"] or "detection")
             model_id = str(params.get("model_id") or params.get("pseudo_label_model_id") or "")
             if not model_id:
                 model_id = str(params.get("fallback_model_id") or "demo_synth_det")
@@ -241,10 +325,22 @@ def pipeline_worker_loop(db_path: str, session_id: str, step: str, params: dict[
             if model_row_raw is None:
                 raise RuntimeError("Modèle introuvable.")
             model_row = dict(model_row_raw)
+            if (
+                dataset_task in {"detection", "segmentation", "pose"}
+                and str(model_row.get("task") or "detection") != dataset_task
+            ):
+                raise RuntimeError(
+                    "Le modèle de pseudo-annotation doit avoir la même tâche "
+                    f"que le dataset ({dataset_task})."
+                )
             if str(model_row["status"]) == "CHAMPION" and not bool(params.get("allow_champion_pseudo_labels", False)):
                 raise RuntimeError("Pseudo-annotation refusée avec le modèle CHAMPION sans autorisation explicite.")
             backend = str(model_row["backend"])
-            names = {"parcel": 0, "person": 1, "left_wrist": 2, "right_wrist": 3}
+            names = (
+                {"person": 0}
+                if dataset_task == "pose"
+                else {"parcel": 0, "person": 1}
+            )
             items = [
                 dict(row)
                 for row in db.fetch_all(
@@ -311,6 +407,7 @@ def pipeline_worker_loop(db_path: str, session_id: str, step: str, params: dict[
                 meta["pseudo_label_backend"] = backend
                 meta["annotation_task"] = annotator.task
                 meta["pseudo_label_count"] = count
+                meta["pseudo_labels"] = detections
                 meta["quality_stats"] = stats
                 meta["annotation_provenance"] = annotator.provenance(
                     session_id=str(item.get("session_id") or session_id),
@@ -333,20 +430,40 @@ def pipeline_worker_loop(db_path: str, session_id: str, step: str, params: dict[
                 )
             ]
             dataset_root = ROOT_DIR / str(dataset["root_path"])
-            tracking_rows = LocalTrackingExporter().export(
-                refreshed_items, dataset_root / "tracking_manifest.jsonl"
-            )
-            reid_rows = MultiCameraReIDExporter().export(
-                refreshed_items, dataset_root / "reid_manifest.jsonl"
-            )
+            tracking_rows = 0
+            reid_summary: dict[str, Any] = {
+                "status": "NOT_APPLICABLE",
+                "crops": 0,
+                "positive_pairs": 0,
+                "negative_pairs": 0,
+            }
+            if dataset_task == "local_tracking":
+                tracking_rows = LocalTrackingExporter().export(
+                    refreshed_items, dataset_root / "tracking_manifest.jsonl"
+                )
+            elif dataset_task == "reid_multicamera":
+                reid_summary = MultiCameraReIDExporter().export(
+                    refreshed_items,
+                    dataset_root / "reid_manifest.jsonl",
+                    crops_dir=dataset_root / "reid_crops",
+                )
+                if reid_summary["status"] != "READY":
+                    for item in refreshed_items:
+                        if item["annotation_status"] != AnnotationStatus.REJECTED.value:
+                            artifact_repo.update_dataset_item(
+                                item["id"],
+                                annotation_status=AnnotationStatus.NEEDS_REVIEW.value,
+                            )
             summary = json.loads(dataset["summary_json"] or "{}")
             summary["pseudo_label_model_id"] = model_id
             summary["pseudo_label_backend"] = backend
             summary["auto_annotate_items_updated"] = updated
             summary["auto_annotate_items_skipped"] = skipped
-            summary["annotation_task"] = annotator.task
+            summary["annotation_task"] = dataset_task
+            summary["pseudo_label_task"] = annotator.task
             summary["tracking_manifest_rows"] = tracking_rows
-            summary["reid_manifest_rows"] = reid_rows
+            summary["reid_manifest_rows"] = int(reid_summary.get("crops", 0))
+            summary["reid"] = reid_summary
             summary["model_loaded_once_per_job"] = True
             artifact_repo.upsert_dataset(
                 dataset_id=dataset_id,
@@ -364,9 +481,10 @@ def pipeline_worker_loop(db_path: str, session_id: str, step: str, params: dict[
                 "items_skipped": skipped,
                 "model_id": model_id,
                 "backend": backend,
-                "task": annotator.task,
+                "task": dataset_task,
                 "tracking_manifest_rows": tracking_rows,
-                "reid_manifest_rows": reid_rows,
+                "reid_manifest_rows": int(reid_summary.get("crops", 0)),
+                "reid_status": reid_summary.get("status"),
             }
         elif step_name == "FINALIZE_DATASET":
             session = control_repo.get_capture_session(session_id)

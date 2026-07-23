@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from visionsort.core.enums import PipelineState
 from visionsort.core.paths import ROOT_DIR
 from visionsort.database.db import VisionSortDB, utc_now
+from visionsort.datasets.pipeline import compute_dataset_fingerprint
 from visionsort.training.pipeline import create_training_job, training_worker_loop
 import visionsort.training.pipeline as training_pipeline
 
@@ -38,6 +39,10 @@ def test_training_worker_demo_updates_session_and_report(tmp_path):
             now,
             now,
         ),
+    )
+    db.execute(
+        "UPDATE datasets SET dataset_fingerprint = ? WHERE id = ?",
+        (compute_dataset_fingerprint(db, "ds-train"), "ds-train"),
     )
 
     recipe = {
@@ -117,6 +122,31 @@ def test_training_job_refuses_non_ready_dataset(tmp_path):
         raise AssertionError("Un dataset non prêt ne doit jamais être entraîné.")
 
 
+def test_unavailable_metrics_are_null_and_block_promotion():
+    benchmark = training_pipeline._benchmark_replays(object(), [])
+    assert benchmark["status"] == "UNAVAILABLE"
+    assert benchmark["fps"] is None
+    assert benchmark["count_accuracy"] is None
+    assert benchmark["merge_rate"] is None
+
+    eligible, failures = training_pipeline._promotion_eligible(
+        {
+            "precision": None,
+            "recall": 0.9,
+            "mAP50": 0.9,
+            "count_accuracy": None,
+            "merge_rate": None,
+            "fps": None,
+        },
+        criteria=training_pipeline.DEFAULT_PROMOTION_CRITERIA,
+        frozen_test=True,
+    )
+    assert eligible is False
+    assert "precision_min:UNAVAILABLE" in failures
+    assert "count_accuracy_min:UNAVAILABLE" in failures
+    assert "merge_rate_max:UNAVAILABLE" in failures
+
+
 def test_ultralytics_training_copies_real_best_pt_to_immutable_version(
     tmp_path, monkeypatch
 ):
@@ -126,6 +156,12 @@ def test_ultralytics_training_copies_real_best_pt_to_immutable_version(
     now = utc_now()
     data_yaml = tmp_path / "data.yaml"
     data_yaml.write_text("path: .\ntrain: images/train\nval: images/val\ntest: images/test\n", encoding="utf-8")
+    base_weights = tmp_path / "base.pt"
+    base_weights.write_bytes(b"base-weights")
+    db.execute(
+        "UPDATE model_registry SET weights_path = ? WHERE id = 'yolo11n_det'",
+        (str(base_weights),),
+    )
     db.execute(
         """
         INSERT INTO datasets
@@ -151,6 +187,10 @@ def test_ultralytics_training_copies_real_best_pt_to_immutable_version(
             now,
             now,
         ),
+    )
+    db.execute(
+        "UPDATE datasets SET dataset_fingerprint = ? WHERE id = ?",
+        (compute_dataset_fingerprint(db, "ds-real"), "ds-real"),
     )
     run_dir = tmp_path / "fake-run"
 

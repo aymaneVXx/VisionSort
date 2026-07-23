@@ -6,6 +6,7 @@ import queue
 import signal
 import sys
 import time
+import uuid
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -15,8 +16,15 @@ if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from visionsort.acquisition.worker import camera_worker_loop
-from visionsort.core.config import load_config
-from visionsort.core.enums import CommandStatus, CommandType, JobType, MatchResult, SourceStatus
+from visionsort.core.config import AppConfig, load_config
+from visionsort.core.enums import (
+    CommandStatus,
+    CommandType,
+    JobType,
+    MatchResult,
+    ParcelState,
+    SourceStatus,
+)
 from visionsort.core.paths import DB_PATH, ROOT_DIR, ensure_project_dirs
 from visionsort.core.types import GlobalParcel, Tracklet
 from visionsort.database.db import VisionSortDB, utc_now
@@ -24,6 +32,7 @@ from visionsort.database.repositories import (
     ArtifactRepository,
     ControlRepository,
     EventRepository,
+    HandoffHypothesisRepository,
     JobRepository,
     TrackingRepository,
 )
@@ -34,6 +43,7 @@ from visionsort.runtime.demo_assets import ensure_demo_assets
 from visionsort.runtime.pipeline_worker import pipeline_worker_loop
 from visionsort.sources.frame_sources import can_open_uri
 from visionsort.tracking.engine import GlobalParcelTracker
+from visionsort.tracking.handoffs import PendingHandoffBuffer
 from visionsort.training.pipeline import create_training_job, training_worker_loop
 
 
@@ -56,14 +66,21 @@ class GPUResourceArbiter:
 
 
 class RuntimeSupervisor:
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        db_path: str | Path | None = None,
+        config: AppConfig | None = None,
+    ):
         ensure_project_dirs()
-        self.config = load_config()
-        self.db = VisionSortDB(DB_PATH)
+        self.config = config or load_config()
+        self.db_path = Path(db_path or DB_PATH)
+        self.db = VisionSortDB(self.db_path)
         self.db.initialize()
         self.control_repo = ControlRepository(self.db)
         self.event_repo = EventRepository(self.db)
         self.tracking_repo = TrackingRepository(self.db)
+        self.hypothesis_repo = HandoffHypothesisRepository(self.db)
         self.artifact_repo = ArtifactRepository(self.db)
         self.job_repo = JobRepository(self.db)
         self.ctx = mp.get_context("spawn")
@@ -74,23 +91,46 @@ class RuntimeSupervisor:
         self.runtime_queue = self.ctx.Queue()
         self.inference_stop_event = self.ctx.Event()
         self.control_flags = self.manager.dict()
+        self.active_source_sessions: dict[str, str] = {}
+        self.latest_stream_epoch_by_source: dict[str, int] = {}
         self.camera_processes: dict[str, tuple[mp.Process, Any]] = {}
         self.training_processes: dict[str, mp.Process] = {}
         self.pipeline_processes: dict[str, mp.Process] = {}
         self.active_model_id: str | None = None
+        self._shutdown_complete = False
         self.arbiter = GPUResourceArbiter(
             allow_training_while_inference=bool(self.config.get("gpu", "allow_training_while_inference", default=False)),
             max_concurrent_live_sources=int(self.config.get("gpu", "max_concurrent_live_sources", default=3)),
         )
         topology_edges = self.config.get("tracking", "site_topology", "edges", default=[])
         self.global_tracker = GlobalParcelTracker(topology_edges=topology_edges, source_roles=self._source_roles())
+        self.pending_handoff_buffer = PendingHandoffBuffer(
+            self.db,
+            topology_edges,
+            window_seconds=float(
+                self.config.get(
+                    "tracking", "handoff_window_seconds", default=0.75
+                )
+            ),
+            max_items=int(
+                self.config.get(
+                    "tracking", "handoff_buffer_max_items", default=1000
+                )
+            ),
+            expiry_seconds=float(
+                self.config.get(
+                    "tracking", "handoff_expiry_seconds", default=30.0
+                )
+            ),
+        )
+        self._restore_global_tracker_state()
         self.inference_process = self.ctx.Process(
             target=inference_worker_loop,
             args=(
                 self.inference_request_queue,
                 self.inference_result_queue,
                 self.inference_stop_event,
-                str(DB_PATH),
+                str(self.db_path),
                 self.config.values,
             ),
             daemon=True,
@@ -99,6 +139,69 @@ class RuntimeSupervisor:
 
     def _source_roles(self) -> dict[str, str]:
         return {row["id"]: row["role"] for row in self.db.fetch_all("SELECT id, role FROM sources")}
+
+    @staticmethod
+    def _tracklet_from_row(row: dict[str, Any]) -> Tracklet:
+        summary = json.loads(row.get("summary_json") or "{}")
+        first_bbox = tuple(
+            float(value)
+            for value in summary.get("first_bbox", summary.get("avg_bbox", [0, 0, 0, 0]))
+        )
+        last_bbox = tuple(
+            float(value)
+            for value in summary.get("last_bbox", summary.get("avg_bbox", [0, 0, 0, 0]))
+        )
+        return Tracklet(
+            tracklet_id=str(row["tracklet_id"]),
+            session_id=str(row.get("session_id") or ""),
+            source_id=str(row.get("source_id") or row["camera_id"]),
+            camera_id=str(row["camera_id"]),
+            camera_role=str(row.get("camera_role") or row["camera_id"]),
+            local_track_id=int(row["local_track_id"]),
+            started_at_local=float(row.get("started_at_local") or 0.0),
+            ended_at_local=float(row.get("ended_at_local") or 0.0),
+            started_at_global=float(row["started_at_global"]),
+            ended_at_global=float(row["ended_at_global"]),
+            class_name=str(row["class_name"]),
+            first_bbox=first_bbox,
+            last_bbox=last_bbox,
+            avg_speed=float(row["avg_speed"]),
+            last_zone_id=row.get("last_zone_id"),
+            frame_count=int(row["frame_count"]),
+            observation_path=str(row["observation_path"]),
+            summary_json=summary,
+            model_id=row.get("model_id"),
+            tracker_id=row.get("tracker_id"),
+        )
+
+    def _restore_global_tracker_state(self) -> None:
+        for raw_row in self.db.fetch_all(
+            "SELECT * FROM tracklets WHERE class_name = 'parcel'"
+        ):
+            row = dict(raw_row)
+            tracklet = self._tracklet_from_row(row)
+            self.global_tracker.tracklets[tracklet.tracklet_id] = tracklet
+            if row.get("parcel_id"):
+                self.global_tracker.tracklet_to_parcel[tracklet.tracklet_id] = str(
+                    row["parcel_id"]
+                )
+        valid_states = {state.value: state for state in ParcelState}
+        for raw_row in self.db.fetch_all("SELECT * FROM global_parcels"):
+            row = dict(raw_row)
+            raw_state = str(row["state"])
+            state_value = raw_state.split(".")[-1]
+            state = valid_states.get(state_value, ParcelState.ON_CONVEYOR)
+            self.global_tracker.parcels[str(row["parcel_id"])] = GlobalParcel(
+                parcel_id=str(row["parcel_id"]),
+                state=state,
+                last_camera_id=str(row["last_camera_id"]),
+                first_seen_at=float(row["first_seen_at"]),
+                last_seen_at=float(row["last_seen_at"]),
+                current_tracklet_id=str(row["current_tracklet_id"]),
+                assigned_destination=row.get("assigned_destination"),
+                operator_id=row.get("operator_id"),
+                appearance_signature=json.loads(row.get("appearance_json") or "[]"),
+            )
 
     def bootstrap_demo_sources(self) -> None:
         if not self.config.demo_mode:
@@ -147,19 +250,37 @@ class RuntimeSupervisor:
         )
 
     def shutdown(self) -> None:
+        if self._shutdown_complete:
+            return
         for source_id in list(self.camera_processes):
             self.stop_source(source_id)
+        self.drain_runtime_messages()
+        self.flush_pending_handoffs(force=True)
         for job_id, process in list(self.training_processes.items()):
             if process.is_alive():
                 process.terminate()
                 process.join(timeout=3)
             self.job_repo.mark_job_stopped(JobType.TRAINING.value, job_id, status="STOPPED")
+            self.training_processes.pop(job_id, None)
+        for job_key, process in list(self.pipeline_processes.items()):
+            process.join(timeout=3)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=3)
+            self.job_repo.mark_job_stopped(
+                JobType.DATASET.value, job_key, status="STOPPED"
+            )
+            self.pipeline_processes.pop(job_key, None)
         self.inference_stop_event.set()
         if self.inference_process.is_alive():
-            self.inference_process.terminate()
             self.inference_process.join(timeout=3)
+            if self.inference_process.is_alive():
+                self.inference_process.terminate()
+                self.inference_process.join(timeout=3)
         self.job_repo.mark_job_stopped(JobType.GPU_INFERENCE.value, "shared", status="STOPPED")
         self.job_repo.mark_job_stopped(JobType.SUPERVISOR.value, "main", status="STOPPED")
+        self._shutdown_complete = True
+        self.manager.shutdown()
 
     def sync_inference_sources(self) -> None:
         sources = {row["id"]: dict(row) for row in self.db.fetch_all("SELECT * FROM sources")}
@@ -168,18 +289,56 @@ class RuntimeSupervisor:
     def ensure_model_loaded(self, model_id: str) -> None:
         if model_id == self.active_model_id:
             return
-        self.sync_inference_sources()
-        self.inference_request_queue.put({"kind": "LOAD_MODEL", "model_id": model_id})
-        timeout = time.time() + 15
-        while time.time() < timeout:
-            self.drain_inference_results()
-            ready = self.inference_result_store.pop("__model_ready__", None)
-            if ready and ready.get("model_id") == model_id:
-                self.active_model_id = model_id
-                self.job_repo.upsert_job_run(JobType.GPU_INFERENCE.value, "shared", self.inference_process.pid or 0, "RUNNING", ready)
-                return
-            time.sleep(0.1)
-        raise RuntimeError(f"Chargement du modèle expiré: {model_id}")
+        flags = getattr(self, "control_flags", None)
+        if flags is not None:
+            flags["__inference_paused__"] = True
+        try:
+            drain_deadline = time.time() + float(
+                self.config.get(
+                    "runtime", "inference_result_ttl_seconds", default=5.0
+                )
+            )
+            while flags is not None and any(
+                str(key).startswith("__inflight__:") for key in list(flags.keys())
+            ):
+                self.drain_inference_results()
+                if time.time() >= drain_deadline:
+                    raise RuntimeError(
+                        "Rechargement annulé: requêtes d'inférence en vol non terminées."
+                    )
+                time.sleep(0.02)
+            self.sync_inference_sources()
+            self.inference_result_store.pop("__model_ready__", None)
+            self.inference_result_store.pop("__model_load_failed__", None)
+            self.inference_request_queue.put(
+                {"kind": "LOAD_MODEL", "model_id": model_id}
+            )
+            timeout = time.time() + 15
+            while time.time() < timeout:
+                self.drain_inference_results()
+                failed = self.inference_result_store.pop(
+                    "__model_load_failed__", None
+                )
+                if failed and failed.get("model_id") == model_id:
+                    self.active_model_id = failed.get("active_model_id")
+                    raise RuntimeError(str(failed.get("error")))
+                ready = self.inference_result_store.pop("__model_ready__", None)
+                if ready and ready.get("model_id") == model_id:
+                    self.active_model_id = model_id
+                    if hasattr(self, "job_repo"):
+                        self.job_repo.upsert_job_run(
+                            JobType.GPU_INFERENCE.value,
+                            "shared",
+                            self.inference_process.pid or 0,
+                            "RUNNING",
+                            ready,
+                        )
+                    return
+                time.sleep(0.1)
+            raise RuntimeError(f"Chargement du modèle expiré: {model_id}")
+        finally:
+            if flags is not None:
+                flags["__inference_paused__"] = False
 
     def runtime_model_id(self, configured_model_id: str) -> str:
         if (
@@ -197,13 +356,20 @@ class RuntimeSupervisor:
     def reload_runtime_model(self, model_id: str) -> bool:
         inference_process = getattr(self, "inference_process", None)
         if inference_process is not None and inference_process.is_alive():
-            self.active_model_id = None
             self.ensure_model_loaded(model_id)
             return True
-        self.active_model_id = None
         return False
 
-    def start_source(self, source_id: str, *, session_id: str, session_start_global: float, replay_offset_ms: float = 0.0) -> None:
+    def start_source(
+        self,
+        source_id: str,
+        *,
+        session_id: str,
+        session_start_global: float,
+        replay_offset_ms: float = 0.0,
+        replay_fps: float = 8.0,
+        replay_loop: bool = False,
+    ) -> None:
         row = self.db.fetch_one("SELECT * FROM sources WHERE id = ?", (source_id,))
         if row is None:
             raise RuntimeError("Source introuvable.")
@@ -223,16 +389,19 @@ class RuntimeSupervisor:
         stop_event = self.ctx.Event()
         cfg = dict(row)
         cfg["model_id"] = runtime_model_id
-        cfg["replay_fps"] = 8.0
+        cfg["replay_fps"] = float(replay_fps)
         cfg["session_id"] = session_id
         cfg["session_start_global"] = float(session_start_global)
         cfg["replay_offset_ms"] = float(replay_offset_ms)
+        cfg["replay_loop"] = bool(replay_loop)
+        self.active_source_sessions[source_id] = session_id
+        self.latest_stream_epoch_by_source[source_id] = -1
         self.control_flags[source_id] = {"recording": False}
         process = self.ctx.Process(
             target=camera_worker_loop,
             args=(
                 cfg,
-                str(DB_PATH),
+                str(self.db_path),
                 self.config.values,
                 self.inference_request_queue,
                 self.inference_result_store,
@@ -267,21 +436,31 @@ class RuntimeSupervisor:
         sources = self.control_repo.list_capture_session_sources(session_id)
         if not sources:
             raise RuntimeError("Session sans caméras assignées.")
+        session_config = json.loads(session.get("config_json") or "{}")
+        replay_loop = bool(session_config.get("replay_loop", False))
         for sess_src in sources:
             self.start_source(
                 sess_src["source_id"],
                 session_id=session_id,
                 session_start_global=start_global,
                 replay_offset_ms=float(sess_src.get("time_offset_ms") or 0.0),
+                replay_fps=float(sess_src.get("replay_fps") or 8.0),
+                replay_loop=replay_loop,
             )
 
     def stop_session(self, session_id: str) -> None:
         sources = self.control_repo.list_capture_session_sources(session_id)
         for sess_src in sources:
             self.stop_source(sess_src["source_id"])
+        self.drain_runtime_messages()
+        self.flush_pending_handoffs(force=True, session_id=session_id)
         self.control_repo.update_capture_session(session_id, ended_at=float(time.time()))
 
     def stop_source(self, source_id: str) -> None:
+        if hasattr(self, "active_source_sessions"):
+            self.active_source_sessions.pop(source_id, None)
+        if hasattr(self, "latest_stream_epoch_by_source"):
+            self.latest_stream_epoch_by_source.pop(source_id, None)
         data = self.camera_processes.pop(source_id, None)
         if data is None:
             self.control_repo.update_source_state(source_id, status=SourceStatus.OFFLINE.value, fps=0.0)
@@ -349,7 +528,7 @@ class RuntimeSupervisor:
                 )
         process = self.ctx.Process(
             target=training_worker_loop,
-            args=(str(DB_PATH), job_id, payload, self.config.demo_mode),
+            args=(str(self.db_path), job_id, payload, self.config.demo_mode),
             daemon=True,
             name=f"visionsort-training-{job_id}",
         )
@@ -367,7 +546,7 @@ class RuntimeSupervisor:
         job_key = f"{session_id}:{step_name}:{int(time.time() * 1000)}"
         process = self.ctx.Process(
             target=pipeline_worker_loop,
-            args=(str(DB_PATH), session_id, step_name, params),
+            args=(str(self.db_path), session_id, step_name, params),
             daemon=True,
             name=f"visionsort-pipeline-{job_key}",
         )
@@ -407,19 +586,61 @@ class RuntimeSupervisor:
     def handle_tracklet(self, payload: dict[str, Any]) -> None:
         self.handle_tracklets([payload])
 
+    def _topology_rank(self, role: str) -> int:
+        edges = self.config.get(
+            "tracking", "site_topology", "edges", default=[]
+        )
+        ranks: dict[str, int] = {}
+        for _ in range(len(edges) + 1):
+            changed = False
+            for edge in edges:
+                left = str(edge["from_role"])
+                right = str(edge["to_role"])
+                proposed = ranks.get(left, 0) + 1
+                if proposed > ranks.get(right, 0):
+                    ranks[right] = proposed
+                    changed = True
+            if not changed:
+                break
+        return ranks.get(role, 0)
+
     def handle_tracklets(self, payloads: list[dict[str, Any]]) -> None:
         tracklets = [Tracklet(**payload) for payload in payloads]
         self.global_tracker.source_roles = self._source_roles()
-        parcel_tracklets = [
-            tracklet for tracklet in tracklets if tracklet.class_name == "parcel"
-        ]
-        parcel_outcomes = self.global_tracker.process_tracklets(parcel_tracklets)
-        outcomes_by_id = {
-            tracklet.tracklet_id: outcome
-            for tracklet, outcome in zip(
-                parcel_tracklets, parcel_outcomes, strict=True
+        outcomes_by_id: dict[
+            str,
+            tuple[str, MatchResult, list[str], Any],
+        ] = {}
+        parcel_tracklets = sorted(
+            (
+                tracklet
+                for tracklet in tracklets
+                if tracklet.class_name == "parcel"
+            ),
+            key=lambda tracklet: (
+                self._topology_rank(tracklet.camera_role),
+                tracklet.ended_at_global,
+                tracklet.tracklet_id,
+            ),
+        )
+        by_rank: dict[int, list[Tracklet]] = {}
+        for tracklet in parcel_tracklets:
+            by_rank.setdefault(
+                self._topology_rank(tracklet.camera_role), []
+            ).append(tracklet)
+        for rank in sorted(by_rank):
+            wave = by_rank[rank]
+            for tracklet in wave:
+                self._try_resolve_hypotheses_with_later_evidence(tracklet)
+            wave_outcomes = self.global_tracker.process_tracklets(wave)
+            outcomes_by_id.update(
+                {
+                    tracklet.tracklet_id: outcome
+                    for tracklet, outcome in zip(
+                        wave, wave_outcomes, strict=True
+                    )
+                }
             )
-        }
         for tracklet in tracklets:
             if tracklet.class_name != "parcel":
                 self.tracking_repo.upsert_tracklet(
@@ -431,6 +652,23 @@ class RuntimeSupervisor:
             parcel_id, result, reasons, candidate = outcomes_by_id[
                 tracklet.tracklet_id
             ]
+            hypothesis_id = None
+            candidate_set = self.global_tracker.last_candidate_sets.get(
+                tracklet.tracklet_id, []
+            )
+            if result == MatchResult.AMBIGUOUS:
+                hypothesis_id = self.hypothesis_repo.create(
+                    session_id=tracklet.session_id,
+                    incoming_tracklet_id=tracklet.tracklet_id,
+                    candidates=[asdict(item) for item in candidate_set],
+                    expiry_seconds=float(
+                        self.config.get(
+                            "tracking",
+                            "hypothesis_expiry_seconds",
+                            default=120.0,
+                        )
+                    ),
+                )
             self.tracking_repo.upsert_tracklet(
                 tracklet,
                 parcel_id=parcel_id or None,
@@ -452,6 +690,8 @@ class RuntimeSupervisor:
                     "tracklet_id": tracklet.tracklet_id,
                     "reasons": reasons,
                     "candidate": asdict(candidate) if candidate else None,
+                    "candidates": [asdict(item) for item in candidate_set],
+                    "hypothesis_id": hypothesis_id,
                     "validated_on_site": False,
                 },
                 parcel_id=parcel_id or None,
@@ -463,6 +703,173 @@ class RuntimeSupervisor:
                 model_id=tracklet.model_id,
                 tracker_id=tracklet.tracker_id,
             )
+
+    def _try_resolve_hypotheses_with_later_evidence(
+        self, later: Tracklet
+    ) -> None:
+        proposals: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
+        edges = self.config.get(
+            "tracking", "site_topology", "edges", default=[]
+        )
+        for hypothesis in self.hypothesis_repo.pending(later.session_id):
+            ambiguous = self.global_tracker.tracklets.get(
+                str(hypothesis["incoming_tracklet_id"])
+            )
+            if ambiguous is None:
+                continue
+            edge = next(
+                (
+                    item
+                    for item in edges
+                    if str(item["from_role"]) == ambiguous.camera_role
+                    and str(item["to_role"]) == later.camera_role
+                ),
+                None,
+            )
+            if edge is None:
+                continue
+            transit = later.started_at_global - ambiguous.ended_at_global
+            if not (
+                float(edge["min_transit_s"])
+                <= transit
+                <= float(edge["max_transit_s"])
+            ):
+                continue
+            for candidate in json.loads(
+                hypothesis.get("candidates_json") or "[]"
+            ):
+                evidence = self.global_tracker.continuation_evidence(
+                    str(candidate["from_tracklet_id"]), later
+                )
+                if evidence is None:
+                    continue
+                combined = 0.6 * float(candidate["score"]) + 0.4 * evidence
+                proposals.append((combined, hypothesis, candidate))
+        proposals.sort(key=lambda item: item[0], reverse=True)
+        if not proposals:
+            return
+        best_score, hypothesis, candidate = proposals[0]
+        second_score = proposals[1][0] if len(proposals) > 1 else 0.0
+        if (
+            best_score < self.global_tracker.minimum_score
+            or best_score - second_score < self.global_tracker.ambiguity_margin
+        ):
+            return
+        outgoing_tracklet_id = str(candidate["from_tracklet_id"])
+        incoming_tracklet_id = str(hypothesis["incoming_tracklet_id"])
+        parcel_id = self.global_tracker.resolve_ambiguous(
+            incoming_tracklet_id, outgoing_tracklet_id
+        )
+        self.hypothesis_repo.resolve(
+            str(hypothesis["id"]),
+            outgoing_tracklet_id=outgoing_tracklet_id,
+            resolution={
+                "mode": "automatic_later_evidence",
+                "later_tracklet_id": later.tracklet_id,
+                "combined_score": best_score,
+            },
+        )
+        incoming = self.global_tracker.tracklets[incoming_tracklet_id]
+        self.tracking_repo.upsert_tracklet(
+            incoming,
+            parcel_id=parcel_id,
+            match_result=MatchResult.MATCHED.value,
+        )
+        self.tracking_repo.upsert_global_parcel(
+            self.global_tracker.parcels[parcel_id]
+        )
+        self.event_repo.add_event(
+            "handoff_ambiguity_resolved",
+            {
+                "hypothesis_id": hypothesis["id"],
+                "incoming_tracklet_id": incoming_tracklet_id,
+                "outgoing_tracklet_id": outgoing_tracklet_id,
+                "later_tracklet_id": later.tracklet_id,
+                "combined_score": best_score,
+                "mode": "automatic_later_evidence",
+            },
+            parcel_id=parcel_id,
+            session_id=later.session_id,
+            timestamp_global=later.started_at_global,
+        )
+
+    def resolve_handoff_hypothesis(
+        self,
+        hypothesis_id: str,
+        outgoing_tracklet_id: str,
+        *,
+        actor: str = "human",
+    ) -> str:
+        hypothesis = self.hypothesis_repo.get(hypothesis_id)
+        if hypothesis is None:
+            raise RuntimeError("Hypothèse introuvable.")
+        incoming_tracklet_id = str(hypothesis["incoming_tracklet_id"])
+        try:
+            parcel_id = self.global_tracker.resolve_ambiguous(
+                incoming_tracklet_id, outgoing_tracklet_id
+            )
+            incoming = self.global_tracker.tracklets[incoming_tracklet_id]
+            self.tracking_repo.upsert_tracklet(
+                incoming,
+                parcel_id=parcel_id,
+                match_result=MatchResult.MATCHED.value,
+            )
+            self.tracking_repo.upsert_global_parcel(
+                self.global_tracker.parcels[parcel_id]
+            )
+        except RuntimeError:
+            outgoing = self.db.fetch_one(
+                "SELECT parcel_id FROM tracklets WHERE tracklet_id = ?",
+                (outgoing_tracklet_id,),
+            )
+            if outgoing is None or not outgoing["parcel_id"]:
+                raise
+            parcel_id = str(outgoing["parcel_id"])
+            incoming_row = self.db.fetch_one(
+                """
+                SELECT camera_id, ended_at_global FROM tracklets
+                WHERE tracklet_id = ?
+                """,
+                (incoming_tracklet_id,),
+            )
+            self.db.execute(
+                """
+                UPDATE tracklets SET parcel_id = ?, match_result = 'MATCHED'
+                WHERE tracklet_id = ?
+                """,
+                (parcel_id, incoming_tracklet_id),
+            )
+            if incoming_row is not None:
+                self.db.execute(
+                    """
+                    UPDATE global_parcels
+                    SET current_tracklet_id = ?, last_camera_id = ?,
+                        last_seen_at = ?
+                    WHERE parcel_id = ?
+                    """,
+                    (
+                        incoming_tracklet_id,
+                        incoming_row["camera_id"],
+                        incoming_row["ended_at_global"],
+                        parcel_id,
+                    ),
+                )
+        self.hypothesis_repo.resolve(
+            hypothesis_id,
+            outgoing_tracklet_id=outgoing_tracklet_id,
+            resolution={"mode": "human", "actor": actor},
+        )
+        return parcel_id
+
+    def flush_pending_handoffs(
+        self, *, force: bool = False, session_id: str | None = None
+    ) -> None:
+        if not hasattr(self, "pending_handoff_buffer"):
+            return
+        for _, payloads in self.pending_handoff_buffer.pop_ready_batches(
+            force=force, session_id=session_id
+        ):
+            self.handle_tracklets(payloads)
 
     def handle_command(self, command: dict[str, Any]) -> None:
         payload = json.loads(command["payload_json"])
@@ -534,9 +941,37 @@ class RuntimeSupervisor:
                         params={"dataset_id": item["dataset_id"]},
                     )
                     result_payload["job_key"] = job_key
+            elif command_type == CommandType.RESOLVE_HANDOFF.value:
+                parcel_id = self.resolve_handoff_hypothesis(
+                    str(payload["hypothesis_id"]),
+                    str(payload["outgoing_tracklet_id"]),
+                    actor=str(payload.get("actor") or command.get("owner") or "human"),
+                )
+                result_payload = {
+                    "hypothesis_id": payload["hypothesis_id"],
+                    "parcel_id": parcel_id,
+                    "status": "RESOLVED",
+                }
+            elif command_type == CommandType.REJECT_HANDOFF.value:
+                self.hypothesis_repo.reject(
+                    str(payload["hypothesis_id"]),
+                    reason=str(payload.get("reason") or "rejet humain"),
+                )
+                result_payload = {
+                    "hypothesis_id": payload["hypothesis_id"],
+                    "status": "REJECTED",
+                }
             elif command_type == CommandType.PROMOTE_MODEL.value:
-                promote_model(self.db, payload["model_id"])
-                reloaded = self.reload_runtime_model(payload["model_id"])
+                previous_active = self.db.fetch_one(
+                    "SELECT id FROM model_registry WHERE is_active = 1 LIMIT 1"
+                )
+                try:
+                    reloaded = self.reload_runtime_model(payload["model_id"])
+                    promote_model(self.db, payload["model_id"])
+                except Exception:
+                    if previous_active is not None:
+                        self.reload_runtime_model(str(previous_active["id"]))
+                    raise
                 result_payload = {
                     "model_id": payload["model_id"],
                     "status": "CHAMPION",
@@ -549,19 +984,39 @@ class RuntimeSupervisor:
                 set_model_status(self.db, payload["model_id"], "ARCHIVED")
                 result_payload = {"model_id": payload["model_id"], "status": "ARCHIVED"}
             elif command_type == CommandType.ACTIVATE_MODEL.value:
-                activate_model(self.db, payload["model_id"])
-                reloaded = self.reload_runtime_model(payload["model_id"])
+                previous_active = self.db.fetch_one(
+                    "SELECT id FROM model_registry WHERE is_active = 1 LIMIT 1"
+                )
+                try:
+                    reloaded = self.reload_runtime_model(payload["model_id"])
+                    activate_model(self.db, payload["model_id"])
+                except Exception:
+                    if previous_active is not None:
+                        self.reload_runtime_model(str(previous_active["id"]))
+                    raise
                 result_payload = {
                     "model_id": payload["model_id"],
                     "runtime_reloaded": reloaded,
                 }
             elif command_type == CommandType.ROLLBACK_MODEL.value:
-                rollback_model_id = rollback_to_previous_active(self.db)
-                reloaded = (
-                    self.reload_runtime_model(rollback_model_id)
-                    if rollback_model_id
-                    else False
+                previous_active = self.db.fetch_one(
+                    "SELECT id FROM model_registry WHERE is_active = 1 LIMIT 1"
                 )
+                rollback_model_id = rollback_to_previous_active(self.db)
+                try:
+                    reloaded = (
+                        self.reload_runtime_model(rollback_model_id)
+                        if rollback_model_id
+                        else False
+                    )
+                except Exception:
+                    if previous_active is not None:
+                        self.db.execute(
+                            "UPDATE model_registry SET is_active = CASE WHEN id = ? THEN 1 ELSE 0 END, updated_at = ?",
+                            (str(previous_active["id"]), utc_now()),
+                        )
+                        self.reload_runtime_model(str(previous_active["id"]))
+                    raise
                 result_payload = {
                     "model_id": rollback_model_id,
                     "runtime_reloaded": reloaded,
@@ -581,13 +1036,15 @@ class RuntimeSupervisor:
             self.event_repo.add_event("command_failed", {"command_type": command_type, "error": str(exc)}, severity="error")
 
     def drain_runtime_messages(self) -> None:
-        tracklet_payloads: list[dict[str, Any]] = []
+        immediate_tracklet_payloads: list[dict[str, Any]] = []
         while True:
             try:
                 message = self.runtime_queue.get_nowait()
             except queue.Empty:
-                if tracklet_payloads:
-                    self.handle_tracklets(tracklet_payloads)
+                if immediate_tracklet_payloads:
+                    self.handle_tracklets(immediate_tracklet_payloads)
+                self.flush_pending_handoffs()
+                self.hypothesis_repo.expire()
                 return
             if message["kind"] == "EVENT":
                 self.event_repo.add_event(
@@ -604,7 +1061,13 @@ class RuntimeSupervisor:
                     tracker_id=message.get("tracker_id"),
                 )
             elif message["kind"] == "TRACKLET":
-                tracklet_payloads.append(message["tracklet"])
+                payload = message["tracklet"]
+                if payload.get("class_name") == "parcel":
+                    immediate_tracklet_payloads.extend(
+                        self.pending_handoff_buffer.add(payload)
+                    )
+                else:
+                    immediate_tracklet_payloads.append(payload)
             elif message["kind"] == "RECORDING":
                 self.artifact_repo.add_recording(
                     source_id=message["source_id"],
@@ -617,6 +1080,7 @@ class RuntimeSupervisor:
                 )
 
     def drain_inference_results(self) -> None:
+        self._cleanup_expired_inference_results()
         while True:
             try:
                 message = self.inference_result_queue.get_nowait()
@@ -624,10 +1088,65 @@ class RuntimeSupervisor:
                 return
             if message["kind"] == "MODEL_READY":
                 self.inference_result_store["__model_ready__"] = message
-            elif message["kind"] == "INFER_RESULT":
-                self.inference_result_store[f"{message['camera_id']}:{message['frame_index']}"] = message
-            elif message["kind"] == "INFER_ERROR":
-                self.inference_result_store[f"{message['camera_id']}:{message['frame_index']}"] = {"error": message["error"]}
+                continue
+            if message["kind"] == "MODEL_LOAD_FAILED":
+                self.inference_result_store["__model_load_failed__"] = message
+                continue
+            if message["kind"] not in {"INFER_RESULT", "INFER_ERROR"}:
+                continue
+            source_id = str(message.get("source_id") or "")
+            request_id = str(message.get("request_id") or "")
+            try:
+                uuid.UUID(request_id)
+            except (ValueError, TypeError):
+                self._increment_inference_result_metric(source_id, "ignored")
+                continue
+            active_sessions = getattr(self, "active_source_sessions", None)
+            if active_sessions is not None and active_sessions.get(source_id) != str(
+                message.get("session_id")
+            ):
+                self._increment_inference_result_metric(source_id, "ignored")
+                continue
+            epoch = int(message.get("stream_epoch") or 0)
+            epochs = getattr(self, "latest_stream_epoch_by_source", None)
+            if epochs is not None:
+                latest_epoch = int(epochs.get(source_id, -1))
+                if epoch < latest_epoch:
+                    self._increment_inference_result_metric(source_id, "ignored")
+                    continue
+                epochs[source_id] = max(latest_epoch, epoch)
+            if time.time() > float(message.get("expires_at") or 0.0):
+                self._increment_inference_result_metric(source_id, "late")
+                continue
+            stored = dict(message)
+            stored["stored_at"] = time.time()
+            if message["kind"] == "INFER_ERROR":
+                stored["error"] = message["error"]
+            self.inference_result_store[request_id] = stored
+
+    def _increment_inference_result_metric(
+        self, source_id: str, metric: str
+    ) -> None:
+        key = f"__inference_metrics__:{source_id}"
+        current = dict(self.inference_result_store.get(key, {}))
+        current[metric] = int(current.get(metric, 0)) + 1
+        self.inference_result_store[key] = current
+
+    def _cleanup_expired_inference_results(
+        self, *, now: float | None = None
+    ) -> None:
+        current_time = float(now if now is not None else time.time())
+        for request_id, result in list(self.inference_result_store.items()):
+            if str(request_id).startswith("__"):
+                continue
+            if not isinstance(result, dict):
+                continue
+            expires_at = float(result.get("expires_at") or 0.0)
+            if expires_at and expires_at <= current_time:
+                self.inference_result_store.pop(request_id, None)
+                self._increment_inference_result_metric(
+                    str(result.get("source_id") or ""), "expired"
+                )
 
     def refresh_jobs(self) -> None:
         for source_id, (process, _) in list(self.camera_processes.items()):

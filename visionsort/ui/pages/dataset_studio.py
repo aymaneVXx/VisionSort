@@ -6,8 +6,14 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+from visionsort.annotations import (
+    export_review_cases,
+    import_review_annotations,
+    render_review_overlay,
+)
 from visionsort.core.enums import AnnotationStatus, CommandType
 from visionsort.core.paths import ROOT_DIR
+from visionsort.database.repositories import ArtifactRepository
 from visionsort.ui.components.common import demo_warning, page_header
 from visionsort.ui.state import UIContext
 
@@ -17,24 +23,103 @@ def render(context: UIContext) -> None:
     demo_warning(context)
 
     sessions = context.repo.list_capture_sessions()
-    session_options = {f"{s['name']} ({s['id']})": s for s in sessions}
-    selected = st.selectbox("CaptureSession", list(session_options) if session_options else [], index=0 if session_options else None)
-    session = session_options[selected] if selected else None
+    completed_sessions = [
+        session for session in sessions if session.get("ended_at") is not None
+    ]
+    session_options = {
+        f"{session['name']} ({session['id']})": session
+        for session in completed_sessions
+    }
+    selected_labels = st.multiselect(
+        "CaptureSessions terminées",
+        list(session_options),
+        help="Une session complète reste dans un seul split.",
+    )
+    selected_sessions = [session_options[label] for label in selected_labels]
+    session = selected_sessions[0] if selected_sessions else None
 
-    if session:
-        st.write(f"État pipeline: `{session.get('pipeline_state')}` | demo={bool(session.get('demo_mode'))} | validé site={bool(session.get('site_validated'))}")
+    if selected_sessions:
+        details: list[dict[str, object]] = []
+        for selected_session in selected_sessions:
+            sources = context.repo.list_capture_session_sources(
+                selected_session["id"]
+            )
+            started_at = selected_session.get("started_at")
+            ended_at = selected_session.get("ended_at")
+            details.append(
+                {
+                    "session_id": selected_session["id"],
+                    "name": selected_session["name"],
+                    "status": selected_session.get("pipeline_state"),
+                    "cameras": ", ".join(
+                        str(source.get("camera_role")) for source in sources
+                    ),
+                    "duration_s": (
+                        round(float(ended_at) - float(started_at), 2)
+                        if started_at is not None and ended_at is not None
+                        else None
+                    ),
+                }
+            )
+        st.dataframe(pd.DataFrame(details), use_container_width=True)
         steps = context.repo.list_pipeline_steps(session["id"])
         if steps:
             st.dataframe(pd.DataFrame(steps), use_container_width=True)
-        model_ids = [row["id"] for row in context.repo.list_models()]
+        models = context.repo.list_models()
 
         col1, col2, col3, col4 = st.columns(4)
-        dataset_name = col1.text_input("Nom dataset", value="dataset_session")
+        dataset_name = col1.text_input("Nom dataset", value="dataset_project")
+        dataset_task = st.selectbox(
+            "Tâche immuable du dataset",
+            [
+                "detection",
+                "segmentation",
+                "pose",
+                "local_tracking",
+                "reid_multicamera",
+            ],
+        )
+        pseudo_label_task = (
+            dataset_task
+            if dataset_task in {"detection", "segmentation", "pose"}
+            else "detection"
+        )
+        model_ids = [
+            row["id"] for row in models if row.get("task") == pseudo_label_task
+        ]
         pseudo_label_model_id = col4.selectbox("Modèle pseudo-label", model_ids, index=0 if model_ids else None)
+        automatic_splits = st.checkbox(
+            "Affectation automatique des splits",
+            value=True,
+            help="Avec au moins trois sessions, train, val et test sont tous attribués.",
+        )
+        split_assignments: dict[str, str] = {}
+        if not automatic_splits:
+            split_columns = st.columns(3)
+            for index, selected_session in enumerate(selected_sessions):
+                split_assignments[selected_session["id"]] = split_columns[
+                    index % 3
+                ].selectbox(
+                    f"Split — {selected_session['name']}",
+                    ["train", "val", "test"],
+                    key=f"split-{selected_session['id']}",
+                )
         if col2.button("1) Sample"):
             context.repo.enqueue_command(
                 CommandType.RUN_PIPELINE_STEP,
-                {"session_id": session["id"], "step": "SAMPLE", "params": {"name": dataset_name}},
+                {
+                    "session_id": session["id"],
+                    "step": "SAMPLE",
+                    "params": {
+                        "name": dataset_name,
+                        "session_ids": [
+                            selected_session["id"]
+                            for selected_session in selected_sessions
+                        ],
+                        "split_assignments": split_assignments,
+                        "task": dataset_task,
+                    },
+                },
             )
             st.success("Step SAMPLE en file.")
         if col3.button("2) Auto-annotate"):
@@ -96,20 +181,151 @@ def render(context: UIContext) -> None:
     st.subheader(f"Review ({len(needs_review)} NEEDS_REVIEW)")
     if needs_review:
         st.caption("Chaque action de review relance un recalcul de FINALIZE_DATASET pour mettre à jour automatiquement l'état REVIEW_PENDING/DATASET_READY.")
-    for it in needs_review[:30]:
-        with st.container(border=True):
-            meta = json.loads(it.get("metadata_json") or "{}")
-            st.write(f"Item `{it['id']}` | split={it.get('split')} | reason={it.get('reason')} | score={it.get('score')}")
-            img_path = ROOT_DIR / it["image_path"]
-            if img_path.exists():
-                st.image(str(img_path), caption=str(Path(it["image_path"])))
-            cols = st.columns(3)
-            if cols[0].button("Accepter", key=f"accept-{it['id']}"):
-                context.repo.enqueue_command(CommandType.UPDATE_DATASET_ITEM, {"item_id": it["id"], "annotation_status": AnnotationStatus.HUMAN_VALIDATED.value})
-                st.info("Commande envoyée.")
-            if cols[1].button("Rejeter", key=f"reject-{it['id']}"):
-                context.repo.enqueue_command(CommandType.UPDATE_DATASET_ITEM, {"item_id": it["id"], "annotation_status": AnnotationStatus.REJECTED.value})
-                st.info("Commande envoyée.")
-            if cols[2].button("Auto-accept", key=f"autoaccept-{it['id']}"):
-                context.repo.enqueue_command(CommandType.UPDATE_DATASET_ITEM, {"item_id": it["id"], "annotation_status": AnnotationStatus.AUTO_ACCEPTED.value})
-                st.info("Commande envoyée.")
+    if not needs_review:
+        return
+
+    filter_columns = st.columns(4)
+    session_filter = filter_columns[0].selectbox(
+        "Session",
+        ["Toutes"]
+        + sorted(
+            {
+                str(item.get("session_id"))
+                for item in needs_review
+                if item.get("session_id")
+            }
+        ),
+    )
+    camera_filter = filter_columns[1].selectbox(
+        "Caméra",
+        ["Toutes"]
+        + sorted(
+            {
+                str(item.get("source_id"))
+                for item in needs_review
+                if item.get("source_id")
+            }
+        ),
+    )
+    task_filter = filter_columns[2].selectbox(
+        "Tâche", ["Toutes", str(ds.get("task") or "detection")]
+    )
+    reason_filter = filter_columns[3].selectbox(
+        "Raison",
+        ["Toutes"]
+        + sorted(
+            {
+                str(item.get("reason"))
+                for item in needs_review
+                if item.get("reason")
+            }
+        ),
+    )
+    filtered = [
+        item
+        for item in needs_review
+        if (session_filter == "Toutes" or item.get("session_id") == session_filter)
+        and (camera_filter == "Toutes" or item.get("source_id") == camera_filter)
+        and (task_filter == "Toutes" or str(ds.get("task")) == task_filter)
+        and (reason_filter == "Toutes" or item.get("reason") == reason_filter)
+    ]
+    if not filtered:
+        st.info("Aucun cas ne correspond aux filtres.")
+        return
+
+    export_columns = st.columns(2)
+    export_columns[0].download_button(
+        "Exporter vers Label Studio",
+        data=export_review_cases(filtered, export_format="label_studio"),
+        file_name=f"{ds['id']}_needs_review_label_studio.json",
+        mime="application/json",
+    )
+    export_columns[1].download_button(
+        "Exporter vers CVAT",
+        data=export_review_cases(filtered, export_format="cvat"),
+        file_name=f"{ds['id']}_needs_review_cvat.xml",
+        mime="application/xml",
+    )
+    uploaded = st.file_uploader(
+        "Réimporter des annotations corrigées",
+        type=["json", "xml"],
+        key=f"review-import-{ds['id']}",
+    )
+    if uploaded is not None and st.button(
+        "Importer et valider humainement", key=f"import-{ds['id']}"
+    ):
+        result = import_review_annotations(
+            context.db,
+            ArtifactRepository(context.db),
+            dataset_id=ds["id"],
+            content=uploaded.getvalue(),
+            filename=uploaded.name,
+        )
+        st.success(f"{result['updated_items']} item(s) réimporté(s).")
+
+    position = int(
+        st.number_input(
+            "Cas affiché",
+            min_value=1,
+            max_value=len(filtered),
+            value=1,
+            step=1,
+        )
+    )
+    item = filtered[position - 1]
+    with st.container(border=True):
+        overlay, details = render_review_overlay(item)
+        st.write(
+            f"Item `{item['id']}` — {position}/{len(filtered)} | "
+            f"split={item.get('split')} | raison={item.get('reason')}"
+        )
+        st.image(
+            overlay,
+            caption=str(Path(item["image_path"])),
+            use_container_width=True,
+        )
+        st.write(
+            f"Attendu: **{details['expected_count']}** | "
+            f"annoté: **{details['annotated_count']}** | "
+            f"tâche: `{details['task'] or ds.get('task')}`"
+        )
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "classe": detection.get("class_name"),
+                        "confiance": detection.get("confidence"),
+                        "bbox": detection.get("bbox"),
+                        "masque": bool(detection.get("mask")),
+                        "keypoints": len(detection.get("keypoints") or []),
+                    }
+                    for detection in details["detections"]
+                ]
+            ),
+            use_container_width=True,
+        )
+        st.json(
+            {
+                "quality_gate": details["quality_stats"],
+                "provenance": details["provenance"],
+            }
+        )
+        actions = st.columns(2)
+        if actions[0].button("Valider humainement", key=f"accept-{item['id']}"):
+            context.repo.enqueue_command(
+                CommandType.UPDATE_DATASET_ITEM,
+                {
+                    "item_id": item["id"],
+                    "annotation_status": AnnotationStatus.HUMAN_VALIDATED.value,
+                },
+            )
+            st.info("Commande envoyée.")
+        if actions[1].button("Rejeter", key=f"reject-{item['id']}"):
+            context.repo.enqueue_command(
+                CommandType.UPDATE_DATASET_ITEM,
+                {
+                    "item_id": item["id"],
+                    "annotation_status": AnnotationStatus.REJECTED.value,
+                },
+            )
+            st.info("Commande envoyée.")

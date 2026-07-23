@@ -22,6 +22,10 @@ def _load_json(text: str | None) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def _metric_text(value, digits: int = 3) -> str:
+    return "UNAVAILABLE" if value is None else f"{float(value):.{digits}f}"
+
+
 def render(context: UIContext) -> None:
     page_header("Models", "Registre local, comparaison, promotion et rollback")
     demo_warning(context)
@@ -48,10 +52,10 @@ def render(context: UIContext) -> None:
                 f"statut `{row['status']}` - actif `{is_active}`"
             )
             info_cols = st.columns(4)
-            info_cols[0].metric("Precision", f"{float(metrics.get('precision', 0.0)):.3f}")
-            info_cols[1].metric("Recall", f"{float(metrics.get('recall', 0.0)):.3f}")
-            info_cols[2].metric("mAP50", f"{float(metrics.get('mAP50', 0.0)):.3f}")
-            info_cols[3].metric("FPS", f"{float(metrics.get('fps', 0.0)):.2f}")
+            info_cols[0].metric("Precision", _metric_text(metrics.get("precision")))
+            info_cols[1].metric("Recall", _metric_text(metrics.get("recall")))
+            info_cols[2].metric("mAP50", _metric_text(metrics.get("mAP50")))
+            info_cols[3].metric("FPS", _metric_text(metrics.get("fps"), 2))
             if notes:
                 st.caption(
                     f"demo_only={bool(notes.get('demo_only'))} | "
@@ -63,8 +67,10 @@ def render(context: UIContext) -> None:
             if active_model and active_model["id"] != row["id"]:
                 active_metrics = _load_json(active_model.get("metrics_json"))
                 deltas = {
-                    key: float(metrics.get(key, 0.0)) - float(active_metrics.get(key, 0.0))
+                    key: float(metrics[key]) - float(active_metrics[key])
                     for key in ("precision", "recall", "mAP50", "mAP50_95", "fps")
+                    if metrics.get(key) is not None
+                    and active_metrics.get(key) is not None
                 }
                 st.caption(
                     "Delta vs actif: "

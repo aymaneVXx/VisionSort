@@ -87,7 +87,16 @@ class QualityGate:
                 perimeter = sum(
                     math.dist(mask[index - 1], mask[index]) for index in range(len(mask))
                 )
-                mask_scores.append(1.0 if perimeter > 4.0 else 0.0)
+                area = abs(
+                    sum(
+                        float(mask[index - 1][0]) * float(mask[index][1])
+                        - float(mask[index][0]) * float(mask[index - 1][1])
+                        for index in range(len(mask))
+                    )
+                ) / 2.0
+                mask_scores.append(
+                    1.0 if perimeter > 4.0 and area > 1.0 else 0.0
+                )
         mask_quality = (
             sum(mask_scores) / len(mask_scores) if mask_scores else 1.0
         )

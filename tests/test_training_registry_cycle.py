@@ -1,5 +1,6 @@
 from visionsort.core.enums import ModelStatus, PipelineState
 from visionsort.database.db import VisionSortDB, utc_now
+from visionsort.datasets.pipeline import compute_dataset_fingerprint
 from visionsort.deployment.registry import promote_model, rollback_to_previous_active
 from visionsort.training.pipeline import create_training_job, training_worker_loop
 
@@ -33,6 +34,10 @@ def test_training_then_promote_then_rollback_cycle(tmp_path):
             now,
             now,
         ),
+    )
+    db.execute(
+        "UPDATE datasets SET dataset_fingerprint = ? WHERE id = ?",
+        (compute_dataset_fingerprint(db, "ds-cycle"), "ds-cycle"),
     )
 
     recipe = {

@@ -26,6 +26,22 @@ def promote_model(db: VisionSortDB, model_id: str) -> None:
     metrics = json.loads(row["metrics_json"] or "{}")
     test_metrics = metrics.get("test") or {}
     criteria = metrics.get("promotion_criteria") or {}
+    required_metrics = (
+        "precision",
+        "recall",
+        "mAP50",
+        "count_accuracy",
+        "merge_rate",
+        "fps",
+    )
+    unavailable = [
+        metric for metric in required_metrics if metrics.get(metric) is None
+    ]
+    if unavailable:
+        raise RuntimeError(
+            "Promotion refusée: métriques obligatoires indisponibles: "
+            + ", ".join(unavailable)
+        )
     if (
         not metrics.get("promotion_eligible")
         or test_metrics.get("status") != "COMPLETED"
