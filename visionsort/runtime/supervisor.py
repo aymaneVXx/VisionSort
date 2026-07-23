@@ -98,6 +98,13 @@ class RuntimeSupervisor:
         self.training_processes: dict[str, mp.Process] = {}
         self.pipeline_processes: dict[str, mp.Process] = {}
         self.active_model_id: str | None = None
+        self.loaded_model_ids: set[str] = set()
+        self.active_model_ids_by_task: dict[str, str] = {
+            str(row["task"]): str(row["id"])
+            for row in self.db.fetch_all(
+                "SELECT id, task FROM model_registry WHERE is_active = 1"
+            )
+        }
         self._shutdown_complete = False
         self.arbiter = GPUResourceArbiter(
             allow_training_while_inference=bool(self.config.get("gpu", "allow_training_while_inference", default=False)),
@@ -287,45 +294,84 @@ class RuntimeSupervisor:
         sources = {row["id"]: dict(row) for row in self.db.fetch_all("SELECT * FROM sources")}
         self.inference_request_queue.put({"kind": "SYNC_SOURCES", "source_map": sources})
 
-    def ensure_model_loaded(self, model_id: str) -> None:
-        if model_id == self.active_model_id:
+    def ensure_model_loaded(
+        self,
+        model_id: str,
+        *,
+        task: str | None = None,
+        force_reload: bool = False,
+    ) -> None:
+        loaded = getattr(self, "loaded_model_ids", set())
+        if model_id in loaded and not force_reload:
             return
         flags = getattr(self, "control_flags", None)
+        pause_key = f"__inference_paused__:{model_id}"
         if flags is not None:
-            flags["__inference_paused__"] = True
+            flags[pause_key] = True
         try:
             drain_deadline = time.time() + float(
                 self.config.get(
                     "runtime", "inference_result_ttl_seconds", default=5.0
                 )
             )
-            while flags is not None and any(
-                str(key).startswith("__inflight__:") for key in list(flags.keys())
-            ):
+
+            def matching_inflight() -> bool:
+                if flags is None:
+                    return False
+                for key, value in list(flags.items()):
+                    if not str(key).startswith("__inflight__:"):
+                        continue
+                    if not isinstance(value, dict):
+                        return True
+                    if str(value.get("model_id") or "") == model_id:
+                        return True
+                return False
+
+            while matching_inflight():
                 self.drain_inference_results()
                 if time.time() >= drain_deadline:
                     raise RuntimeError(
-                        "Rechargement annulé: requêtes d'inférence en vol non terminées."
+                        "Rechargement annulé: requêtes d'inférence en vol "
+                        f"non terminées pour {model_id}."
                     )
                 time.sleep(0.02)
             self.sync_inference_sources()
-            self.inference_result_store.pop("__model_ready__", None)
-            self.inference_result_store.pop("__model_load_failed__", None)
+            ready_key = f"__model_ready__:{model_id}"
+            failed_key = f"__model_load_failed__:{model_id}"
+            self.inference_result_store.pop(ready_key, None)
+            self.inference_result_store.pop(failed_key, None)
             self.inference_request_queue.put(
-                {"kind": "LOAD_MODEL", "model_id": model_id}
+                {
+                    "kind": "LOAD_MODEL",
+                    "model_id": model_id,
+                    "task": task,
+                    "reload": bool(force_reload),
+                }
             )
             timeout = time.time() + 15
             while time.time() < timeout:
                 self.drain_inference_results()
-                failed = self.inference_result_store.pop(
-                    "__model_load_failed__", None
-                )
-                if failed and failed.get("model_id") == model_id:
-                    self.active_model_id = failed.get("active_model_id")
+                failed = self.inference_result_store.pop(failed_key, None)
+                if failed:
                     raise RuntimeError(str(failed.get("error")))
-                ready = self.inference_result_store.pop("__model_ready__", None)
-                if ready and ready.get("model_id") == model_id:
-                    self.active_model_id = model_id
+                ready = self.inference_result_store.pop(ready_key, None)
+                if ready:
+                    if not hasattr(self, "loaded_model_ids"):
+                        self.loaded_model_ids = set()
+                    self.loaded_model_ids.update(
+                        str(item)
+                        for item in ready.get(
+                            "loaded_model_ids", [model_id]
+                        )
+                    )
+                    resolved_task = str(
+                        ready.get("task") or task or "detection"
+                    )
+                    if not hasattr(self, "active_model_ids_by_task"):
+                        self.active_model_ids_by_task = {}
+                    self.active_model_ids_by_task[resolved_task] = model_id
+                    if resolved_task in {"detection", "segmentation"}:
+                        self.active_model_id = model_id
                     if hasattr(self, "job_repo"):
                         self.job_repo.upsert_job_run(
                             JobType.GPU_INFERENCE.value,
@@ -339,7 +385,7 @@ class RuntimeSupervisor:
             raise RuntimeError(f"Chargement du modèle expiré: {model_id}")
         finally:
             if flags is not None:
-                flags["__inference_paused__"] = False
+                flags[pause_key] = False
 
     def runtime_model_id(self, configured_model_id: str) -> str:
         if (
@@ -349,15 +395,130 @@ class RuntimeSupervisor:
             != "active_registry"
         ):
             return configured_model_id
+        configured = self.db.fetch_one(
+            "SELECT task FROM model_registry WHERE id = ?",
+            (configured_model_id,),
+        )
+        task = str(configured["task"] if configured else "detection")
         active = self.db.fetch_one(
-            "SELECT id FROM model_registry WHERE is_active = 1 ORDER BY updated_at DESC LIMIT 1"
+            """
+            SELECT id FROM model_registry
+            WHERE is_active = 1 AND task = ?
+            ORDER BY updated_at DESC LIMIT 1
+            """,
+            (task,),
         )
         return str(active["id"]) if active is not None else configured_model_id
+
+    def resolve_model_pipeline(
+        self,
+        source_id: str,
+        *,
+        configured_model_id: str,
+        snapshot: str | list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, str]]:
+        if isinstance(snapshot, str):
+            try:
+                raw_assignments = json.loads(snapshot or "[]")
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"Snapshot de pipeline invalide pour {source_id}."
+                ) from exc
+        elif snapshot is not None:
+            raw_assignments = list(snapshot)
+        else:
+            raw_assignments = self.control_repo.list_source_model_assignments(
+                source_id
+            )
+        if not raw_assignments:
+            model = self.db.fetch_one(
+                "SELECT task FROM model_registry WHERE id = ?",
+                (configured_model_id,),
+            )
+            task = str(model["task"] if model else "detection")
+            raw_assignments = [
+                {
+                    "pipeline_role": {
+                        "detection": "parcel_detection",
+                        "segmentation": "parcel_segmentation",
+                        "pose": "operator_pose",
+                    }.get(task, task),
+                    "task": task,
+                    "model_id": configured_model_id,
+                    "use_active": True,
+                    "enabled": True,
+                }
+            ]
+        pipeline: list[dict[str, str]] = []
+        seen_roles: set[str] = set()
+        use_registry = (
+            self.config.get(
+                "runtime", "model_selection", default="active_registry"
+            )
+            == "active_registry"
+        )
+        for assignment in raw_assignments:
+            if not bool(assignment.get("enabled", True)):
+                continue
+            role = str(assignment["pipeline_role"])
+            task = str(assignment["task"])
+            if role in seen_roles:
+                raise RuntimeError(
+                    f"Pipeline dupliqué pour {source_id}: {role}"
+                )
+            seen_roles.add(role)
+            model_id = assignment.get("model_id")
+            if use_registry and bool(assignment.get("use_active", True)):
+                active = self.db.fetch_one(
+                    """
+                    SELECT id FROM model_registry
+                    WHERE task = ? AND is_active = 1
+                    ORDER BY updated_at DESC LIMIT 1
+                    """,
+                    (task,),
+                )
+                if active is not None:
+                    model_id = active["id"]
+            if not model_id:
+                raise RuntimeError(
+                    f"Aucun modèle disponible pour le pipeline {role}."
+                )
+            model = self.db.fetch_one(
+                "SELECT task FROM model_registry WHERE id = ?",
+                (str(model_id),),
+            )
+            if model is None or str(model["task"]) != task:
+                raise RuntimeError(
+                    f"Modèle {model_id} incompatible avec la tâche {task}."
+                )
+            pipeline.append(
+                {
+                    "pipeline_role": role,
+                    "task": task,
+                    "model_id": str(model_id),
+                }
+            )
+        if not pipeline:
+            raise RuntimeError(
+                f"Aucun pipeline d'inférence actif pour {source_id}."
+            )
+        return pipeline
 
     def reload_runtime_model(self, model_id: str) -> bool:
         inference_process = getattr(self, "inference_process", None)
         if inference_process is not None and inference_process.is_alive():
-            self.ensure_model_loaded(model_id)
+            row = self.db.fetch_one(
+                "SELECT task FROM model_registry WHERE id = ?",
+                (model_id,),
+            )
+            if model_id in getattr(self, "loaded_model_ids", set()):
+                self.ensure_model_loaded(
+                    model_id,
+                    task=str(row["task"] if row else ""),
+                    force_reload=True,
+                )
+            else:
+                self.ensure_model_loaded(model_id)
             return True
         return False
 
@@ -373,6 +534,7 @@ class RuntimeSupervisor:
         archive_required: bool = False,
         source_type_snapshot: str | None = None,
         source_uri_snapshot: str | None = None,
+        model_pipeline_snapshot: str | list[dict[str, Any]] | None = None,
     ) -> None:
         row = self.db.fetch_one("SELECT * FROM sources WHERE id = ?", (source_id,))
         if row is None:
@@ -382,21 +544,22 @@ class RuntimeSupervisor:
         allowed, reason = self.arbiter.can_start_source(active_sources, training_active)
         if not allowed:
             raise RuntimeError(reason)
-        runtime_model_id = self.runtime_model_id(str(row["model_id"]))
-        if (
-            self.camera_processes
-            and self.active_model_id is not None
-            and self.active_model_id != runtime_model_id
-        ):
-            raise RuntimeError("Toutes les sources actives doivent partager le même model_id pour le worker GPU unique.")
-        self.ensure_model_loaded(runtime_model_id)
+        model_pipeline = self.resolve_model_pipeline(
+            source_id,
+            configured_model_id=str(row["model_id"]),
+            snapshot=model_pipeline_snapshot,
+        )
+        for pipeline in model_pipeline:
+            self.ensure_model_loaded(pipeline["model_id"])
         stop_event = self.ctx.Event()
         cfg = dict(row)
         if source_type_snapshot:
             cfg["source_type"] = source_type_snapshot
         if source_uri_snapshot:
             cfg["uri"] = source_uri_snapshot
-        cfg["model_id"] = runtime_model_id
+        cfg["model_id"] = model_pipeline[0]["model_id"]
+        cfg["model_task"] = model_pipeline[0]["task"]
+        cfg["model_pipeline"] = model_pipeline
         cfg["replay_fps"] = float(replay_fps)
         cfg["session_id"] = session_id
         cfg["session_start_global"] = float(session_start_global)
@@ -431,7 +594,10 @@ class RuntimeSupervisor:
             {
                 "role": row["role"],
                 "configured_model_id": row["model_id"],
-                "runtime_model_id": runtime_model_id,
+                "runtime_model_ids": [
+                    item["model_id"] for item in model_pipeline
+                ],
+                "model_pipeline": model_pipeline,
             },
         )
         self.control_repo.update_source_state(source_id, status=SourceStatus.CONNECTING.value, fps=0.0)
@@ -463,6 +629,9 @@ class RuntimeSupervisor:
                 ),
                 source_uri_snapshot=sess_src.get(
                     "source_uri_snapshot"
+                ),
+                model_pipeline_snapshot=sess_src.get(
+                    "model_pipeline_json"
                 ),
             )
 
@@ -1013,8 +1182,19 @@ class RuntimeSupervisor:
                     "status": "REJECTED",
                 }
             elif command_type == CommandType.PROMOTE_MODEL.value:
+                candidate = self.db.fetch_one(
+                    "SELECT task FROM model_registry WHERE id = ?",
+                    (payload["model_id"],),
+                )
+                if candidate is None:
+                    raise RuntimeError("Modèle introuvable.")
+                task = str(candidate["task"])
                 previous_active = self.db.fetch_one(
-                    "SELECT id FROM model_registry WHERE is_active = 1 LIMIT 1"
+                    """
+                    SELECT id FROM model_registry
+                    WHERE is_active = 1 AND task = ? LIMIT 1
+                    """,
+                    (task,),
                 )
                 try:
                     reloaded = self.reload_runtime_model(payload["model_id"])
@@ -1026,6 +1206,7 @@ class RuntimeSupervisor:
                 result_payload = {
                     "model_id": payload["model_id"],
                     "status": "CHAMPION",
+                    "task": task,
                     "runtime_reloaded": reloaded,
                 }
             elif command_type == CommandType.REJECT_MODEL.value:
@@ -1035,8 +1216,19 @@ class RuntimeSupervisor:
                 set_model_status(self.db, payload["model_id"], "ARCHIVED")
                 result_payload = {"model_id": payload["model_id"], "status": "ARCHIVED"}
             elif command_type == CommandType.ACTIVATE_MODEL.value:
+                candidate = self.db.fetch_one(
+                    "SELECT task FROM model_registry WHERE id = ?",
+                    (payload["model_id"],),
+                )
+                if candidate is None:
+                    raise RuntimeError("Modèle introuvable.")
+                task = str(candidate["task"])
                 previous_active = self.db.fetch_one(
-                    "SELECT id FROM model_registry WHERE is_active = 1 LIMIT 1"
+                    """
+                    SELECT id FROM model_registry
+                    WHERE is_active = 1 AND task = ? LIMIT 1
+                    """,
+                    (task,),
                 )
                 try:
                     reloaded = self.reload_runtime_model(payload["model_id"])
@@ -1047,13 +1239,21 @@ class RuntimeSupervisor:
                     raise
                 result_payload = {
                     "model_id": payload["model_id"],
+                    "task": task,
                     "runtime_reloaded": reloaded,
                 }
             elif command_type == CommandType.ROLLBACK_MODEL.value:
+                task = str(payload.get("task") or "detection")
                 previous_active = self.db.fetch_one(
-                    "SELECT id FROM model_registry WHERE is_active = 1 LIMIT 1"
+                    """
+                    SELECT id FROM model_registry
+                    WHERE is_active = 1 AND task = ? LIMIT 1
+                    """,
+                    (task,),
                 )
-                rollback_model_id = rollback_to_previous_active(self.db)
+                rollback_model_id = rollback_to_previous_active(
+                    self.db, task
+                )
                 try:
                     reloaded = (
                         self.reload_runtime_model(rollback_model_id)
@@ -1062,14 +1262,14 @@ class RuntimeSupervisor:
                     )
                 except Exception:
                     if previous_active is not None:
-                        self.db.execute(
-                            "UPDATE model_registry SET is_active = CASE WHEN id = ? THEN 1 ELSE 0 END, updated_at = ?",
-                            (str(previous_active["id"]), utc_now()),
+                        activate_model(
+                            self.db, str(previous_active["id"])
                         )
                         self.reload_runtime_model(str(previous_active["id"]))
                     raise
                 result_payload = {
                     "model_id": rollback_model_id,
+                    "task": task,
                     "runtime_reloaded": reloaded,
                 }
             elif command_type == CommandType.BOOTSTRAP_DEMO.value:
@@ -1174,10 +1374,30 @@ class RuntimeSupervisor:
             except queue.Empty:
                 return
             if message["kind"] == "MODEL_READY":
+                model_id = str(message["model_id"])
+                self.inference_result_store[
+                    f"__model_ready__:{model_id}"
+                ] = message
                 self.inference_result_store["__model_ready__"] = message
+                if hasattr(self, "loaded_model_ids"):
+                    self.loaded_model_ids.update(
+                        str(item)
+                        for item in message.get(
+                            "loaded_model_ids", [model_id]
+                        )
+                    )
                 continue
             if message["kind"] == "MODEL_LOAD_FAILED":
+                model_id = str(message["model_id"])
+                self.inference_result_store[
+                    f"__model_load_failed__:{model_id}"
+                ] = message
                 self.inference_result_store["__model_load_failed__"] = message
+                continue
+            if message["kind"] == "MODEL_UNLOADED":
+                model_id = str(message["model_id"])
+                if hasattr(self, "loaded_model_ids"):
+                    self.loaded_model_ids.discard(model_id)
                 continue
             if message["kind"] not in {"INFER_RESULT", "INFER_ERROR"}:
                 continue

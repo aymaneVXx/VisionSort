@@ -30,6 +30,9 @@ def build_inference_request(
     frame,
     source_id: str,
     ttl_seconds: float,
+    model_id: str | None = None,
+    task: str | None = None,
+    pipeline_role: str | None = None,
 ) -> dict[str, Any]:
     now = time.time()
     return {
@@ -37,6 +40,9 @@ def build_inference_request(
         "request_id": str(uuid.uuid4()),
         "session_id": frame.session_id,
         "source_id": source_id,
+        "model_id": model_id,
+        "task": task,
+        "pipeline_role": pipeline_role,
         "camera_id": frame.camera_id,
         "camera_role": frame.camera_role,
         "stream_epoch": int(frame.stream_epoch),
@@ -395,6 +401,15 @@ def camera_worker_loop(
         segment_seconds=int(config.get("runtime", "recording_segment_seconds", default=10)),
     )
     archive_required = bool(source_config.get("archive_required", False))
+    model_pipeline = list(source_config.get("model_pipeline") or [])
+    if not model_pipeline:
+        model_pipeline = [
+            {
+                "pipeline_role": "parcel_detection",
+                "task": str(source_config.get("model_task") or "detection"),
+                "model_id": source_config["model_id"],
+            }
+        ]
     session_obs_dir = OBSERVATIONS_DIR / session_id
     session_obs_dir.mkdir(parents=True, exist_ok=True)
     observations_path = session_obs_dir / f"{source_id}.jsonl"
@@ -472,71 +487,145 @@ def camera_worker_loop(
                     "runtime", "inference_result_ttl_seconds", default=5.0
                 )
             )
-            message = build_inference_request(
-                frame=frame,
-                source_id=source_id,
-                ttl_seconds=ttl_seconds,
+            observations: list[Observation] = []
+            frame_results: list[dict[str, Any]] = []
+            pipeline_errors: list[str] = []
+            has_pose_pipeline = any(
+                str(item.get("task")) == "pose"
+                or str(item.get("pipeline_role")) == "operator_pose"
+                for item in model_pipeline
             )
-            inflight_key = f"__inflight__:{message['request_id']}"
-            control_flags[inflight_key] = source_id
-            try:
-                inference_request_queue.put_nowait(message)
-            except queue.Full:
+            for pipeline in model_pipeline:
+                model_id = str(pipeline["model_id"])
+                task = str(pipeline["task"])
+                pipeline_role = str(pipeline["pipeline_role"])
+                while (
+                    bool(
+                        control_flags.get(
+                            f"__inference_paused__:{model_id}", False
+                        )
+                    )
+                    and not stop_event.is_set()
+                ):
+                    time.sleep(0.01)
+                message = build_inference_request(
+                    frame=frame,
+                    source_id=source_id,
+                    ttl_seconds=ttl_seconds,
+                    model_id=model_id,
+                    task=task,
+                    pipeline_role=pipeline_role,
+                )
+                inflight_key = (
+                    f"__inflight__:{message['request_id']}"
+                )
+                control_flags[inflight_key] = {
+                    "source_id": source_id,
+                    "model_id": model_id,
+                    "task": task,
+                }
+                try:
+                    inference_request_queue.put_nowait(message)
+                except queue.Full:
+                    control_flags.pop(inflight_key, None)
+                    pipeline_errors.append(
+                        f"{pipeline_role}: queue d'inférence pleine"
+                    )
+                    continue
+
+                request_id = str(message["request_id"])
+                while (
+                    request_id not in inference_result_store
+                    and time.time() < float(message["expires_at"])
+                    and not stop_event.is_set()
+                ):
+                    time.sleep(0.01)
+                result = inference_result_store.pop(request_id, None)
                 control_flags.pop(inflight_key, None)
+                if result is None:
+                    _increment_inference_metric(
+                        inference_result_store,
+                        source_id,
+                        f"timed_out:{model_id}",
+                    )
+                    pipeline_errors.append(
+                        f"{pipeline_role}: réponse expirée"
+                    )
+                    continue
+                expected_context = (
+                    session_id,
+                    source_id,
+                    camera_id,
+                    int(frame.stream_epoch),
+                    int(frame.frame_index),
+                    model_id,
+                    task,
+                )
+                result_context = (
+                    result.get("session_id"),
+                    result.get("source_id"),
+                    result.get("camera_id"),
+                    int(result.get("stream_epoch", -1)),
+                    int(result.get("frame_index", -1)),
+                    str(result.get("model_id") or ""),
+                    str(result.get("task") or ""),
+                )
+                if result_context != expected_context:
+                    _increment_inference_metric(
+                        inference_result_store,
+                        source_id,
+                        f"ignored:{model_id}",
+                    )
+                    pipeline_errors.append(
+                        f"{pipeline_role}: contexte de réponse invalide"
+                    )
+                    continue
+                if "error" in result:
+                    pipeline_errors.append(
+                        f"{pipeline_role}: {result['error']}"
+                    )
+                    continue
+                frame_results.append(result)
+                pipeline_observations = [
+                    Observation(**row)
+                    for row in result["observations"]
+                ]
+                if has_pose_pipeline and pipeline_role in {
+                    "parcel_detection",
+                    "parcel_segmentation",
+                }:
+                    pipeline_observations = [
+                        item
+                        for item in pipeline_observations
+                        if item.class_name == "parcel"
+                    ]
+                elif task == "pose" or pipeline_role == "operator_pose":
+                    pipeline_observations = [
+                        item
+                        for item in pipeline_observations
+                        if item.class_name != "parcel"
+                    ]
+                for observation in pipeline_observations:
+                    observation.attributes["_stream_epoch"] = int(
+                        frame.stream_epoch
+                    )
+                    observation.attributes["inference_task"] = task
+                    observation.attributes[
+                        "pipeline_role"
+                    ] = pipeline_role
+                observations.extend(pipeline_observations)
+            if not frame_results:
                 acquisition.mark_dropped()
                 repo.update_source_state(
                     source_id,
                     status=SourceStatus.DEGRADED.value,
                     fps=0.0,
+                    last_error="; ".join(pipeline_errors),
                     preview_path=str(preview_path),
                     last_frame_ts=frame.timestamp_global,
                     metrics=acquisition.metrics(),
                 )
                 continue
-
-            request_id = str(message["request_id"])
-            while (
-                request_id not in inference_result_store
-                and time.time() < float(message["expires_at"])
-                and not stop_event.is_set()
-            ):
-                time.sleep(0.01)
-            result = inference_result_store.pop(request_id, None)
-            control_flags.pop(inflight_key, None)
-            if result is None:
-                _increment_inference_metric(
-                    inference_result_store, source_id, "timed_out"
-                )
-                acquisition.mark_dropped()
-                continue
-            expected_context = (
-                session_id,
-                source_id,
-                camera_id,
-                int(frame.stream_epoch),
-                int(frame.frame_index),
-            )
-            result_context = (
-                result.get("session_id"),
-                result.get("source_id"),
-                result.get("camera_id"),
-                int(result.get("stream_epoch", -1)),
-                int(result.get("frame_index", -1)),
-            )
-            if result_context != expected_context:
-                _increment_inference_metric(
-                    inference_result_store, source_id, "ignored"
-                )
-                acquisition.mark_dropped()
-                continue
-            if "error" in result:
-                repo.update_source_state(source_id, status=SourceStatus.ERROR.value, last_error=result["error"], preview_path=str(preview_path))
-                continue
-            observations = [Observation(**row) for row in result["observations"]]
-            for observation in observations:
-                observation.attributes["_stream_epoch"] = int(
-                    frame.stream_epoch
-                )
             with observations_path.open("a", encoding="utf-8") as handle:
                 handle.write(
                     json.dumps(
@@ -545,12 +634,42 @@ def camera_worker_loop(
                             "source_id": source_id,
                             "camera_id": camera_id,
                             "camera_role": camera_role,
-                            "request_id": request_id,
+                            "request_ids": [
+                                item["request_id"]
+                                for item in frame_results
+                            ],
                             "stream_epoch": frame.stream_epoch,
                             "frame_index": frame.frame_index,
                             "timestamp_local": frame.timestamp_local,
                             "timestamp_global": frame.timestamp_global,
                             "model_id": observations[0].model_id if observations else None,
+                            "model_ids": sorted(
+                                {
+                                    str(item["model_id"])
+                                    for item in frame_results
+                                }
+                            ),
+                            "tasks": sorted(
+                                {
+                                    str(item["task"])
+                                    for item in frame_results
+                                }
+                            ),
+                            "pipeline_results": [
+                                {
+                                    "request_id": item["request_id"],
+                                    "model_id": item["model_id"],
+                                    "task": item["task"],
+                                    "pipeline_role": item.get(
+                                        "pipeline_role"
+                                    ),
+                                    "model_metrics": item.get(
+                                        "model_metrics", {}
+                                    ),
+                                }
+                                for item in frame_results
+                            ],
+                            "pipeline_errors": pipeline_errors,
                             "tracker_id": tracker_id,
                             "observations": [asdict(obs) for obs in observations],
                             "validated_on_site": False,
@@ -584,7 +703,11 @@ def camera_worker_loop(
                 source_id,
                 status=status,
                 fps=fps,
-                last_error=None,
+                last_error=(
+                    "; ".join(pipeline_errors)
+                    if pipeline_errors
+                    else None
+                ),
                 last_frame_ts=frame.timestamp_global,
                 preview_path=relative_to_root(preview_path),
                 details_path=relative_to_root(observations_path),
@@ -600,6 +723,13 @@ def camera_worker_loop(
                     "segments_produced": recorder.segments_produced,
                     "segments_corrupted": recorder.segments_corrupted,
                     "archive_bytes": recorder.bytes_used,
+                    "model_pipeline": model_pipeline,
+                    "model_metrics": {
+                        str(item["model_id"]): item.get(
+                            "model_metrics", {}
+                        )
+                        for item in frame_results
+                    },
                     "validated_on_site": False,
                 },
             )
@@ -613,9 +743,16 @@ def camera_worker_loop(
         if finished:
             runtime_queue.put({"kind": "RECORDING", **finished})
         for key in list(control_flags.keys()):
+            inflight = control_flags.get(key)
             if (
                 str(key).startswith("__inflight__:")
-                and control_flags.get(key) == source_id
+                and (
+                    inflight == source_id
+                    or (
+                        isinstance(inflight, dict)
+                        and inflight.get("source_id") == source_id
+                    )
+                )
             ):
                 control_flags.pop(key, None)
         acquisition.stop()

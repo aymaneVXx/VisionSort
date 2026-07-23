@@ -24,6 +24,14 @@ def _source_file_sha256(uri: str) -> str | None:
     return digest.hexdigest()
 
 
+def _pipeline_role_for_task(task: str) -> str:
+    return {
+        "detection": "parcel_detection",
+        "segmentation": "parcel_segmentation",
+        "pose": "operator_pose",
+    }.get(str(task), str(task))
+
+
 class ControlRepository:
     def __init__(self, db: VisionSortDB):
         self.db = db
@@ -64,7 +72,12 @@ class ControlRepository:
             ORDER BY s.role ASC, s.name ASC
             """
         )
-        return [dict(row) for row in rows]
+        output = [dict(row) for row in rows]
+        for source in output:
+            source["model_assignments"] = self.list_source_model_assignments(
+                str(source["id"])
+            )
+        return output
 
     def list_capture_sessions(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self.db.fetch_all("SELECT * FROM capture_sessions ORDER BY created_at DESC")]
@@ -108,6 +121,9 @@ class ControlRepository:
                     ),
                 )
             )
+            model_pipeline = self.list_source_model_assignments(
+                str(item["source_id"])
+            )
             rows.append(
                 (
                     f"sesssrc-{uuid.uuid4().hex[:10]}",
@@ -120,6 +136,7 @@ class ControlRepository:
                     source_uri,
                     _source_file_sha256(source_uri),
                     int(archive_required),
+                    json.dumps(model_pipeline),
                     now,
                     now,
                 )
@@ -130,8 +147,9 @@ class ControlRepository:
                 INSERT INTO capture_session_sources
                 (id, session_id, source_id, camera_role, time_offset_ms,
                  replay_fps, source_type_snapshot, source_uri_snapshot,
-                 source_sha256, archive_required, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 source_sha256, archive_required, model_pipeline_json,
+                 created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -207,7 +225,127 @@ class ControlRepository:
             """,
             (source_id, SourceStatus.OFFLINE.value, now),
         )
+        assignments = payload.get("model_assignments")
+        if assignments is not None:
+            self.set_source_model_assignments(
+                source_id, list(assignments)
+            )
+        else:
+            existing = self.db.fetch_one(
+                """
+                SELECT COUNT(*) AS count FROM source_model_assignments
+                WHERE source_id = ?
+                """,
+                (source_id,),
+            )
+            if int((existing["count"] if existing else 0) or 0) == 0:
+                model = self.db.fetch_one(
+                    "SELECT task FROM model_registry WHERE id = ?",
+                    (payload["model_id"],),
+                )
+                task = str(model["task"] if model else "detection")
+                self.set_source_model_assignments(
+                    source_id,
+                    [
+                        {
+                            "pipeline_role": _pipeline_role_for_task(
+                                task
+                            ),
+                            "task": task,
+                            "model_id": payload["model_id"],
+                            "use_active": True,
+                            "enabled": True,
+                        }
+                    ],
+                )
         return source_id
+
+    def list_source_model_assignments(
+        self, source_id: str
+    ) -> list[dict[str, Any]]:
+        return [
+            dict(row)
+            for row in self.db.fetch_all(
+                """
+                SELECT * FROM source_model_assignments
+                WHERE source_id = ? AND enabled = 1
+                ORDER BY pipeline_role
+                """,
+                (source_id,),
+            )
+        ]
+
+    def set_source_model_assignments(
+        self, source_id: str, assignments: list[dict[str, Any]]
+    ) -> None:
+        if not assignments:
+            raise RuntimeError(
+                "Une source doit conserver au moins un pipeline d'inférence."
+            )
+        normalized: list[dict[str, Any]] = []
+        seen_roles: set[str] = set()
+        for assignment in assignments:
+            role = str(assignment["pipeline_role"])
+            if role in seen_roles:
+                raise RuntimeError(
+                    f"Pipeline dupliqué pour la source: {role}"
+                )
+            seen_roles.add(role)
+            model_id = assignment.get("model_id")
+            task = str(assignment["task"])
+            if model_id:
+                model = self.db.fetch_one(
+                    "SELECT task FROM model_registry WHERE id = ?",
+                    (str(model_id),),
+                )
+                if model is None:
+                    raise RuntimeError(
+                        f"Modèle de pipeline introuvable: {model_id}"
+                    )
+                if str(model["task"]) != task:
+                    raise RuntimeError(
+                        f"Le modèle {model_id} n'est pas compatible "
+                        f"avec la tâche {task}."
+                    )
+            normalized.append(
+                {
+                    "pipeline_role": role,
+                    "task": task,
+                    "model_id": str(model_id) if model_id else None,
+                    "use_active": bool(
+                        assignment.get("use_active", True)
+                    ),
+                    "enabled": bool(assignment.get("enabled", True)),
+                }
+            )
+        now = utc_now()
+        with self.db.connect() as conn:
+            conn.execute(
+                "DELETE FROM source_model_assignments WHERE source_id = ?",
+                (source_id,),
+            )
+            conn.executemany(
+                """
+                INSERT INTO source_model_assignments
+                (id, source_id, pipeline_role, task, model_id, use_active,
+                 enabled, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        f"pipeline-{uuid.uuid4().hex[:12]}",
+                        source_id,
+                        item["pipeline_role"],
+                        item["task"],
+                        item["model_id"],
+                        int(item["use_active"]),
+                        int(item["enabled"]),
+                        now,
+                        now,
+                    )
+                    for item in normalized
+                ],
+            )
 
     def update_source_state(
         self,
@@ -269,8 +407,27 @@ class ControlRepository:
         return [dict(row) for row in self.db.fetch_all("SELECT * FROM tracker_registry ORDER BY id ASC")]
 
     def activate_model(self, model_id: str) -> None:
-        self.db.execute("UPDATE model_registry SET is_active = 0, updated_at = ?", (utc_now(),))
-        self.db.execute("UPDATE model_registry SET is_active = 1, updated_at = ? WHERE id = ?", (utc_now(), model_id))
+        model = self.db.fetch_one(
+            "SELECT task FROM model_registry WHERE id = ?", (model_id,)
+        )
+        if model is None:
+            raise RuntimeError("Modèle introuvable.")
+        now = utc_now()
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE model_registry SET is_active = 0, updated_at = ?
+                WHERE task = ? AND is_active = 1
+                """,
+                (now, str(model["task"])),
+            )
+            conn.execute(
+                """
+                UPDATE model_registry SET is_active = 1, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, model_id),
+            )
 
     def upsert_site_config(self, config_json: dict[str, Any]) -> None:
         self.db.execute(

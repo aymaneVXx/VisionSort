@@ -155,6 +155,7 @@ class VisionSortDB:
                     source_uri_snapshot TEXT,
                     source_sha256 TEXT,
                     archive_required INTEGER NOT NULL DEFAULT 0,
+                    model_pipeline_json TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -169,6 +170,20 @@ class VisionSortDB:
                     recording_enabled INTEGER NOT NULL DEFAULT 0,
                     metrics_json TEXT NOT NULL DEFAULT '{}',
                     updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS source_model_assignments (
+                    id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL,
+                    pipeline_role TEXT NOT NULL,
+                    task TEXT NOT NULL,
+                    model_id TEXT,
+                    use_active INTEGER NOT NULL DEFAULT 1,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(source_id, pipeline_role),
+                    FOREIGN KEY (source_id) REFERENCES sources(id),
+                    FOREIGN KEY (model_id) REFERENCES model_registry(id)
                 );
                 CREATE TABLE IF NOT EXISTS commands (
                     id TEXT PRIMARY KEY,
@@ -418,6 +433,9 @@ class VisionSortDB:
                 CREATE INDEX IF NOT EXISTS idx_handoff_hypotheses_status ON handoff_hypotheses(status, session_id, expires_at);
                 CREATE INDEX IF NOT EXISTS idx_recording_frames_lookup ON recording_frames(session_id, source_id, stream_epoch, frame_index);
                 CREATE INDEX IF NOT EXISTS idx_recordings_session_source ON recordings(session_id, source_id, started_at);
+                CREATE INDEX IF NOT EXISTS idx_source_model_assignments_source ON source_model_assignments(source_id, enabled);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_model_active_task
+                    ON model_registry(task) WHERE is_active = 1;
                 """
             )
             self._migrate(conn)
@@ -696,6 +714,67 @@ class VisionSortDB:
                 """
             )
             conn.execute("PRAGMA user_version = 6")
+
+        if version < 7:
+            add_column(
+                "capture_session_sources",
+                "model_pipeline_json TEXT NOT NULL DEFAULT '[]'",
+            )
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS source_model_assignments (
+                    id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL,
+                    pipeline_role TEXT NOT NULL,
+                    task TEXT NOT NULL,
+                    model_id TEXT,
+                    use_active INTEGER NOT NULL DEFAULT 1,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(source_id, pipeline_role),
+                    FOREIGN KEY (source_id) REFERENCES sources(id),
+                    FOREIGN KEY (model_id) REFERENCES model_registry(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_source_model_assignments_source
+                    ON source_model_assignments(source_id, enabled);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_model_active_task
+                    ON model_registry(task) WHERE is_active = 1;
+                """
+            )
+            now = utc_now()
+            legacy_sources = conn.execute(
+                """
+                SELECT s.id AS source_id, s.model_id, m.task
+                FROM sources s
+                LEFT JOIN model_registry m ON m.id = s.model_id
+                """
+            ).fetchall()
+            for source in legacy_sources:
+                task = str(source["task"] or ModelTask.DETECTION.value)
+                role = {
+                    ModelTask.DETECTION.value: "parcel_detection",
+                    ModelTask.SEGMENTATION.value: "parcel_segmentation",
+                    ModelTask.POSE.value: "operator_pose",
+                }.get(task, task)
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO source_model_assignments
+                    (id, source_id, pipeline_role, task, model_id,
+                     use_active, enabled, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?)
+                    """,
+                    (
+                        f"legacy-{source['source_id']}-{role}",
+                        source["source_id"],
+                        role,
+                        task,
+                        source["model_id"],
+                        now,
+                        now,
+                    ),
+                )
+            conn.execute("PRAGMA user_version = 7")
 
     def fetch_all(self, query: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
         with self.connect() as conn:

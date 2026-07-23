@@ -14,6 +14,14 @@ def render(context: UIContext) -> None:
     page_header("Cameras", "Déclaration, test et pilotage des sources")
     demo_warning(context)
     models = context.repo.list_models()
+    parcel_models = [
+        row
+        for row in models
+        if row.get("task") in {"detection", "segmentation"}
+    ]
+    pose_models = [
+        row for row in models if row.get("task") == "pose"
+    ]
     trackers = context.repo.list_trackers()
     sources = context.repo.list_sources()
 
@@ -78,9 +86,54 @@ def render(context: UIContext) -> None:
         role = st.selectbox("Rôle", ["C1", "C2", "C3"])
         source_type = st.selectbox("Type", ["REPLAY", "VIDEO_FILE", "RTSP"])
         uri = st.text_input("URI / chemin vidéo", value="")
-        model_id = st.selectbox("Modèle", [row["id"] for row in models], index=0 if models else None)
+        model_id = st.selectbox(
+            "Modèle colis",
+            [row["id"] for row in parcel_models],
+            index=0 if parcel_models else None,
+        )
+        enable_pose = st.checkbox(
+            "Ajouter le pipeline opérateur Pose",
+            value=False,
+            disabled=not pose_models,
+            help=(
+                "Le modèle actif de la tâche pose sera partagé entre "
+                "les caméras qui utilisent ce pipeline."
+            ),
+        )
+        pose_model_id = st.selectbox(
+            "Modèle Pose",
+            [row["id"] for row in pose_models],
+            index=0 if pose_models else None,
+            disabled=not enable_pose,
+        )
         tracker_id = st.selectbox("Tracker", [row["id"] for row in trackers], index=0 if trackers else None)
         if st.form_submit_button("Enregistrer la source"):
+            selected_model = next(
+                row for row in parcel_models if row["id"] == model_id
+            )
+            assignments = [
+                {
+                    "pipeline_role": (
+                        "parcel_segmentation"
+                        if selected_model["task"] == "segmentation"
+                        else "parcel_detection"
+                    ),
+                    "task": selected_model["task"],
+                    "model_id": model_id,
+                    "use_active": True,
+                    "enabled": True,
+                }
+            ]
+            if enable_pose and pose_model_id:
+                assignments.append(
+                    {
+                        "pipeline_role": "operator_pose",
+                        "task": "pose",
+                        "model_id": pose_model_id,
+                        "use_active": True,
+                        "enabled": True,
+                    }
+                )
             context.repo.enqueue_command(
                 CommandType.REGISTER_SOURCE,
                 {
@@ -89,6 +142,7 @@ def render(context: UIContext) -> None:
                     "source_type": source_type,
                     "uri": uri,
                     "model_id": model_id,
+                    "model_assignments": assignments,
                     "tracker_id": tracker_id,
                     "enabled": True,
                 },
@@ -104,6 +158,19 @@ def render(context: UIContext) -> None:
     for row in sources:
         with st.container(border=True):
             st.write(f"**{row['name']}** - {row['role']} - {row['source_type']} - état `{row.get('status') or 'OFFLINE'}`")
+            assignments = row.get("model_assignments") or []
+            st.caption(
+                "Pipelines: "
+                + (
+                    ", ".join(
+                        f"{item['pipeline_role']} → "
+                        f"{item.get('model_id') or 'actif ' + item['task']}"
+                        for item in assignments
+                    )
+                    if assignments
+                    else "migration legacy en attente"
+                )
+            )
             cols = st.columns(4)
             if cols[0].button("Tester", key=f"test-{row['id']}"):
                 context.repo.enqueue_command(CommandType.TEST_SOURCE, {"uri": row["uri"], "role": row["role"]})
