@@ -56,6 +56,25 @@ def render(context: UIContext) -> None:
                     },
                 )
                 st.info("Rejet envoyé au supervisor.")
+    audit_rows = context.repo.list_handoff_resolution_audit(limit=200)
+    with st.expander(
+        f"Historique des résolutions ({len(audit_rows)})"
+    ):
+        if audit_rows:
+            st.dataframe(
+                pd.DataFrame(audit_rows)[
+                    [
+                        "created_at",
+                        "hypothesis_id",
+                        "actor",
+                        "result",
+                        "reason",
+                    ]
+                ],
+                use_container_width=True,
+            )
+        else:
+            st.caption("Aucune résolution auditée.")
     st.divider()
     events = context.repo.recent_events(limit=500)
     if not events:

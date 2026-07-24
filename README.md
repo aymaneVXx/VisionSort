@@ -17,11 +17,29 @@ VisionSort est une plateforme locale Python + Streamlit pour piloter un cycle co
 - SQLite stocke uniquement commandes, sessions, états, jobs, événements, tracklets, datasets, modèles et trackers.
 - Les images, previews, enregistrements, observations détaillées et rapports restent sur disque.
 - Les observations détaillées sont stockées en `JSONL`, avec export `Parquet` possible via un step pipeline dédié.
-- L’inférence est conçue autour d’un worker partagé par modèle sélectionné.
+- L’inférence utilise un scheduler central et un cache partagé par `model_id`;
+  une source peut combiner les rôles colis et pose.
 - Chaque caméra conserve son tracker local indépendant.
 - `bytetrack_cpu` et `botsort_cpu` utilisent les implémentations natives Ultralytics; `greedy_iou` reste une option de démonstration explicite.
 - L'acquisition utilise un buffer borné `latest frame wins` et ne bloque plus sur le temps d'inférence.
 - Le mode simulé est explicite: aucun résultat démo ne doit être utilisé silencieusement hors `DEMO_MODE=1`.
+
+### Relations SQLite ajoutées
+
+- `recordings` représente les segments immuables d’une session et
+  `recording_frames` indexe précisément chaque
+  `(session_id, source_id, stream_epoch, frame_index)`.
+- `session_media_coverage` conserve le bilan d’archivage par source.
+- `source_model_assignments` relie une source à ses pipelines
+  `parcel_detection`, `parcel_segmentation` et `operator_pose`;
+  `capture_session_sources.model_pipeline_json` en garde le snapshot.
+- `model_registry.is_active` est unique par tâche, et non plus global.
+- `handoff_hypotheses` conserve les ambiguïtés;
+  `handoff_resolution_audit` journalise chaque résolution ou refus avec
+  l’ancienne et la nouvelle chaîne.
+
+Les migrations incrémentales SQLite v6, v7 et v8 ajoutent ces structures
+sans recréer les bases existantes.
 
 ## Modules Principaux
 

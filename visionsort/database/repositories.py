@@ -539,6 +539,20 @@ class ControlRepository:
             )
         return [dict(row) for row in rows]
 
+    def list_handoff_resolution_audit(
+        self, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        return [
+            dict(row)
+            for row in self.db.fetch_all(
+                """
+                SELECT * FROM handoff_resolution_audit
+                ORDER BY created_at DESC LIMIT ?
+                """,
+                (limit,),
+            )
+        ]
+
 
 class EventRepository:
     def __init__(self, db: VisionSortDB):
@@ -765,20 +779,388 @@ class HandoffHypothesisRepository:
             ),
         )
 
+    def resolve_transactional(
+        self,
+        hypothesis_id: str,
+        *,
+        outgoing_tracklet_id: str,
+        actor: str,
+        topology_edges: list[dict[str, Any]],
+        reason: str,
+        resolution: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        old_chain: list[dict[str, Any]] = []
+        new_chain: list[dict[str, Any]] = []
+        session_id: str | None = None
+        try:
+            with self.db.connect() as conn:
+                hypothesis = conn.execute(
+                    """
+                    SELECT * FROM handoff_hypotheses
+                    WHERE id = ?
+                    """,
+                    (hypothesis_id,),
+                ).fetchone()
+                if hypothesis is None:
+                    raise RuntimeError("Hypothèse introuvable.")
+                session_id = str(hypothesis["session_id"])
+                if hypothesis["status"] != "PENDING":
+                    raise RuntimeError(
+                        "L'hypothèse n'est plus PENDING."
+                    )
+                candidates = json.loads(
+                    hypothesis["candidates_json"] or "[]"
+                )
+                candidate_ids = {
+                    str(candidate["from_tracklet_id"])
+                    for candidate in candidates
+                }
+                if outgoing_tracklet_id not in candidate_ids:
+                    raise RuntimeError(
+                        "Le candidat choisi n'appartient pas à l'hypothèse."
+                    )
+                incoming_tracklet_id = str(
+                    hypothesis["incoming_tracklet_id"]
+                )
+                outgoing = conn.execute(
+                    """
+                    SELECT * FROM tracklets WHERE tracklet_id = ?
+                    """,
+                    (outgoing_tracklet_id,),
+                ).fetchone()
+                incoming = conn.execute(
+                    """
+                    SELECT * FROM tracklets WHERE tracklet_id = ?
+                    """,
+                    (incoming_tracklet_id,),
+                ).fetchone()
+                if outgoing is None or incoming is None:
+                    raise RuntimeError(
+                        "Tracklet entrant ou sortant introuvable."
+                    )
+                if (
+                    str(outgoing["session_id"]) != session_id
+                    or str(incoming["session_id"]) != session_id
+                ):
+                    raise RuntimeError(
+                        "Les tracklets ne partagent pas la session "
+                        "de l'hypothèse."
+                    )
+                if not outgoing["parcel_id"]:
+                    raise RuntimeError(
+                        "Le candidat sortant ne possède aucun colis global."
+                    )
+                parcel_id = str(outgoing["parcel_id"])
+                if incoming["parcel_id"] not in {None, parcel_id}:
+                    raise RuntimeError(
+                        "Le tracklet entrant a déjà été consommé."
+                    )
+                parcel = conn.execute(
+                    """
+                    SELECT * FROM global_parcels WHERE parcel_id = ?
+                    """,
+                    (parcel_id,),
+                ).fetchone()
+                if parcel is None:
+                    raise RuntimeError("Colis global introuvable.")
+                if (
+                    str(parcel["current_tracklet_id"])
+                    != outgoing_tracklet_id
+                ):
+                    raise RuntimeError(
+                        "Le colis global a déjà progressé vers une "
+                        "caméra ultérieure."
+                    )
+                previous_resolutions = conn.execute(
+                    """
+                    SELECT id, resolution_json
+                    FROM handoff_hypotheses
+                    WHERE status = 'RESOLVED' AND id <> ?
+                    """,
+                    (hypothesis_id,),
+                ).fetchall()
+                for previous in previous_resolutions:
+                    payload = json.loads(
+                        previous["resolution_json"] or "{}"
+                    )
+                    if (
+                        str(payload.get("outgoing_tracklet_id") or "")
+                        == outgoing_tracklet_id
+                    ):
+                        raise RuntimeError(
+                            "Le candidat sortant a déjà été consommé "
+                            "par une autre hypothèse."
+                        )
+                edge = next(
+                    (
+                        item
+                        for item in topology_edges
+                        if str(item["from_role"])
+                        == str(outgoing["camera_role"])
+                        and str(item["to_role"])
+                        == str(incoming["camera_role"])
+                    ),
+                    None,
+                )
+                if edge is None:
+                    raise RuntimeError(
+                        "La transition viole la topologie du site."
+                    )
+                transit = float(incoming["started_at_global"]) - float(
+                    outgoing["ended_at_global"]
+                )
+                if (
+                    transit < float(edge["min_transit_s"])
+                    or transit > float(edge["max_transit_s"])
+                ):
+                    raise RuntimeError(
+                        "Les timestamps sont incompatibles avec la "
+                        "fenêtre de transit."
+                    )
+                chain_rows = conn.execute(
+                    """
+                    SELECT tracklet_id, camera_id, camera_role,
+                           started_at_global, ended_at_global
+                    FROM tracklets
+                    WHERE parcel_id = ?
+                    ORDER BY started_at_global, ended_at_global,
+                             tracklet_id
+                    """,
+                    (parcel_id,),
+                ).fetchall()
+                old_chain = [dict(row) for row in chain_rows]
+                if (
+                    not old_chain
+                    or str(old_chain[-1]["tracklet_id"])
+                    != outgoing_tracklet_id
+                ):
+                    raise RuntimeError(
+                        "La chaîne existante ne se termine plus par le "
+                        "candidat choisi."
+                    )
+                for left, right in zip(
+                    old_chain, old_chain[1:], strict=False
+                ):
+                    if float(right["started_at_global"]) < float(
+                        left["ended_at_global"]
+                    ):
+                        raise RuntimeError(
+                            "La chaîne existante contient des timestamps "
+                            "désordonnés."
+                        )
+                duplicate = conn.execute(
+                    """
+                    SELECT tracklet_id FROM tracklets
+                    WHERE parcel_id = ? AND camera_id = ?
+                      AND tracklet_id NOT IN (?, ?)
+                    LIMIT 1
+                    """,
+                    (
+                        parcel_id,
+                        incoming["camera_id"],
+                        outgoing_tracklet_id,
+                        incoming_tracklet_id,
+                    ),
+                ).fetchone()
+                if duplicate is not None:
+                    raise RuntimeError(
+                        "Un autre tracklet possède déjà cette association "
+                        "colis/caméra."
+                    )
+                incoming_chain_row = {
+                    "tracklet_id": incoming_tracklet_id,
+                    "camera_id": str(incoming["camera_id"]),
+                    "camera_role": str(incoming["camera_role"]),
+                    "started_at_global": float(
+                        incoming["started_at_global"]
+                    ),
+                    "ended_at_global": float(
+                        incoming["ended_at_global"]
+                    ),
+                }
+                new_chain = [*old_chain, incoming_chain_row]
+                updated_tracklet = conn.execute(
+                    """
+                    UPDATE tracklets
+                    SET parcel_id = ?, match_result = 'MATCHED'
+                    WHERE tracklet_id = ?
+                      AND (parcel_id IS NULL OR parcel_id = ?)
+                    """,
+                    (parcel_id, incoming_tracklet_id, parcel_id),
+                )
+                if updated_tracklet.rowcount != 1:
+                    raise RuntimeError(
+                        "Le tracklet entrant a été modifié concurremment."
+                    )
+                updated_parcel = conn.execute(
+                    """
+                    UPDATE global_parcels
+                    SET current_tracklet_id = ?, last_camera_id = ?,
+                        last_seen_at = ?
+                    WHERE parcel_id = ? AND current_tracklet_id = ?
+                    """,
+                    (
+                        incoming_tracklet_id,
+                        incoming["camera_id"],
+                        incoming["ended_at_global"],
+                        parcel_id,
+                        outgoing_tracklet_id,
+                    ),
+                )
+                if updated_parcel.rowcount != 1:
+                    raise RuntimeError(
+                        "Le colis global a été modifié concurremment."
+                    )
+                resolution_payload = {
+                    **(resolution or {}),
+                    "actor": actor,
+                    "reason": reason,
+                    "outgoing_tracklet_id": outgoing_tracklet_id,
+                    "parcel_id": parcel_id,
+                }
+                updated_hypothesis = conn.execute(
+                    """
+                    UPDATE handoff_hypotheses
+                    SET status = 'RESOLVED', resolution_json = ?,
+                        updated_at = ?
+                    WHERE id = ? AND status = 'PENDING'
+                    """,
+                    (
+                        json.dumps(resolution_payload),
+                        utc_now(),
+                        hypothesis_id,
+                    ),
+                )
+                if updated_hypothesis.rowcount != 1:
+                    raise RuntimeError(
+                        "L'hypothèse a été modifiée concurremment."
+                    )
+                conn.execute(
+                    """
+                    INSERT INTO handoff_resolution_audit
+                    (id, hypothesis_id, session_id, actor, old_chain_json,
+                     new_chain_json, reason, result, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'RESOLVED', ?)
+                    """,
+                    (
+                        f"handoff-audit-{uuid.uuid4().hex[:12]}",
+                        hypothesis_id,
+                        session_id,
+                        actor,
+                        json.dumps(old_chain),
+                        json.dumps(new_chain),
+                        reason,
+                        utc_now(),
+                    ),
+                )
+            return {
+                "parcel_id": parcel_id,
+                "incoming_tracklet_id": incoming_tracklet_id,
+                "outgoing_tracklet_id": outgoing_tracklet_id,
+                "old_chain": old_chain,
+                "new_chain": new_chain,
+            }
+        except Exception as exc:
+            self.db.execute(
+                """
+                INSERT INTO handoff_resolution_audit
+                (id, hypothesis_id, session_id, actor, old_chain_json,
+                 new_chain_json, reason, result, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'REFUSED', ?)
+                """,
+                (
+                    f"handoff-audit-{uuid.uuid4().hex[:12]}",
+                    hypothesis_id,
+                    session_id,
+                    actor,
+                    json.dumps(old_chain),
+                    json.dumps(new_chain),
+                    f"{reason}: {exc}",
+                    utc_now(),
+                ),
+            )
+            raise
+
+    def list_audit(
+        self, *, hypothesis_id: str | None = None, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        if hypothesis_id is None:
+            rows = self.db.fetch_all(
+                """
+                SELECT * FROM handoff_resolution_audit
+                ORDER BY created_at DESC LIMIT ?
+                """,
+                (limit,),
+            )
+        else:
+            rows = self.db.fetch_all(
+                """
+                SELECT * FROM handoff_resolution_audit
+                WHERE hypothesis_id = ?
+                ORDER BY created_at DESC LIMIT ?
+                """,
+                (hypothesis_id, limit),
+            )
+        return [dict(row) for row in rows]
+
     def reject(
-        self, hypothesis_id: str, *, reason: str = "rejet humain"
+        self,
+        hypothesis_id: str,
+        *,
+        reason: str = "rejet humain",
+        actor: str = "human",
     ) -> None:
-        row = self.get(hypothesis_id)
-        if row is None or row["status"] != "PENDING":
-            raise RuntimeError("Hypothèse de handoff non rejetable.")
-        self.db.execute(
-            """
-            UPDATE handoff_hypotheses
-            SET status = 'REJECTED', resolution_json = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (json.dumps({"reason": reason}), utc_now(), hypothesis_id),
-        )
+        with self.db.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM handoff_hypotheses WHERE id = ?
+                """,
+                (hypothesis_id,),
+            ).fetchone()
+            if row is None or row["status"] != "PENDING":
+                raise RuntimeError("Hypothèse de handoff non rejetable.")
+            candidates = json.loads(row["candidates_json"] or "[]")
+            unchanged_chain = [
+                {
+                    "incoming_tracklet_id": row[
+                        "incoming_tracklet_id"
+                    ],
+                    "candidate_tracklet_ids": [
+                        candidate["from_tracklet_id"]
+                        for candidate in candidates
+                    ],
+                }
+            ]
+            conn.execute(
+                """
+                UPDATE handoff_hypotheses
+                SET status = 'REJECTED', resolution_json = ?, updated_at = ?
+                WHERE id = ? AND status = 'PENDING'
+                """,
+                (
+                    json.dumps({"reason": reason, "actor": actor}),
+                    utc_now(),
+                    hypothesis_id,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO handoff_resolution_audit
+                (id, hypothesis_id, session_id, actor, old_chain_json,
+                 new_chain_json, reason, result, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'REJECTED', ?)
+                """,
+                (
+                    f"handoff-audit-{uuid.uuid4().hex[:12]}",
+                    hypothesis_id,
+                    row["session_id"],
+                    actor,
+                    json.dumps(unchanged_chain),
+                    json.dumps(unchanged_chain),
+                    reason,
+                    utc_now(),
+                ),
+            )
 
     def expire(self, *, now: float | None = None) -> int:
         current = float(now if now is not None else time.time())

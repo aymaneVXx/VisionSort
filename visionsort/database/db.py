@@ -419,6 +419,17 @@ class VisionSortDB:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS handoff_resolution_audit (
+                    id TEXT PRIMARY KEY,
+                    hypothesis_id TEXT NOT NULL,
+                    session_id TEXT,
+                    actor TEXT NOT NULL,
+                    old_chain_json TEXT NOT NULL,
+                    new_chain_json TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    result TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS site_config (
                     id TEXT PRIMARY KEY,
                     config_json TEXT NOT NULL,
@@ -431,6 +442,7 @@ class VisionSortDB:
                 CREATE INDEX IF NOT EXISTS idx_dataset_sessions_session ON dataset_sessions(session_id, dataset_id);
                 CREATE INDEX IF NOT EXISTS idx_pending_handoffs_session ON pending_handoffs(session_id, link_key, received_at);
                 CREATE INDEX IF NOT EXISTS idx_handoff_hypotheses_status ON handoff_hypotheses(status, session_id, expires_at);
+                CREATE INDEX IF NOT EXISTS idx_handoff_resolution_audit_hypothesis ON handoff_resolution_audit(hypothesis_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_recording_frames_lookup ON recording_frames(session_id, source_id, stream_epoch, frame_index);
                 CREATE INDEX IF NOT EXISTS idx_recordings_session_source ON recordings(session_id, source_id, started_at);
                 CREATE INDEX IF NOT EXISTS idx_source_model_assignments_source ON source_model_assignments(source_id, enabled);
@@ -775,6 +787,26 @@ class VisionSortDB:
                     ),
                 )
             conn.execute("PRAGMA user_version = 7")
+
+        if version < 8:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS handoff_resolution_audit (
+                    id TEXT PRIMARY KEY,
+                    hypothesis_id TEXT NOT NULL,
+                    session_id TEXT,
+                    actor TEXT NOT NULL,
+                    old_chain_json TEXT NOT NULL,
+                    new_chain_json TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    result TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_handoff_resolution_audit_hypothesis
+                    ON handoff_resolution_audit(hypothesis_id, created_at);
+                """
+            )
+            conn.execute("PRAGMA user_version = 8")
 
     def fetch_all(self, query: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
         with self.connect() as conn:

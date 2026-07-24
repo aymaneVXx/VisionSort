@@ -977,27 +977,23 @@ class RuntimeSupervisor:
             return
         outgoing_tracklet_id = str(candidate["from_tracklet_id"])
         incoming_tracklet_id = str(hypothesis["incoming_tracklet_id"])
-        parcel_id = self.global_tracker.resolve_ambiguous(
-            incoming_tracklet_id, outgoing_tracklet_id
-        )
-        self.hypothesis_repo.resolve(
-            str(hypothesis["id"]),
-            outgoing_tracklet_id=outgoing_tracklet_id,
-            resolution={
-                "mode": "automatic_later_evidence",
-                "later_tracklet_id": later.tracklet_id,
-                "combined_score": best_score,
-            },
-        )
-        incoming = self.global_tracker.tracklets[incoming_tracklet_id]
-        self.tracking_repo.upsert_tracklet(
-            incoming,
-            parcel_id=parcel_id,
-            match_result=MatchResult.MATCHED.value,
-        )
-        self.tracking_repo.upsert_global_parcel(
-            self.global_tracker.parcels[parcel_id]
-        )
+        try:
+            resolved = self.hypothesis_repo.resolve_transactional(
+                str(hypothesis["id"]),
+                outgoing_tracklet_id=outgoing_tracklet_id,
+                actor="supervisor",
+                topology_edges=edges,
+                reason="preuve tardive automatique",
+                resolution={
+                    "mode": "automatic_later_evidence",
+                    "later_tracklet_id": later.tracklet_id,
+                    "combined_score": best_score,
+                },
+            )
+        except RuntimeError:
+            return
+        parcel_id = str(resolved["parcel_id"])
+        self._sync_resolved_handoff_in_memory(resolved)
         self.event_repo.add_event(
             "handoff_ambiguity_resolved",
             {
@@ -1013,6 +1009,30 @@ class RuntimeSupervisor:
             timestamp_global=later.started_at_global,
         )
 
+    def _sync_resolved_handoff_in_memory(
+        self, resolved: dict[str, Any]
+    ) -> None:
+        incoming_tracklet_id = str(
+            resolved["incoming_tracklet_id"]
+        )
+        parcel_id = str(resolved["parcel_id"])
+        incoming = self.global_tracker.tracklets.get(
+            incoming_tracklet_id
+        )
+        if incoming is not None:
+            self.global_tracker.tracklet_to_parcel[
+                incoming_tracklet_id
+            ] = parcel_id
+        parcel = self.global_tracker.parcels.get(parcel_id)
+        if parcel is not None and incoming is not None:
+            parcel.last_camera_id = incoming.camera_id
+            parcel.last_seen_at = incoming.ended_at_global
+            parcel.current_tracklet_id = incoming_tracklet_id
+            parcel.appearance_signature = (
+                self.global_tracker._appearance(incoming)
+                or parcel.appearance_signature
+            )
+
     def resolve_handoff_hypothesis(
         self,
         hypothesis_id: str,
@@ -1020,66 +1040,19 @@ class RuntimeSupervisor:
         *,
         actor: str = "human",
     ) -> str:
-        hypothesis = self.hypothesis_repo.get(hypothesis_id)
-        if hypothesis is None:
-            raise RuntimeError("Hypothèse introuvable.")
-        incoming_tracklet_id = str(hypothesis["incoming_tracklet_id"])
-        try:
-            parcel_id = self.global_tracker.resolve_ambiguous(
-                incoming_tracklet_id, outgoing_tracklet_id
-            )
-            incoming = self.global_tracker.tracklets[incoming_tracklet_id]
-            self.tracking_repo.upsert_tracklet(
-                incoming,
-                parcel_id=parcel_id,
-                match_result=MatchResult.MATCHED.value,
-            )
-            self.tracking_repo.upsert_global_parcel(
-                self.global_tracker.parcels[parcel_id]
-            )
-        except RuntimeError:
-            outgoing = self.db.fetch_one(
-                "SELECT parcel_id FROM tracklets WHERE tracklet_id = ?",
-                (outgoing_tracklet_id,),
-            )
-            if outgoing is None or not outgoing["parcel_id"]:
-                raise
-            parcel_id = str(outgoing["parcel_id"])
-            incoming_row = self.db.fetch_one(
-                """
-                SELECT camera_id, ended_at_global FROM tracklets
-                WHERE tracklet_id = ?
-                """,
-                (incoming_tracklet_id,),
-            )
-            self.db.execute(
-                """
-                UPDATE tracklets SET parcel_id = ?, match_result = 'MATCHED'
-                WHERE tracklet_id = ?
-                """,
-                (parcel_id, incoming_tracklet_id),
-            )
-            if incoming_row is not None:
-                self.db.execute(
-                    """
-                    UPDATE global_parcels
-                    SET current_tracklet_id = ?, last_camera_id = ?,
-                        last_seen_at = ?
-                    WHERE parcel_id = ?
-                    """,
-                    (
-                        incoming_tracklet_id,
-                        incoming_row["camera_id"],
-                        incoming_row["ended_at_global"],
-                        parcel_id,
-                    ),
-                )
-        self.hypothesis_repo.resolve(
+        edges = self.config.get(
+            "tracking", "site_topology", "edges", default=[]
+        )
+        resolved = self.hypothesis_repo.resolve_transactional(
             hypothesis_id,
             outgoing_tracklet_id=outgoing_tracklet_id,
-            resolution={"mode": "human", "actor": actor},
+            actor=actor,
+            topology_edges=edges,
+            reason="résolution humaine explicite",
+            resolution={"mode": "human"},
         )
-        return parcel_id
+        self._sync_resolved_handoff_in_memory(resolved)
+        return str(resolved["parcel_id"])
 
     def flush_pending_handoffs(
         self, *, force: bool = False, session_id: str | None = None
@@ -1176,6 +1149,11 @@ class RuntimeSupervisor:
                 self.hypothesis_repo.reject(
                     str(payload["hypothesis_id"]),
                     reason=str(payload.get("reason") or "rejet humain"),
+                    actor=str(
+                        payload.get("actor")
+                        or command.get("owner")
+                        or "human"
+                    ),
                 )
                 result_payload = {
                     "hypothesis_id": payload["hypothesis_id"],

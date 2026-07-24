@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import lap
 
 from visionsort.core.config import relative_to_root
 from visionsort.core.enums import MatchResult, ParcelState
@@ -497,6 +498,35 @@ class TrackletBuilder:
         return output
 
 
+def solve_handoff_assignment(
+    score_matrix: np.ndarray, *, minimum_score: float
+) -> tuple[dict[int, int], float]:
+    """Solve the rectangular one-to-one handoff problem with LAPJV."""
+    scores = np.asarray(score_matrix, dtype=np.float64)
+    if scores.ndim != 2:
+        raise ValueError("La matrice de scores doit être bidimensionnelle.")
+    if scores.shape[0] == 0 or scores.shape[1] == 0:
+        return {}, 0.0
+    compatible = np.isfinite(scores) & (scores >= float(minimum_score))
+    costs = np.full(scores.shape, 1_000_000.0, dtype=np.float64)
+    costs[compatible] = 1.0 - scores[compatible]
+    _, row_to_column, _ = lap.lapjv(
+        costs,
+        extend_cost=True,
+        cost_limit=max(0.0, 1.0 - float(minimum_score)) + 1e-12,
+    )
+    assignments = {
+        row: int(column)
+        for row, column in enumerate(row_to_column.tolist())
+        if column >= 0 and compatible[row, int(column)]
+    }
+    total_score = sum(
+        float(scores[row, column])
+        for row, column in assignments.items()
+    )
+    return assignments, total_score
+
+
 class GlobalParcelTracker:
     def __init__(
         self,
@@ -521,12 +551,17 @@ class GlobalParcelTracker:
     def process_tracklets(
         self, incoming_tracklets: list[Tracklet]
     ) -> list[tuple[str, MatchResult, list[str], HandoffCandidate | None]]:
-        """Associate a batch with a conservative global one-to-one assignment."""
-        results: list[tuple[str, MatchResult, list[str], HandoffCandidate | None] | None] = [
-            None
-        ] * len(incoming_tracklets)
+        """Associate a batch through a conservative global LAP assignment."""
+        results: list[
+            tuple[
+                str,
+                MatchResult,
+                list[str],
+                HandoffCandidate | None,
+            ]
+            | None
+        ] = [None] * len(incoming_tracklets)
         candidates_by_incoming: dict[int, list[HandoffCandidate]] = {}
-        candidates_by_outgoing: dict[str, list[tuple[int, HandoffCandidate]]] = {}
 
         for incoming_index, incoming in enumerate(incoming_tracklets):
             candidates: list[HandoffCandidate] = []
@@ -538,46 +573,88 @@ class GlobalParcelTracker:
                 if candidate is None:
                     continue
                 candidates.append(candidate)
-                candidates_by_outgoing.setdefault(outgoing.tracklet_id, []).append(
-                    (incoming_index, candidate)
-                )
             candidates.sort(key=lambda item: item.score, reverse=True)
             candidates_by_incoming[incoming_index] = candidates
             self.last_candidate_sets[incoming.tracklet_id] = list(candidates)
 
-        ambiguous: set[int] = set()
-        for incoming_index, candidates in candidates_by_incoming.items():
-            viable = [item for item in candidates if item.score >= self.minimum_score]
-            if len(viable) > 1 and viable[0].score - viable[1].score < self.ambiguity_margin:
-                ambiguous.add(incoming_index)
-        for outgoing_candidates in candidates_by_outgoing.values():
-            viable = sorted(
-                (
-                    (incoming_index, candidate)
-                    for incoming_index, candidate in outgoing_candidates
-                    if candidate.score >= self.minimum_score
-                ),
-                key=lambda item: item[1].score,
-                reverse=True,
-            )
-            if len(viable) > 1 and viable[0][1].score - viable[1][1].score < self.ambiguity_margin:
-                ambiguous.update((viable[0][0], viable[1][0]))
-
-        proposals = sorted(
-            (
-                (candidate.score, incoming_index, candidate)
-                for incoming_index, candidates in candidates_by_incoming.items()
+        outgoing_ids = sorted(
+            {
+                candidate.from_tracklet_id
+                for candidates in candidates_by_incoming.values()
                 for candidate in candidates
-                if candidate.score >= self.minimum_score and incoming_index not in ambiguous
-            ),
-            reverse=True,
-            key=lambda item: item[0],
+            }
         )
-        assigned_incoming: set[int] = set()
-        assigned_outgoing: set[str] = set()
-        for _, incoming_index, candidate in proposals:
-            if incoming_index in assigned_incoming or candidate.from_tracklet_id in assigned_outgoing:
+        outgoing_index = {
+            tracklet_id: index
+            for index, tracklet_id in enumerate(outgoing_ids)
+        }
+        score_matrix = np.full(
+            (len(incoming_tracklets), len(outgoing_ids)),
+            -np.inf,
+            dtype=np.float64,
+        )
+        candidate_lookup: dict[tuple[int, int], HandoffCandidate] = {}
+        for incoming_index, candidates in candidates_by_incoming.items():
+            for candidate in candidates:
+                column = outgoing_index[candidate.from_tracklet_id]
+                score_matrix[incoming_index, column] = candidate.score
+                candidate_lookup[(incoming_index, column)] = candidate
+        assignments, optimal_total = solve_handoff_assignment(
+            score_matrix, minimum_score=self.minimum_score
+        )
+
+        ambiguous: set[int] = set()
+        for incoming_index, column in assignments.items():
+            selected_score = float(
+                score_matrix[incoming_index, column]
+            )
+            row_alternatives = [
+                float(score_matrix[incoming_index, other_column])
+                for other_column in range(len(outgoing_ids))
+                if other_column != column
+                and score_matrix[incoming_index, other_column]
+                >= self.minimum_score
+            ]
+            if (
+                row_alternatives
+                and abs(selected_score - max(row_alternatives))
+                < self.ambiguity_margin
+            ):
+                ambiguous.add(incoming_index)
+            for other_incoming in range(len(incoming_tracklets)):
+                if (
+                    other_incoming == incoming_index
+                    or score_matrix[other_incoming, column]
+                    < self.minimum_score
+                ):
+                    continue
+                competitor_score = float(
+                    score_matrix[other_incoming, column]
+                )
+                if (
+                    abs(selected_score - competitor_score)
+                    < self.ambiguity_margin
+                ):
+                    ambiguous.update(
+                        (incoming_index, other_incoming)
+                    )
+            alternative_scores = score_matrix.copy()
+            alternative_scores[incoming_index, column] = -np.inf
+            _, alternative_total = solve_handoff_assignment(
+                alternative_scores,
+                minimum_score=self.minimum_score,
+            )
+            if (
+                optimal_total - alternative_total
+                < self.ambiguity_margin
+            ):
+                ambiguous.add(incoming_index)
+
+        matched_score_by_outgoing: dict[str, float] = {}
+        for incoming_index, column in sorted(assignments.items()):
+            if incoming_index in ambiguous:
                 continue
+            candidate = candidate_lookup[(incoming_index, column)]
             incoming = incoming_tracklets[incoming_index]
             parcel_id = self.tracklet_to_parcel[candidate.from_tracklet_id]
             parcel = self.parcels[parcel_id]
@@ -594,20 +671,37 @@ class GlobalParcelTracker:
                 candidate.reasons,
                 candidate,
             )
-            assigned_incoming.add(incoming_index)
-            assigned_outgoing.add(candidate.from_tracklet_id)
+            matched_score_by_outgoing[
+                candidate.from_tracklet_id
+            ] = candidate.score
 
         for incoming_index, incoming in enumerate(incoming_tracklets):
             if results[incoming_index] is not None:
                 continue
             candidates = candidates_by_incoming.get(incoming_index, [])
             viable = [item for item in candidates if item.score >= self.minimum_score]
-            if incoming_index in ambiguous or viable and any(
-                item.from_tracklet_id in assigned_outgoing for item in viable
-            ):
-                best = viable[0] if viable else candidates[0]
+            close_conflict = any(
+                candidate.from_tracklet_id in matched_score_by_outgoing
+                and abs(
+                    matched_score_by_outgoing[
+                        candidate.from_tracklet_id
+                    ]
+                    - candidate.score
+                )
+                < self.ambiguity_margin
+                for candidate in viable
+            )
+            if incoming_index in ambiguous or close_conflict:
+                assigned_column = assignments.get(incoming_index)
+                best = (
+                    candidate_lookup[(incoming_index, assigned_column)]
+                    if assigned_column is not None
+                    else viable[0]
+                )
                 best.result = MatchResult.AMBIGUOUS
-                reasons = best.reasons + ["association concurrente ou scores trop proches"]
+                reasons = best.reasons + [
+                    "solutions LAP concurrentes ou scores trop proches"
+                ]
                 results[incoming_index] = ("", MatchResult.AMBIGUOUS, reasons, best)
                 self.tracklets[incoming.tracklet_id] = incoming
                 continue
