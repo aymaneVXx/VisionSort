@@ -135,6 +135,7 @@ class VisionSortDB:
                     site_validated INTEGER NOT NULL DEFAULT 0,
                     config_json TEXT NOT NULL DEFAULT '{}',
                     report_path TEXT,
+                    media_report_json TEXT NOT NULL DEFAULT '{}',
                     last_dataset_id TEXT,
                     last_training_job_id TEXT,
                     last_candidate_model_id TEXT,
@@ -150,6 +151,11 @@ class VisionSortDB:
                     camera_role TEXT NOT NULL,
                     time_offset_ms REAL NOT NULL DEFAULT 0,
                     replay_fps REAL,
+                    source_type_snapshot TEXT,
+                    source_uri_snapshot TEXT,
+                    source_sha256 TEXT,
+                    archive_required INTEGER NOT NULL DEFAULT 0,
+                    model_pipeline_json TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -164,6 +170,20 @@ class VisionSortDB:
                     recording_enabled INTEGER NOT NULL DEFAULT 0,
                     metrics_json TEXT NOT NULL DEFAULT '{}',
                     updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS source_model_assignments (
+                    id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL,
+                    pipeline_role TEXT NOT NULL,
+                    task TEXT NOT NULL,
+                    model_id TEXT,
+                    use_active INTEGER NOT NULL DEFAULT 1,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(source_id, pipeline_role),
+                    FOREIGN KEY (source_id) REFERENCES sources(id),
+                    FOREIGN KEY (model_id) REFERENCES model_registry(id)
                 );
                 CREATE TABLE IF NOT EXISTS commands (
                     id TEXT PRIMARY KEY,
@@ -251,12 +271,53 @@ class VisionSortDB:
                     id TEXT PRIMARY KEY,
                     source_id TEXT NOT NULL,
                     session_id TEXT,
+                    camera_role TEXT,
+                    stream_epoch INTEGER,
+                    segment_index INTEGER,
                     segment_path TEXT NOT NULL,
                     started_at REAL NOT NULL,
                     ended_at REAL NOT NULL,
                     frame_count INTEGER NOT NULL,
                     size_bytes INTEGER NOT NULL DEFAULT 0,
+                    fps REAL,
+                    codec TEXT,
+                    sha256 TEXT,
+                    corrupted INTEGER NOT NULL DEFAULT 0,
+                    immutable INTEGER NOT NULL DEFAULT 1,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS recording_frames (
+                    id TEXT PRIMARY KEY,
+                    recording_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    camera_role TEXT NOT NULL,
+                    stream_epoch INTEGER NOT NULL DEFAULT 0,
+                    frame_index INTEGER NOT NULL,
+                    timestamp_local REAL NOT NULL,
+                    timestamp_global REAL NOT NULL,
+                    segment_frame_index INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(session_id, source_id, stream_epoch, frame_index),
+                    FOREIGN KEY (recording_id) REFERENCES recordings(id)
+                );
+                CREATE TABLE IF NOT EXISTS session_media_coverage (
+                    session_id TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    archive_required INTEGER NOT NULL DEFAULT 0,
+                    frames_acquired INTEGER NOT NULL DEFAULT 0,
+                    frames_processed INTEGER NOT NULL DEFAULT 0,
+                    frames_archived INTEGER NOT NULL DEFAULT 0,
+                    frames_unarchived INTEGER NOT NULL DEFAULT 0,
+                    segments_produced INTEGER NOT NULL DEFAULT 0,
+                    segments_corrupted INTEGER NOT NULL DEFAULT 0,
+                    bytes_used INTEGER NOT NULL DEFAULT 0,
+                    coverage_ratio REAL NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    details_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (session_id, source_id)
                 );
                 CREATE TABLE IF NOT EXISTS datasets (
                     id TEXT PRIMARY KEY,
@@ -358,6 +419,17 @@ class VisionSortDB:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS handoff_resolution_audit (
+                    id TEXT PRIMARY KEY,
+                    hypothesis_id TEXT NOT NULL,
+                    session_id TEXT,
+                    actor TEXT NOT NULL,
+                    old_chain_json TEXT NOT NULL,
+                    new_chain_json TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    result TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS site_config (
                     id TEXT PRIMARY KEY,
                     config_json TEXT NOT NULL,
@@ -370,6 +442,12 @@ class VisionSortDB:
                 CREATE INDEX IF NOT EXISTS idx_dataset_sessions_session ON dataset_sessions(session_id, dataset_id);
                 CREATE INDEX IF NOT EXISTS idx_pending_handoffs_session ON pending_handoffs(session_id, link_key, received_at);
                 CREATE INDEX IF NOT EXISTS idx_handoff_hypotheses_status ON handoff_hypotheses(status, session_id, expires_at);
+                CREATE INDEX IF NOT EXISTS idx_handoff_resolution_audit_hypothesis ON handoff_resolution_audit(hypothesis_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_recording_frames_lookup ON recording_frames(session_id, source_id, stream_epoch, frame_index);
+                CREATE INDEX IF NOT EXISTS idx_recordings_session_source ON recordings(session_id, source_id, started_at);
+                CREATE INDEX IF NOT EXISTS idx_source_model_assignments_source ON source_model_assignments(source_id, enabled);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_model_active_task
+                    ON model_registry(task) WHERE is_active = 1;
                 """
             )
             self._migrate(conn)
@@ -553,6 +631,182 @@ class VisionSortDB:
                 "CREATE INDEX IF NOT EXISTS idx_handoff_hypotheses_status ON handoff_hypotheses(status, session_id, expires_at)"
             )
             conn.execute("PRAGMA user_version = 5")
+
+        if version < 6:
+            add_column(
+                "capture_sessions",
+                "media_report_json TEXT NOT NULL DEFAULT '{}'",
+            )
+            add_column("capture_session_sources", "source_type_snapshot TEXT")
+            add_column("capture_session_sources", "source_uri_snapshot TEXT")
+            add_column("capture_session_sources", "source_sha256 TEXT")
+            add_column(
+                "capture_session_sources",
+                "archive_required INTEGER NOT NULL DEFAULT 0",
+            )
+            add_column("recordings", "camera_role TEXT")
+            add_column("recordings", "stream_epoch INTEGER")
+            add_column("recordings", "segment_index INTEGER")
+            add_column("recordings", "fps REAL")
+            add_column("recordings", "codec TEXT")
+            add_column("recordings", "sha256 TEXT")
+            add_column(
+                "recordings", "corrupted INTEGER NOT NULL DEFAULT 0"
+            )
+            add_column(
+                "recordings", "immutable INTEGER NOT NULL DEFAULT 1"
+            )
+            add_column(
+                "recordings", "metadata_json TEXT NOT NULL DEFAULT '{}'"
+            )
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS recording_frames (
+                    id TEXT PRIMARY KEY,
+                    recording_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    camera_role TEXT NOT NULL,
+                    stream_epoch INTEGER NOT NULL DEFAULT 0,
+                    frame_index INTEGER NOT NULL,
+                    timestamp_local REAL NOT NULL,
+                    timestamp_global REAL NOT NULL,
+                    segment_frame_index INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(session_id, source_id, stream_epoch, frame_index),
+                    FOREIGN KEY (recording_id) REFERENCES recordings(id)
+                );
+                CREATE TABLE IF NOT EXISTS session_media_coverage (
+                    session_id TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    archive_required INTEGER NOT NULL DEFAULT 0,
+                    frames_acquired INTEGER NOT NULL DEFAULT 0,
+                    frames_processed INTEGER NOT NULL DEFAULT 0,
+                    frames_archived INTEGER NOT NULL DEFAULT 0,
+                    frames_unarchived INTEGER NOT NULL DEFAULT 0,
+                    segments_produced INTEGER NOT NULL DEFAULT 0,
+                    segments_corrupted INTEGER NOT NULL DEFAULT 0,
+                    bytes_used INTEGER NOT NULL DEFAULT 0,
+                    coverage_ratio REAL NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    details_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (session_id, source_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_recording_frames_lookup
+                    ON recording_frames(
+                        session_id, source_id, stream_epoch, frame_index
+                    );
+                CREATE INDEX IF NOT EXISTS idx_recordings_session_source
+                    ON recordings(session_id, source_id, started_at);
+                """
+            )
+            conn.execute(
+                """
+                UPDATE capture_session_sources
+                SET source_type_snapshot = COALESCE(
+                        source_type_snapshot,
+                        (SELECT source_type FROM sources
+                         WHERE sources.id = capture_session_sources.source_id)
+                    ),
+                    source_uri_snapshot = COALESCE(
+                        source_uri_snapshot,
+                        (SELECT uri FROM sources
+                         WHERE sources.id = capture_session_sources.source_id)
+                    )
+                """
+            )
+            conn.execute(
+                """
+                UPDATE capture_session_sources
+                SET archive_required = CASE
+                    WHEN source_type_snapshot IN ('RTSP', 'VIDEO_FILE') THEN 1
+                    ELSE archive_required
+                END
+                """
+            )
+            conn.execute("PRAGMA user_version = 6")
+
+        if version < 7:
+            add_column(
+                "capture_session_sources",
+                "model_pipeline_json TEXT NOT NULL DEFAULT '[]'",
+            )
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS source_model_assignments (
+                    id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL,
+                    pipeline_role TEXT NOT NULL,
+                    task TEXT NOT NULL,
+                    model_id TEXT,
+                    use_active INTEGER NOT NULL DEFAULT 1,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(source_id, pipeline_role),
+                    FOREIGN KEY (source_id) REFERENCES sources(id),
+                    FOREIGN KEY (model_id) REFERENCES model_registry(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_source_model_assignments_source
+                    ON source_model_assignments(source_id, enabled);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_model_active_task
+                    ON model_registry(task) WHERE is_active = 1;
+                """
+            )
+            now = utc_now()
+            legacy_sources = conn.execute(
+                """
+                SELECT s.id AS source_id, s.model_id, m.task
+                FROM sources s
+                LEFT JOIN model_registry m ON m.id = s.model_id
+                """
+            ).fetchall()
+            for source in legacy_sources:
+                task = str(source["task"] or ModelTask.DETECTION.value)
+                role = {
+                    ModelTask.DETECTION.value: "parcel_detection",
+                    ModelTask.SEGMENTATION.value: "parcel_segmentation",
+                    ModelTask.POSE.value: "operator_pose",
+                }.get(task, task)
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO source_model_assignments
+                    (id, source_id, pipeline_role, task, model_id,
+                     use_active, enabled, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?)
+                    """,
+                    (
+                        f"legacy-{source['source_id']}-{role}",
+                        source["source_id"],
+                        role,
+                        task,
+                        source["model_id"],
+                        now,
+                        now,
+                    ),
+                )
+            conn.execute("PRAGMA user_version = 7")
+
+        if version < 8:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS handoff_resolution_audit (
+                    id TEXT PRIMARY KEY,
+                    hypothesis_id TEXT NOT NULL,
+                    session_id TEXT,
+                    actor TEXT NOT NULL,
+                    old_chain_json TEXT NOT NULL,
+                    new_chain_json TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    result TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_handoff_resolution_audit_hypothesis
+                    ON handoff_resolution_audit(hypothesis_id, created_at);
+                """
+            )
+            conn.execute("PRAGMA user_version = 8")
 
     def fetch_all(self, query: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
         with self.connect() as conn:

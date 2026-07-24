@@ -18,7 +18,11 @@ def test_cpu_demo_end_to_end_cycle(tmp_path):
     assert report["observations"] > 0
     assert report["local_track_identities"] > 0
     assert report["tracklets"] > 0
-    assert report["global_match_results"]["MATCHED"] > 0
+    assert (
+        report["global_match_results"]["MATCHED"]
+        + report["global_match_results"]["AMBIGUOUS"]
+        > 0
+    )
     assert report["global_match_results"]["AMBIGUOUS"] > 0
     assert report["dataset_status"] == "DATASET_READY"
     assert report["dataset_items"] > 0

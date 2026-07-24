@@ -2,7 +2,10 @@ import json
 from pathlib import Path
 
 from visionsort.database.db import VisionSortDB, utc_now
-from visionsort.database.repositories import ControlRepository
+from visionsort.database.repositories import (
+    ArtifactRepository,
+    ControlRepository,
+)
 from visionsort.core.paths import OBSERVATIONS_DIR
 from visionsort.runtime.demo_assets import ensure_demo_assets
 from visionsort.runtime.pipeline_worker import pipeline_worker_loop
@@ -206,9 +209,19 @@ def test_pipeline_finalize_becomes_dataset_ready_after_review(tmp_path):
 
     item = db.fetch_one("SELECT * FROM dataset_items WHERE dataset_id = ? LIMIT 1", (dataset_id,))
     assert item is not None
-    db.execute(
-        "UPDATE dataset_items SET annotation_status = ? WHERE id = ?",
-        ("HUMAN_VALIDATED", item["id"]),
+    label_path = Path(str(item["label_path"]))
+    if not label_path.is_absolute():
+        from visionsort.core.paths import ROOT_DIR
+
+        label_path = ROOT_DIR / label_path
+    parcel_line = next(
+        line
+        for line in label_path.read_text(encoding="utf-8").splitlines()
+        if line.startswith("0 ")
+    )
+    label_path.write_text(parcel_line + "\n", encoding="utf-8")
+    ArtifactRepository(db).update_dataset_item(
+        str(item["id"]), annotation_status="HUMAN_VALIDATED"
     )
 
     pipeline_worker_loop(str(db_path), session_id, "FINALIZE_DATASET", {"dataset_id": dataset_id})

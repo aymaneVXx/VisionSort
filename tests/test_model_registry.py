@@ -1,8 +1,15 @@
 import json
 
+import cv2
+import numpy as np
+
 from visionsort.core.enums import ModelStatus, PipelineState
 from visionsort.database.db import VisionSortDB, utc_now
 from visionsort.deployment.registry import promote_model, rollback_to_previous_active, set_model_status
+from visionsort.datasets.pipeline import (
+    compute_dataset_fingerprint,
+    rewrite_training_manifest,
+)
 
 
 def test_promote_and_rollback_model_registry(tmp_path):
@@ -23,6 +30,57 @@ def test_promote_and_rollback_model_registry(tmp_path):
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         ("ds-a", "Dataset A", "data/datasets/ds-a", "DATASET_READY", "manifest.csv", "data.yaml", '{"session_id":"session-a"}', now, now),
+    )
+    root = tmp_path / "dataset-a"
+    root.mkdir()
+    image = root / "image.jpg"
+    label = root / "label.txt"
+    manifest = root / "manifest.csv"
+    data_yaml = root / "data.yaml"
+    cv2.imwrite(
+        str(image), np.zeros((32, 32, 3), dtype=np.uint8)
+    )
+    label.write_text("0 0.5 0.5 0.2 0.2\n", encoding="utf-8")
+    data_yaml.write_text(
+        "path: .\ntrain: images/train\nval: images/val\n"
+        "test: images/test\ntask: detection\nnames:\n  0: parcel\n",
+        encoding="utf-8",
+    )
+    db.execute(
+        """
+        UPDATE datasets SET root_path = ?, manifest_path = ?,
+                            data_yaml_path = ?
+        WHERE id = 'ds-a'
+        """,
+        (str(root), str(manifest), str(data_yaml)),
+    )
+    db.execute(
+        """
+        INSERT INTO dataset_sessions
+        (dataset_id, session_id, split, created_at)
+        VALUES ('ds-a', 'session-a', 'train', ?)
+        """,
+        (now,),
+    )
+    db.execute(
+        """
+        INSERT INTO dataset_items
+        (id, dataset_id, session_id, sample_group_id, split, source_id,
+         camera_role, frame_index, timestamp_global, image_path, label_path,
+         annotation_status, reason, score, metadata_json, created_at)
+        VALUES ('item-a', 'ds-a', 'session-a', 'group-a', 'train',
+                'source-a', 'C1', 1, 1.0, ?, ?, 'HUMAN_VALIDATED',
+                'ready', 1.0, '{"instance_count":1}', ?)
+        """,
+        (str(image), str(label), now),
+    )
+    rewrite_training_manifest(db, "ds-a", manifest)
+    db.execute(
+        """
+        UPDATE datasets SET dataset_fingerprint = ?
+        WHERE id = 'ds-a'
+        """,
+        (compute_dataset_fingerprint(db, "ds-a"),),
     )
     db.execute(
         """

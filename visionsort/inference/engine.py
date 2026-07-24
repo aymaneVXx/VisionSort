@@ -225,6 +225,7 @@ class SharedInferenceEngine:
             raise RuntimeError(f"Backend de modèle non supporté: {backend}")
         return built, {
             "model_id": model_id,
+            "task": str(row["task"]),
             "backend": backend,
             "model_version": (
                 str(resolved_path) if resolved_path is not None else model_id
@@ -244,6 +245,13 @@ class SharedInferenceEngine:
             obs.model_version = self.model_version
         return output
 
+    def sync_sources(
+        self, source_map: dict[str, dict[str, Any]]
+    ) -> None:
+        if isinstance(self.backend, DemoDetectionBackend):
+            for camera_id, source in source_map.items():
+                self.backend.register_sidecar(camera_id, source["uri"])
+
 
 def inference_worker_loop(
     request_queue,
@@ -254,8 +262,9 @@ def inference_worker_loop(
 ) -> None:
     db = VisionSortDB(Path(db_path))
     config = AppConfig(values=config_values)
-    engine = SharedInferenceEngine(db, config)
-    loaded_model_id: str | None = None
+    engines: dict[str, SharedInferenceEngine] = {}
+    load_counts: dict[str, int] = {}
+    inference_metrics: dict[str, dict[str, float | int]] = {}
     source_map: dict[str, dict[str, Any]] = {}
     while not stop_event.is_set():
         try:
@@ -265,39 +274,102 @@ def inference_worker_loop(
         kind = message.get("kind")
         if kind == "SYNC_SOURCES":
             source_map = message["source_map"]
+            for engine in engines.values():
+                engine.sync_sources(source_map)
         elif kind == "LOAD_MODEL":
-            model_id = message["model_id"]
+            model_id = str(message["model_id"])
             started = time.perf_counter()
             try:
-                if model_id != loaded_model_id:
-                    engine.load_model(model_id, source_map)
-                    loaded_model_id = model_id
+                if model_id not in engines or bool(message.get("reload")):
+                    previous_engine = engines.get(model_id)
+                    replacement = SharedInferenceEngine(db, config)
+                    replacement.load_model(model_id, source_map)
+                    engines[model_id] = replacement
+                    if previous_engine is not None:
+                        del previous_engine
+                        release_model_memory()
+                    load_counts[model_id] = (
+                        int(load_counts.get(model_id, 0)) + 1
+                    )
+                engine = engines[model_id]
                 result_queue.put(
                     {
                         "kind": "MODEL_READY",
                         "model_id": model_id,
+                        "task": engine.backend_info.get("task"),
                         "backend_info": engine.backend_info,
                         "duration_seconds": time.perf_counter() - started,
+                        "load_count": load_counts[model_id],
+                        "loaded_model_ids": sorted(engines),
                     }
                 )
             except Exception as exc:
-                loaded_model_id = engine.model_id
                 result_queue.put(
                     {
                         "kind": "MODEL_LOAD_FAILED",
                         "model_id": model_id,
-                        "active_model_id": engine.model_id,
+                        "task": message.get("task"),
+                        "active_model_id": (
+                            engines[model_id].model_id
+                            if model_id in engines
+                            else None
+                        ),
                         "error": str(exc),
                         "duration_seconds": time.perf_counter() - started,
-                        "rollback_succeeded": engine.model_id is not None,
+                        "rollback_succeeded": model_id in engines,
+                        "loaded_model_ids": sorted(engines),
                     }
                 )
+        elif kind == "UNLOAD_MODEL":
+            model_id = str(message["model_id"])
+            engines.pop(model_id, None)
+            release_model_memory()
+            result_queue.put(
+                {
+                    "kind": "MODEL_UNLOADED",
+                    "model_id": model_id,
+                    "loaded_model_ids": sorted(engines),
+                }
+            )
         elif kind == "INFER":
+            model_id = str(
+                message.get("model_id") or next(iter(engines), "")
+            )
+            task = str(message.get("task") or "")
+            started = time.perf_counter()
             try:
+                if model_id not in engines:
+                    raise RuntimeError(
+                        f"Modèle non chargé pour l'inférence: {model_id}"
+                    )
+                engine = engines[model_id]
+                if not task:
+                    task = str(engine.backend_info.get("task") or "")
+                observations = engine.predict(
+                    message["camera_id"],
+                    message["frame_index"],
+                    message["image"],
+                )
+                elapsed = time.perf_counter() - started
+                metrics = inference_metrics.setdefault(
+                    model_id,
+                    {
+                        "requests": 0,
+                        "errors": 0,
+                        "total_duration_seconds": 0.0,
+                    },
+                )
+                metrics["requests"] = int(metrics["requests"]) + 1
+                metrics["total_duration_seconds"] = (
+                    float(metrics["total_duration_seconds"]) + elapsed
+                )
                 result_queue.put(
                     {
                         "kind": "INFER_RESULT",
                         "request_id": message["request_id"],
+                        "model_id": model_id,
+                        "task": task,
+                        "pipeline_role": message.get("pipeline_role"),
                         "session_id": message["session_id"],
                         "source_id": message["source_id"],
                         "camera_id": message["camera_id"],
@@ -308,21 +380,30 @@ def inference_worker_loop(
                         "timestamp_global": message["timestamp_global"],
                         "created_at": message["created_at"],
                         "expires_at": message["expires_at"],
+                        "duration_seconds": elapsed,
+                        "model_metrics": dict(metrics),
                         "observations": [
-                            asdict(obs)
-                            for obs in engine.predict(
-                                message["camera_id"],
-                                message["frame_index"],
-                                message["image"],
-                            )
+                            asdict(obs) for obs in observations
                         ],
                     }
                 )
             except Exception as exc:  # pragma: no cover - runtime
+                metrics = inference_metrics.setdefault(
+                    model_id,
+                    {
+                        "requests": 0,
+                        "errors": 0,
+                        "total_duration_seconds": 0.0,
+                    },
+                )
+                metrics["errors"] = int(metrics["errors"]) + 1
                 result_queue.put(
                     {
                         "kind": "INFER_ERROR",
                         "request_id": message.get("request_id"),
+                        "model_id": model_id,
+                        "task": task,
+                        "pipeline_role": message.get("pipeline_role"),
                         "session_id": message.get("session_id"),
                         "source_id": message.get("source_id"),
                         "camera_id": message["camera_id"],
@@ -330,6 +411,7 @@ def inference_worker_loop(
                         "frame_index": message["frame_index"],
                         "created_at": message.get("created_at"),
                         "expires_at": message.get("expires_at"),
+                        "model_metrics": dict(metrics),
                         "error": str(exc),
                     }
                 )

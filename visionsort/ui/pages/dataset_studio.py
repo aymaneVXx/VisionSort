@@ -11,6 +11,7 @@ from visionsort.annotations import (
     import_review_annotations,
     render_review_overlay,
 )
+from visionsort.annotations.validators import PoseLabelValidator
 from visionsort.core.enums import AnnotationStatus, CommandType
 from visionsort.core.paths import ROOT_DIR
 from visionsort.database.repositories import ArtifactRepository
@@ -176,6 +177,25 @@ def render(context: UIContext) -> None:
     )
     if ds.get("manifest_path"):
         st.caption(f"Manifest: `{ds['manifest_path']}`")
+    integrity = summary.get("integrity_report") or {}
+    if integrity:
+        message = (
+            f"Intégrité: {integrity.get('checked_items', 0)} item(s) "
+            f"contrôlé(s), tâche `{integrity.get('task')}`."
+        )
+        if integrity.get("valid"):
+            st.success(message)
+        else:
+            st.error(message)
+            with st.expander(
+                "Raisons empêchant DATASET_READY", expanded=True
+            ):
+                for error in integrity.get("errors") or []:
+                    st.write(f"- {error}")
+                if integrity.get("report_path"):
+                    st.caption(
+                        f"Rapport: `{integrity['report_path']}`"
+                    )
 
     needs_review = [it for it in items if it.get("annotation_status") == AnnotationStatus.NEEDS_REVIEW.value]
     st.subheader(f"Review ({len(needs_review)} NEEDS_REVIEW)")
@@ -254,14 +274,20 @@ def render(context: UIContext) -> None:
     if uploaded is not None and st.button(
         "Importer et valider humainement", key=f"import-{ds['id']}"
     ):
-        result = import_review_annotations(
-            context.db,
-            ArtifactRepository(context.db),
-            dataset_id=ds["id"],
-            content=uploaded.getvalue(),
-            filename=uploaded.name,
-        )
-        st.success(f"{result['updated_items']} item(s) réimporté(s).")
+        try:
+            result = import_review_annotations(
+                context.db,
+                ArtifactRepository(context.db),
+                dataset_id=ds["id"],
+                content=uploaded.getvalue(),
+                filename=uploaded.name,
+            )
+        except RuntimeError as exc:
+            st.error(str(exc))
+        else:
+            st.success(
+                f"{result['updated_items']} item(s) réimporté(s)."
+            )
 
     position = int(
         st.number_input(
@@ -310,8 +336,33 @@ def render(context: UIContext) -> None:
                 "provenance": details["provenance"],
             }
         )
+        pose_report = None
+        if str(ds.get("task")) == "pose":
+            label_path = item.get("label_path")
+            if label_path:
+                pose_report = PoseLabelValidator(
+                    str(ds.get("data_yaml_path") or "")
+                ).validate(str(label_path))
+            if pose_report is None or not pose_report.valid:
+                st.error("Validation Pose impossible pour cet item.")
+                for error in (
+                    pose_report.errors
+                    if pose_report is not None
+                    else ["Aucun fichier label Pose."]
+                ):
+                    st.caption(error)
         actions = st.columns(2)
-        if actions[0].button("Valider humainement", key=f"accept-{item['id']}"):
+        if actions[0].button(
+            "Valider humainement",
+            key=f"accept-{item['id']}",
+            disabled=bool(
+                pose_report is not None and not pose_report.valid
+            )
+            or (
+                str(ds.get("task")) == "pose"
+                and pose_report is None
+            ),
+        ):
             context.repo.enqueue_command(
                 CommandType.UPDATE_DATASET_ITEM,
                 {

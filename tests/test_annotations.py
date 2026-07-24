@@ -19,7 +19,10 @@ from visionsort.annotations.review import (
     render_review_overlay,
 )
 from visionsort.database.db import VisionSortDB, utc_now
-from visionsort.database.repositories import ArtifactRepository
+from visionsort.database.repositories import (
+    ArtifactRepository,
+    ControlRepository,
+)
 
 
 def test_task_specific_annotators_emit_yolo_formats(tmp_path):
@@ -55,7 +58,8 @@ def test_task_specific_annotators_emit_yolo_formats(tmp_path):
         {
             "class_name": "person",
             "bbox": [0, 0, 20, 40],
-            "keypoints": [[10, 20, 0.9], [15, 25, 0.1]],
+            "keypoints": [[10, 20, 0.9]] * 16
+            + [[15, 25, 0.1]],
         },
         names,
         100,
@@ -63,6 +67,103 @@ def test_task_specific_annotators_emit_yolo_formats(tmp_path):
     )
     assert pose_line is not None
     assert pose_line.endswith("0.150000 0.250000 1")
+
+
+def test_demo_annotator_uses_captured_dataset_observations_after_uri_change(
+    tmp_path,
+):
+    db = VisionSortDB(tmp_path / "captured-observations.db")
+    db.initialize()
+    source_path = tmp_path / "current-uri.mp4"
+    source_path.with_suffix(".jsonl").write_text(
+        json.dumps(
+            {
+                "frame_index": 7,
+                "class_name": "parcel",
+                "confidence": 0.5,
+                "bbox": [20, 20, 30, 30],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    ControlRepository(db).upsert_source(
+        {
+            "id": "source-changed",
+            "name": "Changed source",
+            "role": "C1",
+            "source_type": "VIDEO_FILE",
+            "uri": str(source_path),
+            "model_id": "demo_synth_det",
+            "tracker_id": "greedy_iou",
+            "enabled": True,
+        }
+    )
+    db.execute(
+        """
+        INSERT INTO datasets
+        (id, name, root_path, task, status, summary_json,
+         generation_config_json, created_at, updated_at)
+        VALUES ('dataset-archive', 'Archive', 'dataset-archive',
+                'detection', 'SAMPLED', '{}', '{}', ?, ?)
+        """,
+        (utc_now(), utc_now()),
+    )
+    ArtifactRepository(db).add_dataset_item(
+        dataset_id="dataset-archive",
+        session_id=None,
+        sample_group_id="group-1",
+        split="train",
+        source_id="source-changed",
+        camera_role="C1",
+        frame_index=7,
+        timestamp_global=10.0,
+        image_path="unused.jpg",
+        label_path=None,
+        annotation_status="NEEDS_REVIEW",
+        reason="test",
+        score=1.0,
+        metadata={
+            "observations": [
+                {
+                    "class_name": "parcel",
+                    "confidence": 0.96,
+                    "bbox": [1, 2, 10, 12],
+                    "model_id": "demo_synth_det",
+                    "extra": {"_stream_epoch": 0},
+                }
+            ]
+        },
+    )
+
+    annotator = DetectionAutoAnnotator(
+        db,
+        {
+            "id": "demo_synth_det",
+            "backend": "demo",
+            "weights_path": "",
+            "task": "detection",
+        },
+        config={"dataset_id": "dataset-archive"},
+    )
+
+    detections = annotator.predict(
+        source_id="source-changed",
+        frame_index=7,
+        image_path=tmp_path / "unused.jpg",
+    )
+    assert detections == [
+        {
+            "class_name": "parcel",
+            "confidence": 0.96,
+            "bbox": [1, 2, 10, 12],
+            "mask": None,
+            "keypoints": None,
+            "embedding": None,
+            "model_id": "demo_synth_det",
+            "attributes": {"_stream_epoch": 0},
+        }
+    ]
 
 
 def test_ultralytics_model_is_loaded_once_for_multiple_images(tmp_path, monkeypatch):
@@ -268,6 +369,18 @@ def test_visual_review_overlay_export_and_reimport(tmp_path):
     db.initialize()
     now = utc_now()
     dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    (dataset_root / "data.yaml").write_text(
+        "path: .\n"
+        "train: images/train\n"
+        "val: images/val\n"
+        "test: images/test\n"
+        "task: detection\n"
+        "names:\n"
+        "  0: parcel\n"
+        "  1: person\n",
+        encoding="utf-8",
+    )
     db.execute(
         """
         INSERT INTO datasets

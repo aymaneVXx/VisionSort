@@ -53,6 +53,14 @@ jobs:
           --report data/runtime/reports/supervisor-e2e.json
           --max-frames 72
 
+      - name: RuntimeSupervisor multi-model end-to-end scenario
+        if: matrix.python-version == '3.12'
+        run: >-
+          python -m visionsort.runtime.multimodel_e2e
+          --db data/runtime/ci-multimodel-e2e.db
+          --report data/runtime/reports/multimodel-e2e.json
+          --max-frames 24
+
       - name: Upload E2E reports
         if: always() && matrix.python-version == '3.12'
         uses: actions/upload-artifact@v4
@@ -61,4 +69,5 @@ jobs:
           path: |
             data/runtime/reports/ci-e2e.json
             data/runtime/reports/supervisor-e2e.json
+            data/runtime/reports/multimodel-e2e.json
           if-no-files-found: warn

@@ -18,6 +18,7 @@ from visionsort.datasets.pipeline import (
     validate_dataset_splits,
     verify_dataset_fingerprint,
 )
+from visionsort.datasets.integrity import DatasetIntegrityValidator
 from visionsort.inference.engine import DemoDetectionBackend, resolve_model_artifact
 from visionsort.runtime.demo_assets import ensure_demo_assets
 
@@ -47,9 +48,16 @@ def _json_dict(text: str | None) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _build_comparison(db: VisionSortDB, metrics: dict[str, Any]) -> dict[str, Any]:
+def _build_comparison(
+    db: VisionSortDB, metrics: dict[str, Any], *, task: str
+) -> dict[str, Any]:
     active = db.fetch_one(
-        "SELECT id, metrics_json FROM model_registry WHERE is_active = 1 ORDER BY updated_at DESC LIMIT 1"
+        """
+        SELECT id, metrics_json FROM model_registry
+        WHERE is_active = 1 AND task = ?
+        ORDER BY updated_at DESC LIMIT 1
+        """,
+        (task,),
     )
     if active is None:
         return {
@@ -331,6 +339,14 @@ def _resolve_best_pt(results: Any, job_id: str) -> Path:
 
 
 def _validate_training_dataset(db: VisionSortDB, dataset_id: str) -> None:
+    strict_integrity = DatasetIntegrityValidator(
+        db, dataset_id
+    ).validate()
+    if not strict_integrity["valid"]:
+        raise RuntimeError(
+            "Entraînement refusé: intégrité stricte invalide. "
+            + " ".join(strict_integrity["errors"][:5])
+        )
     fingerprint = verify_dataset_fingerprint(db, dataset_id)
     if not fingerprint["valid"]:
         raise RuntimeError(
@@ -612,7 +628,9 @@ def training_worker_loop(
             },
             "test": test_metrics,
             "benchmark": benchmark,
-            "comparison": _build_comparison(db, metrics),
+            "comparison": _build_comparison(
+                db, metrics, task=str(model_row["task"])
+            ),
             "promotion_criteria": criteria,
             "promotion_eligible": promotion_eligible,
             "promotion_failures": promotion_failures,

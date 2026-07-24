@@ -1,4 +1,5 @@
 from dataclasses import asdict
+import json
 
 from visionsort.core.config import AppConfig, DEFAULT_CONFIG
 from visionsort.core.types import Tracklet
@@ -163,6 +164,13 @@ def test_ambiguous_handoff_is_persisted_and_human_resolvable(tmp_path):
     assert resolved is not None and resolved["status"] == "RESOLVED"
     assert incoming is not None and incoming["parcel_id"] == parcel_id
     assert incoming["match_result"] == "MATCHED"
+    audit = supervisor.hypothesis_repo.list_audit(
+        hypothesis_id=hypotheses[0]["id"]
+    )
+    assert len(audit) == 1
+    assert audit[0]["actor"] == "pytest"
+    assert audit[0]["result"] == "RESOLVED"
+    assert len(json.loads(audit[0]["new_chain_json"])) == 2
 
 
 def test_later_camera_evidence_can_resolve_pending_ambiguity(tmp_path):

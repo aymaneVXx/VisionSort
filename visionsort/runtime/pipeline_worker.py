@@ -24,6 +24,7 @@ from visionsort.datasets.pipeline import (
     rewrite_training_manifest,
     validate_dataset_splits,
 )
+from visionsort.datasets.integrity import DatasetIntegrityValidator
 from visionsort.observations.export import jsonl_to_parquet
 
 def _load_json_dict(text: str | None) -> dict[str, Any]:
@@ -82,8 +83,6 @@ def _finalize_dataset_status(
         db, dataset_id, manifest_path
     )
     split_integrity = validate_dataset_splits(db, dataset_id)
-    if not split_integrity["valid"]:
-        raise RuntimeError(f"Fuite entre splits: {split_integrity['leaks']}")
     summary["split_integrity"] = split_integrity
     summary["trainable_manifest_rows"] = trainable_manifest_rows
     linked_sessions = [
@@ -118,12 +117,19 @@ def _finalize_dataset_status(
             )
     summary["task_artifacts_ready"] = task_artifacts_ready
     summary["task_readiness_reason"] = task_readiness_reason
+    integrity_report = DatasetIntegrityValidator(
+        db, dataset_id
+    ).validate()
+    summary["integrity_report"] = integrity_report
+    summary["integrity_report_path"] = integrity_report["report_path"]
+    summary["dataset_ready_blockers"] = integrity_report["errors"]
     status = (
         "REVIEW_PENDING"
         if needs_review > 0
         or trainable <= 0
         or (real_dataset and not split_complete)
         or not task_artifacts_ready
+        or not integrity_report["valid"]
         else "DATASET_READY"
     )
     pipeline_state = (
@@ -172,6 +178,7 @@ def _finalize_dataset_status(
         "real_split_ready": split_complete,
         "task_artifacts_ready": task_artifacts_ready,
         "task_readiness_reason": task_readiness_reason,
+        "integrity_report": integrity_report,
     }
 
 
@@ -395,7 +402,16 @@ def pipeline_worker_loop(db_path: str, session_id: str, step: str, params: dict[
                     task=annotator.task,
                 )
                 meta = json.loads(item.get("metadata_json") or "{}")
-                expected_count = int(meta.get("instance_count") or 0)
+                expected_count = sum(
+                    1
+                    for observation in meta.get("observations") or []
+                    if str(observation.get("class_name") or "") in names
+                )
+                if not meta.get("observations"):
+                    expected_count = int(
+                        meta.get("instance_count") or 0
+                    )
+                meta["expected_label_count"] = expected_count
                 stats["expected_visible_instances"] = expected_count
                 stats["frame_annotation_complete"] = count >= expected_count
                 if (

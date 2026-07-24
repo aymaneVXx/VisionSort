@@ -17,11 +17,29 @@ VisionSort est une plateforme locale Python + Streamlit pour piloter un cycle co
 - SQLite stocke uniquement commandes, sessions, états, jobs, événements, tracklets, datasets, modèles et trackers.
 - Les images, previews, enregistrements, observations détaillées et rapports restent sur disque.
 - Les observations détaillées sont stockées en `JSONL`, avec export `Parquet` possible via un step pipeline dédié.
-- L’inférence est conçue autour d’un worker partagé par modèle sélectionné.
+- L’inférence utilise un scheduler central et un cache partagé par `model_id`;
+  une source peut combiner les rôles colis et pose.
 - Chaque caméra conserve son tracker local indépendant.
 - `bytetrack_cpu` et `botsort_cpu` utilisent les implémentations natives Ultralytics; `greedy_iou` reste une option de démonstration explicite.
 - L'acquisition utilise un buffer borné `latest frame wins` et ne bloque plus sur le temps d'inférence.
 - Le mode simulé est explicite: aucun résultat démo ne doit être utilisé silencieusement hors `DEMO_MODE=1`.
+
+### Relations SQLite ajoutées
+
+- `recordings` représente les segments immuables d’une session et
+  `recording_frames` indexe précisément chaque
+  `(session_id, source_id, stream_epoch, frame_index)`.
+- `session_media_coverage` conserve le bilan d’archivage par source.
+- `source_model_assignments` relie une source à ses pipelines
+  `parcel_detection`, `parcel_segmentation` et `operator_pose`;
+  `capture_session_sources.model_pipeline_json` en garde le snapshot.
+- `model_registry.is_active` est unique par tâche, et non plus global.
+- `handoff_hypotheses` conserve les ambiguïtés;
+  `handoff_resolution_audit` journalise chaque résolution ou refus avec
+  l’ancienne et la nouvelle chaîne.
+
+Les migrations incrémentales SQLite v6, v7 et v8 ajoutent ces structures
+sans recréer les bases existantes.
 
 ## Modules Principaux
 
@@ -29,7 +47,8 @@ VisionSort est une plateforme locale Python + Streamlit pour piloter un cycle co
 - `visionsort/runtime/supervisor.py` : supervisor persistant et gestion des commandes
 - `visionsort/runtime/pipeline_worker.py` : steps pipeline (`PROCESS_SESSION`, `SAMPLE`, `AUTO_ANNOTATE`, `FINALIZE_DATASET`, `EXPORT_OBSERVATIONS_PARQUET`)
 - `visionsort/runtime/e2e.py` : validation CPU complète avec backends simulés explicitement
-- `visionsort/runtime/supervisor_e2e.py` : validation multiprocessus via commandes SQLite et `RuntimeSupervisor`
+- `visionsort/runtime/supervisor_e2e.py` : validation multiprocessus de l'archive immuable, du dataset et du déploiement
+- `visionsort/runtime/multimodel_e2e.py` : validation multiprocessus des pipelines parcelle + pose et du rechargement sélectif
 - `visionsort/acquisition/worker.py` : boucle caméra/source, previews, enregistrement, observations JSONL
 - `visionsort/inference/engine.py` : backends de modèles et provenance modèle/version
 - `visionsort/tracking/engine.py` : trackers locaux, tracklets, matching multicaméra
@@ -213,8 +232,20 @@ $env:DEMO_MODE="1"
 python -m visionsort.runtime.supervisor_e2e --db data/runtime/supervisor-e2e.db --report data/runtime/reports/supervisor-e2e.json
 ```
 
-Il enregistre les Replay par commandes SQLite, exécute trois sessions isolées
-pour les splits train/val/test, pilote sampling, annotation, entraînement,
-promotion et activation, puis vérifie le modèle actif dans une nouvelle
-session. La CI exécute installation, compilation et tests sous Python 3.10 et
-3.12; les deux scénarios E2E sont lancés sous Python 3.12.
+Il enregistre des `VideoFileSource` en segments immuables, exécute trois
+sessions isolées pour les splits train/val/test, modifie ensuite les URI
+courantes, puis vérifie que sampling, validation stricte, fingerprint,
+entraînement, promotion et activation utilisent encore l'archive de capture.
+
+Scénario end-to-end multi-modèle via le superviseur :
+
+```powershell
+$env:DEMO_MODE="1"
+python -m visionsort.runtime.multimodel_e2e --db data/runtime/multimodel-e2e.db --report data/runtime/reports/multimodel-e2e.json
+```
+
+Il vérifie une source parcelle seule, une source parcelle + pose, la
+consommation des 17 keypoints par le moteur d'événements et l'activation d'une
+nouvelle version pose sans recharger ni désactiver le modèle parcelle. La CI
+exécute installation, compilation et tests sous Python 3.10 et 3.12; les trois
+scénarios E2E sont lancés sous Python 3.12.

@@ -12,6 +12,7 @@ from visionsort.annotations.review import (
     import_review_annotations,
     render_review_overlay,
 )
+from visionsort.annotations.validators import PoseLabelValidator
 
 __all__ = [
     "DetectionAutoAnnotator",
@@ -24,4 +25,5 @@ __all__ = [
     "render_review_overlay",
     "export_review_cases",
     "import_review_annotations",
+    "PoseLabelValidator",
 ]

@@ -15,7 +15,8 @@ import numpy as np
 from visionsort.core.config import AppConfig, DEFAULT_CONFIG
 from visionsort.core.enums import CommandStatus, CommandType
 from visionsort.core.paths import REPORTS_DIR, ROOT_DIR
-from visionsort.database.db import VisionSortDB
+from visionsort.database.db import VisionSortDB, utc_now
+from visionsort.datasets.pipeline import verify_dataset_fingerprint
 from visionsort.runtime.demo_assets import ensure_demo_assets
 from visionsort.runtime.supervisor import RuntimeSupervisor
 
@@ -327,6 +328,7 @@ def run_supervisor_e2e(
     config_values["app"]["demo_mode"] = True
     config_values["runtime"]["poll_interval_seconds"] = 0.05
     config_values["runtime"]["max_inference_queue"] = 32
+    config_values["runtime"]["recording_segment_seconds"] = 1
     config_values["tracking"]["handoff_window_seconds"] = 0.10
     config_values["tracking"]["handoff_expiry_seconds"] = 5.0
     supervisor = RuntimeSupervisor(
@@ -348,7 +350,7 @@ def run_supervisor_e2e(
                         "id": source_id,
                         "name": f"Supervisor E2E {split} {role}",
                         "role": role,
-                        "source_type": "REPLAY",
+                        "source_type": "VIDEO_FILE",
                         "uri": variants[split][role],
                         "model_id": "demo_synth_det",
                         "tracker_id": "greedy_iou",
@@ -379,6 +381,51 @@ def run_supervisor_e2e(
                 replay_fps=replay_fps,
             )
 
+        archive_reports = {
+            split: _json_dict(
+                (
+                    supervisor.control_repo.get_capture_session(session_id)
+                    or {}
+                ).get("media_report_json")
+            )
+            for split, session_id in sessions.items()
+        }
+        if not all(
+            report.get("valid") is True
+            for report in archive_reports.values()
+        ):
+            raise RuntimeError(
+                f"Archive de session incomplète: {archive_reports}"
+            )
+        archive_counts = dict(
+            supervisor.db.fetch_one(
+                """
+                SELECT
+                    COUNT(DISTINCT r.id) AS segments,
+                    COUNT(rf.id) AS frames
+                FROM recordings r
+                LEFT JOIN recording_frames rf ON rf.recording_id = r.id
+                WHERE r.session_id IN (?, ?, ?)
+                """,
+                tuple(sessions.values()),
+            )
+            or {}
+        )
+        if (
+            int(archive_counts.get("segments") or 0) <= 0
+            or int(archive_counts.get("frames") or 0) <= 0
+        ):
+            raise RuntimeError(
+                f"Aucun média archivé exploitable: {archive_counts}"
+            )
+        changed_uri = str(asset_dir / "source-uri-changed-after-capture.mp4")
+        for split_sources in source_ids_by_split.values():
+            for source_id in split_sources.values():
+                supervisor.db.execute(
+                    "UPDATE sources SET uri = ?, updated_at = ? WHERE id = ?",
+                    (changed_uri, utc_now(), source_id),
+                )
+
         anchor_session = sessions["train"]
         _execute_command(
             supervisor,
@@ -407,6 +454,31 @@ def run_supervisor_e2e(
         dataset_id = str(session_row.get("last_dataset_id") or "")
         if not dataset_id:
             raise RuntimeError("SAMPLE n'a pas lié de dataset à la session.")
+        archive_dataset_items = [
+            dict(row)
+            for row in supervisor.db.fetch_all(
+                """
+                SELECT image_path, metadata_json FROM dataset_items
+                WHERE dataset_id = ?
+                """,
+                (dataset_id,),
+            )
+        ]
+        archive_provenance_verified = bool(archive_dataset_items) and all(
+            (
+                json.loads(item["metadata_json"])
+                .get("media_provenance", {})
+                .get("origin")
+                == "session_archive"
+            )
+            and (ROOT_DIR / str(item["image_path"])).is_file()
+            for item in archive_dataset_items
+        )
+        if not archive_provenance_verified:
+            raise RuntimeError(
+                "Le dataset n'a pas été reconstruit intégralement depuis "
+                "l'archive immuable."
+            )
 
         _execute_command(
             supervisor,
@@ -455,9 +527,21 @@ def run_supervisor_e2e(
             raise RuntimeError("Le dataset multi-session n'est pas DATASET_READY.")
         dataset_summary = _json_dict(dataset["summary_json"])
         split_integrity = dataset_summary.get("split_integrity") or {}
+        strict_integrity = dataset_summary.get("integrity_report") or {}
         if not split_integrity.get("all_splits_nonempty"):
             raise RuntimeError(
                 f"Les splits réels sont incomplets: {split_integrity}"
+            )
+        if strict_integrity.get("valid") is not True:
+            raise RuntimeError(
+                f"Intégrité stricte invalide: {strict_integrity}"
+            )
+        fingerprint_verification = verify_dataset_fingerprint(
+            supervisor.db, dataset_id
+        )
+        if fingerprint_verification["valid"] is not True:
+            raise RuntimeError(
+                f"Fingerprint non vérifiable: {fingerprint_verification}"
             )
 
         _execute_command(
@@ -633,7 +717,14 @@ def run_supervisor_e2e(
             "dataset_id": dataset_id,
             "dataset_status": dataset["status"],
             "dataset_fingerprint": dataset["dataset_fingerprint"],
+            "dataset_fingerprint_verified": fingerprint_verification["valid"],
+            "dataset_integrity": strict_integrity,
             "split_integrity": split_integrity,
+            "archive_reports": archive_reports,
+            "archive_segments": int(archive_counts.get("segments") or 0),
+            "archive_frames": int(archive_counts.get("frames") or 0),
+            "source_uri_changed_after_capture": True,
+            "archive_provenance_verified": archive_provenance_verified,
             "training_job_id": training_job_id,
             "training_status": training_job["status"],
             "candidate_model_id": candidate_id,

@@ -34,9 +34,19 @@ def render(context: UIContext) -> None:
         st.info("Aucun modèle en base.")
         return
 
-    active_model = next((row for row in models if int(row.get("is_active") or 0) == 1), None)
-    if active_model:
-        st.caption(f"Modèle actif: `{active_model['id']}` | statut `{active_model['status']}`")
+    active_models = {
+        str(row["task"]): row
+        for row in models
+        if int(row.get("is_active") or 0) == 1
+    }
+    if active_models:
+        st.caption(
+            "Modèles actifs par tâche: "
+            + " | ".join(
+                f"`{task}` → `{row['id']}`"
+                for task, row in sorted(active_models.items())
+            )
+        )
 
     for row in models:
         notes = _load_json(row.get("notes_json"))
@@ -64,6 +74,7 @@ def render(context: UIContext) -> None:
                 )
             comparison = metrics.get("comparison") or {}
             benchmark = metrics.get("benchmark") or {}
+            active_model = active_models.get(str(row["task"]))
             if active_model and active_model["id"] != row["id"]:
                 active_metrics = _load_json(active_model.get("metrics_json"))
                 deltas = {
@@ -98,6 +109,12 @@ def render(context: UIContext) -> None:
             if cols[3].button("Archiver", key=f"archive-{row['id']}", disabled=not can_archive):
                 context.repo.enqueue_command(CommandType.ARCHIVE_MODEL, {"model_id": row["id"]})
     st.divider()
+    rollback_task = st.selectbox(
+        "Tâche à restaurer",
+        sorted({str(row["task"]) for row in models}),
+    )
     if st.button("Rollback vers précédent actif", type="secondary"):
-        context.repo.enqueue_command(CommandType.ROLLBACK_MODEL, {})
+        context.repo.enqueue_command(
+            CommandType.ROLLBACK_MODEL, {"task": rollback_task}
+        )
     st.dataframe(pd.DataFrame(models), use_container_width=True)
