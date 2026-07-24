@@ -99,6 +99,7 @@ class RuntimeSupervisor:
         self.pipeline_processes: dict[str, mp.Process] = {}
         self.active_model_id: str | None = None
         self.loaded_model_ids: set[str] = set()
+        self.model_load_counts: dict[str, int] = {}
         self.active_model_ids_by_task: dict[str, str] = {
             str(row["task"]): str(row["id"])
             for row in self.db.fetch_all(
@@ -1353,6 +1354,10 @@ class RuntimeSupervisor:
                 return
             if message["kind"] == "MODEL_READY":
                 model_id = str(message["model_id"])
+                if hasattr(self, "model_load_counts"):
+                    self.model_load_counts[model_id] = int(
+                        message.get("load_count") or 0
+                    )
                 self.inference_result_store[
                     f"__model_ready__:{model_id}"
                 ] = message

@@ -34,6 +34,7 @@ class BaseAutoAnnotator:
         self.model = None
         self.demo_by_source: dict[str, dict[int, list[dict[str, Any]]]] = {}
         if self.backend == "demo":
+            self._load_demo_dataset_observations()
             self._load_demo_sidecars()
         elif self.backend == "ultralytics":
             os.environ.setdefault(
@@ -49,17 +50,63 @@ class BaseAutoAnnotator:
         else:
             raise RuntimeError(f"Backend d'annotation non supporté: {self.backend}")
 
+    def _load_demo_dataset_observations(self) -> None:
+        dataset_id = str(self.config.get("dataset_id") or "")
+        if not dataset_id:
+            return
+        for row in self.db.fetch_all(
+            """
+            SELECT source_id, frame_index, metadata_json
+            FROM dataset_items WHERE dataset_id = ?
+            ORDER BY source_id, frame_index
+            """,
+            (dataset_id,),
+        ):
+            source_id = str(row["source_id"] or "")
+            if not source_id:
+                continue
+            metadata = json.loads(row["metadata_json"] or "{}")
+            detections: list[dict[str, Any]] = []
+            for observation in metadata.get("observations") or []:
+                extra = dict(observation.get("extra") or {})
+                detections.append(
+                    {
+                        "class_name": observation["class_name"],
+                        "confidence": float(
+                            observation.get("confidence", 1.0)
+                        ),
+                        "bbox": list(observation["bbox"]),
+                        "mask": observation.get("mask")
+                        or extra.get("mask"),
+                        "keypoints": observation.get("keypoints")
+                        or extra.get("keypoints"),
+                        "embedding": observation.get("embedding")
+                        or observation.get("appearance_hint"),
+                        "model_id": observation.get("model_id"),
+                        "attributes": extra,
+                    }
+                )
+            self.demo_by_source.setdefault(source_id, {})[
+                int(row["frame_index"] or 0)
+            ] = detections
+
     def _load_demo_sidecars(self) -> None:
         for source in self.db.fetch_all("SELECT id, uri FROM sources"):
             sidecar = Path(str(source["uri"])).with_suffix(".jsonl")
-            frames: dict[int, list[dict[str, Any]]] = {}
+            frames = self.demo_by_source.setdefault(
+                str(source["id"]), {}
+            )
+            sidecar_frames: dict[int, list[dict[str, Any]]] = {}
             if sidecar.exists():
                 for line in sidecar.read_text(encoding="utf-8").splitlines():
                     if not line.strip():
                         continue
                     item = json.loads(line)
-                    frames.setdefault(int(item["frame_index"]), []).append(item)
-            self.demo_by_source[str(source["id"])] = frames
+                    sidecar_frames.setdefault(
+                        int(item["frame_index"]), []
+                    ).append(item)
+            for frame_index, detections in sidecar_frames.items():
+                frames.setdefault(frame_index, detections)
 
     def predict(
         self, *, source_id: str, frame_index: int, image_path: Path

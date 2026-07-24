@@ -22,6 +22,12 @@ def test_full_lifecycle_through_runtime_supervisor(tmp_path):
     assert report["mode"] == "SUPERVISOR_PROCESS_E2E"
     assert report["tracklets"] > 0
     assert report["dataset_status"] == "DATASET_READY"
+    assert report["archive_segments"] > 0
+    assert report["archive_frames"] > 0
+    assert report["source_uri_changed_after_capture"] is True
+    assert report["archive_provenance_verified"] is True
+    assert report["dataset_integrity"]["valid"] is True
+    assert report["dataset_fingerprint_verified"] is True
     assert report["split_integrity"]["all_splits_nonempty"] is True
     assert report["training_status"] == "COMPLETED"
     assert report["active_model_id"] == report["candidate_model_id"]

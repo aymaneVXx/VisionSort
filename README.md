@@ -47,7 +47,8 @@ sans recréer les bases existantes.
 - `visionsort/runtime/supervisor.py` : supervisor persistant et gestion des commandes
 - `visionsort/runtime/pipeline_worker.py` : steps pipeline (`PROCESS_SESSION`, `SAMPLE`, `AUTO_ANNOTATE`, `FINALIZE_DATASET`, `EXPORT_OBSERVATIONS_PARQUET`)
 - `visionsort/runtime/e2e.py` : validation CPU complète avec backends simulés explicitement
-- `visionsort/runtime/supervisor_e2e.py` : validation multiprocessus via commandes SQLite et `RuntimeSupervisor`
+- `visionsort/runtime/supervisor_e2e.py` : validation multiprocessus de l'archive immuable, du dataset et du déploiement
+- `visionsort/runtime/multimodel_e2e.py` : validation multiprocessus des pipelines parcelle + pose et du rechargement sélectif
 - `visionsort/acquisition/worker.py` : boucle caméra/source, previews, enregistrement, observations JSONL
 - `visionsort/inference/engine.py` : backends de modèles et provenance modèle/version
 - `visionsort/tracking/engine.py` : trackers locaux, tracklets, matching multicaméra
@@ -231,8 +232,20 @@ $env:DEMO_MODE="1"
 python -m visionsort.runtime.supervisor_e2e --db data/runtime/supervisor-e2e.db --report data/runtime/reports/supervisor-e2e.json
 ```
 
-Il enregistre les Replay par commandes SQLite, exécute trois sessions isolées
-pour les splits train/val/test, pilote sampling, annotation, entraînement,
-promotion et activation, puis vérifie le modèle actif dans une nouvelle
-session. La CI exécute installation, compilation et tests sous Python 3.10 et
-3.12; les deux scénarios E2E sont lancés sous Python 3.12.
+Il enregistre des `VideoFileSource` en segments immuables, exécute trois
+sessions isolées pour les splits train/val/test, modifie ensuite les URI
+courantes, puis vérifie que sampling, validation stricte, fingerprint,
+entraînement, promotion et activation utilisent encore l'archive de capture.
+
+Scénario end-to-end multi-modèle via le superviseur :
+
+```powershell
+$env:DEMO_MODE="1"
+python -m visionsort.runtime.multimodel_e2e --db data/runtime/multimodel-e2e.db --report data/runtime/reports/multimodel-e2e.json
+```
+
+Il vérifie une source parcelle seule, une source parcelle + pose, la
+consommation des 17 keypoints par le moteur d'événements et l'activation d'une
+nouvelle version pose sans recharger ni désactiver le modèle parcelle. La CI
+exécute installation, compilation et tests sous Python 3.10 et 3.12; les trois
+scénarios E2E sont lancés sous Python 3.12.

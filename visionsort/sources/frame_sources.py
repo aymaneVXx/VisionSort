@@ -100,6 +100,8 @@ class VideoFileSource(OpenCVSourceBase):
         ok, image = self._read_raw()
         if not ok:
             return None
+        if self.settings.replay_fps > 0:
+            time.sleep(max(0.0, 1.0 / self.settings.replay_fps))
         return self._build_frame(image)
 
 
