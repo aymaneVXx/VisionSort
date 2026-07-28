@@ -8,7 +8,13 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from visionsort.core.enums import CommandStatus, CommandType, MatchResult, SourceStatus
+from visionsort.core.enums import (
+    CommandStatus,
+    CommandType,
+    JobType,
+    MatchResult,
+    SourceStatus,
+)
 from visionsort.core.types import GlobalParcel, Tracklet
 from visionsort.database.db import VisionSortDB, utc_now
 
@@ -402,6 +408,52 @@ class ControlRepository:
 
     def list_models(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self.db.fetch_all("SELECT * FROM model_registry ORDER BY created_at DESC")]
+
+    def list_model_activation_history(
+        self,
+        *,
+        task: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        if task is None:
+            rows = self.db.fetch_all(
+                """
+                SELECT * FROM model_activation_history
+                ORDER BY activated_at DESC LIMIT ?
+                """,
+                (int(limit),),
+            )
+        else:
+            rows = self.db.fetch_all(
+                """
+                SELECT * FROM model_activation_history
+                WHERE task = ?
+                ORDER BY activated_at DESC LIMIT ?
+                """,
+                (str(task), int(limit)),
+            )
+        return [dict(row) for row in rows]
+
+    def get_runtime_model_state(self) -> dict[str, Any]:
+        row = self.db.fetch_one(
+            """
+            SELECT status, info_json, updated_at
+            FROM job_runs
+            WHERE id = ?
+            """,
+            (f"{JobType.GPU_INFERENCE.value}:shared",),
+        )
+        if row is None:
+            return {}
+        try:
+            info = json.loads(row["info_json"] or "{}")
+        except json.JSONDecodeError:
+            info = {}
+        return {
+            "job_status": str(row["status"]),
+            "updated_at": str(row["updated_at"]),
+            **(info if isinstance(info, dict) else {}),
+        }
 
     def list_trackers(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self.db.fetch_all("SELECT * FROM tracker_registry ORDER BY id ASC")]

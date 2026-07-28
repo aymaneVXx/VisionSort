@@ -26,6 +26,35 @@ def _metric_text(value, digits: int = 3) -> str:
     return "UNAVAILABLE" if value is None else f"{float(value):.{digits}f}"
 
 
+def _history_frame(rows: list[dict]) -> pd.DataFrame:
+    formatted: list[dict] = []
+    for row in rows:
+        metadata = _load_json(row.get("metadata_json"))
+        steps = metadata.get("switch_steps") or {}
+        formatted.append(
+            {
+                "date": row.get("completed_at")
+                or row.get("activated_at"),
+                "tâche": row.get("task"),
+                "ancien": row.get("previous_model_id") or "-",
+                "nouveau": row.get("activated_model_id"),
+                "génération": row.get("routing_generation"),
+                "statut": row.get("status"),
+                "runtime appliqué": bool(
+                    row.get("runtime_applied")
+                ),
+                "acteur": row.get("actor"),
+                "raison": row.get("reason"),
+                "étapes": " | ".join(
+                    f"{name}={status}"
+                    for name, status in steps.items()
+                ),
+                "erreur": row.get("error_text") or "",
+            }
+        )
+    return pd.DataFrame(formatted)
+
+
 def render(context: UIContext) -> None:
     page_header("Models", "Registre local, comparaison, promotion et rollback")
     demo_warning(context)
@@ -33,6 +62,105 @@ def render(context: UIContext) -> None:
     if not models:
         st.info("Aucun modèle en base.")
         return
+
+    runtime_state = context.repo.get_runtime_model_state()
+    consistency = runtime_state.get("consistency") or {}
+    st.subheader("Cohérence registre / runtime")
+    if not runtime_state:
+        st.warning(
+            "Le supervisor n'a pas encore publié son état runtime."
+        )
+    elif consistency.get("consistent"):
+        st.success(
+            "Le registre, le routage en mémoire et les modèles chargés "
+            "sont cohérents."
+        )
+    else:
+        st.error(
+            "Incohérence détectée: "
+            + " | ".join(
+                consistency.get("errors")
+                or ["état runtime incomplet"]
+            )
+        )
+    task_states = consistency.get("tasks") or []
+    if task_states:
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "tâche": row.get("task"),
+                        "actif en base": row.get(
+                            "registry_model_id"
+                        ),
+                        "actif runtime": row.get(
+                            "runtime_model_id"
+                        ),
+                        "génération": row.get(
+                            "routing_generation"
+                        ),
+                        "chargé": row.get("loaded"),
+                        "références": row.get("references"),
+                        "in-flight": row.get("inflight"),
+                        "cohérent": row.get("consistent"),
+                    }
+                    for row in task_states
+                ]
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+    for warning in consistency.get("warnings") or []:
+        st.warning(str(warning))
+    unload_errors = consistency.get("unload_errors") or {}
+    if unload_errors:
+        st.error(
+            "Échecs de déchargement: "
+            + " | ".join(
+                f"{model_id}: {error}"
+                for model_id, error in unload_errors.items()
+            )
+        )
+    with st.expander("Détails des références runtime"):
+        st.json(
+            {
+                "modèles chargés": consistency.get(
+                    "loaded_model_ids", []
+                ),
+                "références": consistency.get(
+                    "references_by_model", {}
+                ),
+                "in-flight": consistency.get(
+                    "inflight_by_model", {}
+                ),
+                "dernière publication": runtime_state.get(
+                    "published_at"
+                )
+                or runtime_state.get("updated_at"),
+            }
+        )
+
+    history = context.repo.list_model_activation_history(limit=100)
+    if history:
+        latest = history[0]
+        latest_metadata = _load_json(latest.get("metadata_json"))
+        st.caption(
+            "Dernière bascule: "
+            f"`{latest.get('task')}` "
+            f"`{latest.get('previous_model_id') or '-'}` → "
+            f"`{latest.get('activated_model_id')}` | "
+            f"statut `{latest.get('status')}` | "
+            f"génération `{latest.get('routing_generation')}`"
+        )
+        steps = latest_metadata.get("switch_steps") or {}
+        if steps:
+            st.caption(
+                "Progression: "
+                + " → ".join(
+                    f"{name}: {status}"
+                    for name, status in steps.items()
+                )
+            )
 
     active_models = {
         str(row["task"]): row
@@ -116,5 +244,12 @@ def render(context: UIContext) -> None:
     if st.button("Rollback vers précédent actif", type="secondary"):
         context.repo.enqueue_command(
             CommandType.ROLLBACK_MODEL, {"task": rollback_task}
+        )
+    if history:
+        st.subheader("Historique des activations et rollbacks")
+        st.dataframe(
+            _history_frame(history),
+            use_container_width=True,
+            hide_index=True,
         )
     st.dataframe(pd.DataFrame(models), use_container_width=True)
