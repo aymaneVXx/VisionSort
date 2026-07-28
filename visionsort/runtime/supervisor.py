@@ -102,6 +102,9 @@ class RuntimeSupervisor:
         self.active_model_id: str | None = None
         self.loaded_model_ids: set[str] = set()
         self.model_load_counts: dict[str, int] = {}
+        self.rollback_model_holds: set[str] = set()
+        self.last_model_unload_error: dict[str, str] = {}
+        self.inference_runtime_snapshot: dict[str, Any] = {}
         self.active_model_ids_by_task: dict[str, str] = {
             str(row["task"]): str(row["id"])
             for row in self.db.fetch_all(
@@ -377,6 +380,243 @@ class RuntimeSupervisor:
             self.active_model_id = str(model_id)
         return route
 
+    def model_references(self, model_id: str) -> dict[str, Any]:
+        model_id = str(model_id)
+        route_tasks = [
+            str(task)
+            for task in set(
+                list(
+                    getattr(
+                        self, "active_model_ids_by_task", {}
+                    ).keys()
+                )
+                + list(
+                    getattr(
+                        self, "active_runtime_models_by_task", {}
+                    ).keys()
+                )
+            )
+            if str(self.runtime_route(task).get("model_id") or "")
+            == model_id
+        ]
+        fixed_sources: list[str] = []
+        for source_id, pipelines in getattr(
+            self, "active_source_pipelines", {}
+        ).items():
+            if any(
+                not bool(pipeline.get("use_active", True))
+                and str(
+                    pipeline.get("configured_model_id")
+                    or pipeline.get("model_id")
+                    or ""
+                )
+                == model_id
+                for pipeline in pipelines
+            ):
+                fixed_sources.append(str(source_id))
+        inflight_request_ids: list[str] = []
+        flags = getattr(self, "control_flags", {})
+        for key, value in list(flags.items()):
+            if not str(key).startswith("__inflight__:"):
+                continue
+            if isinstance(value, dict) and str(
+                value.get("model_id") or ""
+            ) == model_id:
+                inflight_request_ids.append(
+                    str(key).split(":", 1)[-1]
+                )
+        rollback_hold = model_id in getattr(
+            self, "rollback_model_holds", set()
+        )
+        total = (
+            len(route_tasks)
+            + len(fixed_sources)
+            + len(inflight_request_ids)
+            + int(rollback_hold)
+        )
+        return {
+            "model_id": model_id,
+            "route_tasks": sorted(route_tasks),
+            "fixed_sources": sorted(fixed_sources),
+            "inflight_request_ids": sorted(inflight_request_ids),
+            "rollback_hold": rollback_hold,
+            "total": total,
+        }
+
+    def models_in_use(self) -> dict[str, dict[str, Any]]:
+        candidates = set(getattr(self, "loaded_model_ids", set()))
+        candidates.update(
+            str(route.get("model_id"))
+            for route in (
+                self.runtime_route(task)
+                for task in getattr(
+                    self, "active_model_ids_by_task", {}
+                )
+            )
+            if route.get("model_id")
+        )
+        for pipelines in getattr(
+            self, "active_source_pipelines", {}
+        ).values():
+            for pipeline in pipelines:
+                model_id = pipeline.get("configured_model_id") or pipeline.get(
+                    "model_id"
+                )
+                if model_id:
+                    candidates.add(str(model_id))
+        return {
+            model_id: self.model_references(model_id)
+            for model_id in sorted(candidates)
+        }
+
+    def request_inference_runtime_status(
+        self, *, timeout: float = 2.0
+    ) -> dict[str, Any]:
+        operation_id = str(uuid.uuid4())
+        key = f"__inference_runtime_status__:{operation_id}"
+        self.inference_result_store.pop(key, None)
+        self.inference_request_queue.put(
+            {
+                "kind": "GET_RUNTIME_STATUS",
+                "operation_id": operation_id,
+            }
+        )
+        deadline = time.monotonic() + max(0.1, float(timeout))
+        while time.monotonic() < deadline:
+            self.drain_inference_results()
+            status = self.inference_result_store.pop(key, None)
+            if status:
+                self.inference_runtime_snapshot = dict(status)
+                return dict(status)
+            time.sleep(0.02)
+        raise RuntimeError("Timeout du statut du worker d'inférence.")
+
+    def safe_unload_model(
+        self,
+        model_id: str,
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        model_id = str(model_id)
+        if model_id not in getattr(self, "loaded_model_ids", set()):
+            return {
+                "model_id": model_id,
+                "status": "NOT_LOADED",
+                "unloaded": False,
+                "references": self.model_references(model_id),
+            }
+        references = self.model_references(model_id)
+        blocking = (
+            len(references["route_tasks"])
+            + len(references["fixed_sources"])
+            + int(references["rollback_hold"])
+        )
+        if blocking:
+            return {
+                "model_id": model_id,
+                "status": "REFERENCED",
+                "unloaded": False,
+                "references": references,
+            }
+        deadline = time.monotonic() + float(
+            timeout
+            if timeout is not None
+            else self.config.get(
+                "runtime",
+                "model_unload_timeout_seconds",
+                default=5.0,
+            )
+        )
+        stable_zero_checks = 0
+        while time.monotonic() < deadline:
+            self.drain_inference_results()
+            references = self.model_references(model_id)
+            if references["inflight_request_ids"]:
+                stable_zero_checks = 0
+                time.sleep(0.02)
+                continue
+            stable_zero_checks += 1
+            if stable_zero_checks >= 2:
+                break
+            time.sleep(0.02)
+        else:
+            error = (
+                "Timeout: requêtes en vol encore présentes; "
+                "modèle conservé en mémoire."
+            )
+            if not hasattr(self, "last_model_unload_error"):
+                self.last_model_unload_error = {}
+            self.last_model_unload_error[model_id] = error
+            if hasattr(self, "event_repo"):
+                self.event_repo.add_event(
+                    "model_unload_timeout",
+                    {
+                        "model_id": model_id,
+                        "references": references,
+                        "error": error,
+                    },
+                    severity="warning",
+                )
+            return {
+                "model_id": model_id,
+                "status": "TIMEOUT",
+                "unloaded": False,
+                "references": references,
+                "error": error,
+            }
+        operation_id = str(uuid.uuid4())
+        unloaded_key = f"__model_unloaded__:{operation_id}"
+        deferred_key = f"__model_unload_deferred__:{operation_id}"
+        self.inference_result_store.pop(unloaded_key, None)
+        self.inference_result_store.pop(deferred_key, None)
+        self.inference_request_queue.put(
+            {
+                "kind": "UNLOAD_MODEL",
+                "model_id": model_id,
+                "operation_id": operation_id,
+            }
+        )
+        while time.monotonic() < deadline:
+            self.drain_inference_results()
+            deferred = self.inference_result_store.pop(
+                deferred_key, None
+            )
+            if deferred:
+                return {
+                    "model_id": model_id,
+                    "status": "DEFERRED",
+                    "unloaded": False,
+                    "references": self.model_references(model_id),
+                    "worker": deferred,
+                }
+            confirmation = self.inference_result_store.pop(
+                unloaded_key, None
+            )
+            if confirmation:
+                self.loaded_model_ids.discard(model_id)
+                getattr(self, "last_model_unload_error", {}).pop(
+                    model_id, None
+                )
+                return {
+                    "model_id": model_id,
+                    "status": "UNLOADED",
+                    "unloaded": True,
+                    "references": self.model_references(model_id),
+                    "worker": confirmation,
+                }
+            time.sleep(0.02)
+        error = "Timeout en attente de MODEL_UNLOADED; modèle conservé."
+        if not hasattr(self, "last_model_unload_error"):
+            self.last_model_unload_error = {}
+        self.last_model_unload_error[model_id] = error
+        return {
+            "model_id": model_id,
+            "status": "TIMEOUT",
+            "unloaded": False,
+            "references": self.model_references(model_id),
+            "error": error,
+        }
+
     def ensure_model_loaded(
         self,
         model_id: str,
@@ -591,8 +831,13 @@ class RuntimeSupervisor:
                 (model_id,),
             )
             task = str(row["task"] if row else "")
+            previous_model_id = str(
+                self.runtime_route(task).get("model_id") or ""
+            )
             self.ensure_model_loaded(model_id)
             self.apply_runtime_route(task, model_id)
+            if previous_model_id and previous_model_id != model_id:
+                self.safe_unload_model(previous_model_id)
             return True
         return False
 
@@ -1460,6 +1705,36 @@ class RuntimeSupervisor:
                 model_id = str(message["model_id"])
                 if hasattr(self, "loaded_model_ids"):
                     self.loaded_model_ids.discard(model_id)
+                operation_id = str(message.get("operation_id") or "")
+                if operation_id:
+                    self.inference_result_store[
+                        f"__model_unloaded__:{operation_id}"
+                    ] = message
+                continue
+            if message["kind"] == "MODEL_UNLOAD_DEFERRED":
+                operation_id = str(message.get("operation_id") or "")
+                if operation_id:
+                    self.inference_result_store[
+                        f"__model_unload_deferred__:{operation_id}"
+                    ] = message
+                continue
+            if message["kind"] == "INFERENCE_RUNTIME_STATUS":
+                operation_id = str(message.get("operation_id") or "")
+                self.inference_runtime_snapshot = dict(message)
+                if operation_id:
+                    self.inference_result_store[
+                        f"__inference_runtime_status__:{operation_id}"
+                    ] = message
+                continue
+            if message["kind"] in {
+                "MODEL_VALIDATED",
+                "MODEL_VALIDATION_FAILED",
+            }:
+                operation_id = str(message.get("operation_id") or "")
+                if operation_id:
+                    self.inference_result_store[
+                        f"__model_validation__:{operation_id}"
+                    ] = message
                 continue
             if message["kind"] not in {"INFER_RESULT", "INFER_ERROR"}:
                 continue
@@ -1522,6 +1797,8 @@ class RuntimeSupervisor:
             if not process.is_alive():
                 self.job_repo.mark_job_stopped(JobType.CAMERA.value, source_id, status="EXITED")
                 self.camera_processes.pop(source_id, None)
+                self.active_source_sessions.pop(source_id, None)
+                self.active_source_pipelines.pop(source_id, None)
         for job_id, process in list(self.training_processes.items()):
             if not process.is_alive():
                 training_job = self.db.fetch_one(

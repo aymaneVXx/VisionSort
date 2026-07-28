@@ -169,6 +169,18 @@ def test_multi_model_worker_caches_shared_models_and_reloads_independently(
         "demo-pose",
         "demo_synth_det",
     ]
+    request_queue.put(
+        {
+            "kind": "UNLOAD_MODEL",
+            "model_id": "demo-pose",
+            "operation_id": "unload-pose",
+        }
+    )
+    unloaded = _next_result(result_queue, "MODEL_UNLOADED")
+    assert unloaded["operation_id"] == "unload-pose"
+    assert unloaded["model_id"] == "demo-pose"
+    assert unloaded["loaded_model_ids"] == ["demo_synth_det"]
+    assert unloaded["memory_cleanup_called"] is True
     stop_event.set()
     worker.join(timeout=2.0)
 
