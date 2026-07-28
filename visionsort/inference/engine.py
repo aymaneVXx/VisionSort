@@ -370,6 +370,9 @@ def inference_worker_loop(
                         "model_id": model_id,
                         "task": task,
                         "pipeline_role": message.get("pipeline_role"),
+                        "routing_generation": int(
+                            message.get("routing_generation") or 0
+                        ),
                         "session_id": message["session_id"],
                         "source_id": message["source_id"],
                         "camera_id": message["camera_id"],
@@ -404,6 +407,9 @@ def inference_worker_loop(
                         "model_id": model_id,
                         "task": task,
                         "pipeline_role": message.get("pipeline_role"),
+                        "routing_generation": int(
+                            message.get("routing_generation") or 0
+                        ),
                         "session_id": message.get("session_id"),
                         "source_id": message.get("source_id"),
                         "camera_id": message["camera_id"],

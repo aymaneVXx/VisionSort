@@ -92,7 +92,9 @@ class RuntimeSupervisor:
         self.runtime_queue = self.ctx.Queue()
         self.inference_stop_event = self.ctx.Event()
         self.control_flags = self.manager.dict()
+        self.active_runtime_models_by_task = self.manager.dict()
         self.active_source_sessions: dict[str, str] = {}
+        self.active_source_pipelines: dict[str, list[dict[str, Any]]] = {}
         self.latest_stream_epoch_by_source: dict[str, int] = {}
         self.camera_processes: dict[str, tuple[mp.Process, Any]] = {}
         self.training_processes: dict[str, mp.Process] = {}
@@ -106,6 +108,17 @@ class RuntimeSupervisor:
                 "SELECT id, task FROM model_registry WHERE is_active = 1"
             )
         }
+        activated_at = time.time()
+        for task, model_id in self.active_model_ids_by_task.items():
+            self.active_runtime_models_by_task[task] = {
+                "task": task,
+                "model_id": model_id,
+                "generation": 1,
+                "activated_at": activated_at,
+            }
+        self.active_model_id = self.active_model_ids_by_task.get(
+            "detection"
+        ) or self.active_model_ids_by_task.get("segmentation")
         self._shutdown_complete = False
         self.arbiter = GPUResourceArbiter(
             allow_training_while_inference=bool(self.config.get("gpu", "allow_training_while_inference", default=False)),
@@ -239,6 +252,7 @@ class RuntimeSupervisor:
     def start(self) -> None:
         self.recover_interrupted_jobs()
         self.bootstrap_demo_sources()
+        self.refresh_runtime_routes_from_registry()
         if not self.inference_process.is_alive():
             self.inference_process.start()
             self.job_repo.upsert_job_run(JobType.GPU_INFERENCE.value, "shared", self.inference_process.pid or 0, "RUNNING", {"active_model_id": self.active_model_id})
@@ -294,6 +308,74 @@ class RuntimeSupervisor:
     def sync_inference_sources(self) -> None:
         sources = {row["id"]: dict(row) for row in self.db.fetch_all("SELECT * FROM sources")}
         self.inference_request_queue.put({"kind": "SYNC_SOURCES", "source_map": sources})
+
+    def runtime_route(self, task: str) -> dict[str, Any]:
+        routes = getattr(self, "active_runtime_models_by_task", None)
+        if routes is not None:
+            route = dict(routes.get(str(task), {}) or {})
+            if route:
+                return route
+        model_id = getattr(self, "active_model_ids_by_task", {}).get(
+            str(task)
+        )
+        return {
+            "task": str(task),
+            "model_id": model_id,
+            "generation": 0,
+            "activated_at": None,
+        }
+
+    def refresh_runtime_routes_from_registry(self) -> None:
+        rows = self.db.fetch_all(
+            """
+            SELECT id, task FROM model_registry
+            WHERE is_active = 1 ORDER BY updated_at DESC
+            """
+        )
+        for row in rows:
+            task = str(row["task"])
+            model_id = str(row["id"])
+            current = self.runtime_route(task)
+            if current.get("model_id") == model_id:
+                continue
+            self.apply_runtime_route(
+                task,
+                model_id,
+                generation=max(1, int(current.get("generation") or 0)),
+            )
+
+    def apply_runtime_route(
+        self,
+        task: str,
+        model_id: str,
+        *,
+        generation: int | None = None,
+        activated_at: float | None = None,
+    ) -> dict[str, Any]:
+        task = str(task)
+        previous = self.runtime_route(task)
+        next_generation = int(
+            generation
+            if generation is not None
+            else int(previous.get("generation") or 0) + 1
+        )
+        route = {
+            "task": task,
+            "model_id": str(model_id),
+            "generation": next_generation,
+            "activated_at": float(
+                activated_at if activated_at is not None else time.time()
+            ),
+        }
+        routes = getattr(self, "active_runtime_models_by_task", None)
+        if routes is not None:
+            routes[task] = route
+        if not hasattr(self, "active_model_ids_by_task"):
+            self.active_model_ids_by_task = {}
+        self.active_model_ids_by_task[task] = str(model_id)
+        if task in {"detection", "segmentation"}:
+            self.active_model_id = str(model_id)
+        return route
 
     def ensure_model_loaded(
         self,
@@ -368,11 +450,6 @@ class RuntimeSupervisor:
                     resolved_task = str(
                         ready.get("task") or task or "detection"
                     )
-                    if not hasattr(self, "active_model_ids_by_task"):
-                        self.active_model_ids_by_task = {}
-                    self.active_model_ids_by_task[resolved_task] = model_id
-                    if resolved_task in {"detection", "segmentation"}:
-                        self.active_model_id = model_id
                     if hasattr(self, "job_repo"):
                         self.job_repo.upsert_job_run(
                             JobType.GPU_INFERENCE.value,
@@ -401,15 +478,8 @@ class RuntimeSupervisor:
             (configured_model_id,),
         )
         task = str(configured["task"] if configured else "detection")
-        active = self.db.fetch_one(
-            """
-            SELECT id FROM model_registry
-            WHERE is_active = 1 AND task = ?
-            ORDER BY updated_at DESC LIMIT 1
-            """,
-            (task,),
-        )
-        return str(active["id"]) if active is not None else configured_model_id
+        route = self.runtime_route(task)
+        return str(route.get("model_id") or configured_model_id)
 
     def resolve_model_pipeline(
         self,
@@ -417,7 +487,7 @@ class RuntimeSupervisor:
         *,
         configured_model_id: str,
         snapshot: str | list[dict[str, Any]] | None = None,
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         if isinstance(snapshot, str):
             try:
                 raw_assignments = json.loads(snapshot or "[]")
@@ -450,7 +520,7 @@ class RuntimeSupervisor:
                     "enabled": True,
                 }
             ]
-        pipeline: list[dict[str, str]] = []
+        pipeline: list[dict[str, Any]] = []
         seen_roles: set[str] = set()
         use_registry = (
             self.config.get(
@@ -468,8 +538,10 @@ class RuntimeSupervisor:
                     f"Pipeline dupliqué pour {source_id}: {role}"
                 )
             seen_roles.add(role)
-            model_id = assignment.get("model_id")
-            if use_registry and bool(assignment.get("use_active", True)):
+            configured_assignment_model_id = assignment.get("model_id")
+            use_active = bool(assignment.get("use_active", True))
+            model_id = configured_assignment_model_id
+            if use_registry and use_active:
                 active = self.db.fetch_one(
                     """
                     SELECT id FROM model_registry
@@ -497,6 +569,12 @@ class RuntimeSupervisor:
                     "pipeline_role": role,
                     "task": task,
                     "model_id": str(model_id),
+                    "configured_model_id": (
+                        str(configured_assignment_model_id)
+                        if configured_assignment_model_id
+                        else str(model_id)
+                    ),
+                    "use_active": use_active,
                 }
             )
         if not pipeline:
@@ -512,14 +590,9 @@ class RuntimeSupervisor:
                 "SELECT task FROM model_registry WHERE id = ?",
                 (model_id,),
             )
-            if model_id in getattr(self, "loaded_model_ids", set()):
-                self.ensure_model_loaded(
-                    model_id,
-                    task=str(row["task"] if row else ""),
-                    force_reload=True,
-                )
-            else:
-                self.ensure_model_loaded(model_id)
+            task = str(row["task"] if row else "")
+            self.ensure_model_loaded(model_id)
+            self.apply_runtime_route(task, model_id)
             return True
         return False
 
@@ -568,6 +641,9 @@ class RuntimeSupervisor:
         cfg["replay_loop"] = bool(replay_loop)
         cfg["archive_required"] = bool(archive_required)
         self.active_source_sessions[source_id] = session_id
+        self.active_source_pipelines[source_id] = [
+            dict(item) for item in model_pipeline
+        ]
         self.latest_stream_epoch_by_source[source_id] = -1
         self.control_flags[source_id] = {"recording": False}
         process = self.ctx.Process(
@@ -581,6 +657,7 @@ class RuntimeSupervisor:
                 self.runtime_queue,
                 stop_event,
                 self.control_flags,
+                self.active_runtime_models_by_task,
             ),
             daemon=True,
             name=f"visionsort-camera-{row['role']}",
@@ -668,6 +745,8 @@ class RuntimeSupervisor:
     def stop_source(self, source_id: str) -> None:
         if hasattr(self, "active_source_sessions"):
             self.active_source_sessions.pop(source_id, None)
+        if hasattr(self, "active_source_pipelines"):
+            self.active_source_pipelines.pop(source_id, None)
         if hasattr(self, "latest_stream_epoch_by_source"):
             self.latest_stream_epoch_by_source.pop(source_id, None)
         data = self.camera_processes.pop(source_id, None)

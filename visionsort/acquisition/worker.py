@@ -33,6 +33,7 @@ def build_inference_request(
     model_id: str | None = None,
     task: str | None = None,
     pipeline_role: str | None = None,
+    routing_generation: int = 0,
 ) -> dict[str, Any]:
     now = time.time()
     return {
@@ -43,6 +44,7 @@ def build_inference_request(
         "model_id": model_id,
         "task": task,
         "pipeline_role": pipeline_role,
+        "routing_generation": int(routing_generation),
         "camera_id": frame.camera_id,
         "camera_role": frame.camera_role,
         "stream_epoch": int(frame.stream_epoch),
@@ -53,6 +55,30 @@ def build_inference_request(
         "expires_at": now + max(0.1, float(ttl_seconds)),
         "image": frame.image,
     }
+
+
+def resolve_pipeline_model(
+    pipeline: dict[str, Any],
+    active_runtime_models_by_task,
+) -> tuple[str, int]:
+    """Resolve a pipeline without querying SQLite from the camera worker."""
+    configured_model_id = str(
+        pipeline.get("configured_model_id")
+        or pipeline.get("model_id")
+        or ""
+    )
+    if not bool(pipeline.get("use_active", True)):
+        if not configured_model_id:
+            raise RuntimeError(
+                f"Modèle fixe absent pour {pipeline.get('pipeline_role')}."
+            )
+        return configured_model_id, 0
+    task = str(pipeline.get("task") or "")
+    route = dict(active_runtime_models_by_task.get(task, {}) or {})
+    model_id = str(route.get("model_id") or pipeline.get("model_id") or "")
+    if not model_id:
+        raise RuntimeError(f"Aucun modèle runtime actif pour la tâche {task}.")
+    return model_id, int(route.get("generation") or 0)
 
 
 def _increment_inference_metric(
@@ -375,6 +401,7 @@ def camera_worker_loop(
     runtime_queue,
     stop_event,
     control_flags,
+    active_runtime_models_by_task,
 ) -> None:
     db = VisionSortDB(Path(db_path))
     config = AppConfig(values=config_values)
@@ -496,9 +523,12 @@ def camera_worker_loop(
                 for item in model_pipeline
             )
             for pipeline in model_pipeline:
-                model_id = str(pipeline["model_id"])
                 task = str(pipeline["task"])
                 pipeline_role = str(pipeline["pipeline_role"])
+                model_id, routing_generation = resolve_pipeline_model(
+                    pipeline,
+                    active_runtime_models_by_task,
+                )
                 while (
                     bool(
                         control_flags.get(
@@ -515,6 +545,7 @@ def camera_worker_loop(
                     model_id=model_id,
                     task=task,
                     pipeline_role=pipeline_role,
+                    routing_generation=routing_generation,
                 )
                 inflight_key = (
                     f"__inflight__:{message['request_id']}"
@@ -523,6 +554,7 @@ def camera_worker_loop(
                     "source_id": source_id,
                     "model_id": model_id,
                     "task": task,
+                    "routing_generation": routing_generation,
                 }
                 try:
                     inference_request_queue.put_nowait(message)
@@ -560,6 +592,7 @@ def camera_worker_loop(
                     int(frame.frame_index),
                     model_id,
                     task,
+                    routing_generation,
                 )
                 result_context = (
                     result.get("session_id"),
@@ -569,6 +602,7 @@ def camera_worker_loop(
                     int(result.get("frame_index", -1)),
                     str(result.get("model_id") or ""),
                     str(result.get("task") or ""),
+                    int(result.get("routing_generation") or 0),
                 )
                 if result_context != expected_context:
                     _increment_inference_metric(
@@ -613,6 +647,9 @@ def camera_worker_loop(
                     observation.attributes[
                         "pipeline_role"
                     ] = pipeline_role
+                    observation.attributes[
+                        "routing_generation"
+                    ] = routing_generation
                 observations.extend(pipeline_observations)
             if not frame_results:
                 acquisition.mark_dropped()
@@ -655,6 +692,12 @@ def camera_worker_loop(
                                     for item in frame_results
                                 }
                             ),
+                            "routing_generations": {
+                                str(item["task"]): int(
+                                    item.get("routing_generation") or 0
+                                )
+                                for item in frame_results
+                            },
                             "pipeline_results": [
                                 {
                                     "request_id": item["request_id"],
@@ -662,6 +705,9 @@ def camera_worker_loop(
                                     "task": item["task"],
                                     "pipeline_role": item.get(
                                         "pipeline_role"
+                                    ),
+                                    "routing_generation": int(
+                                        item.get("routing_generation") or 0
                                     ),
                                     "model_metrics": item.get(
                                         "model_metrics", {}

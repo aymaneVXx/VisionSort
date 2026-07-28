@@ -218,11 +218,15 @@ def test_source_pipeline_resolves_active_model_per_task(tmp_path):
             "pipeline_role": "operator_pose",
             "task": "pose",
             "model_id": "demo-pose",
+            "configured_model_id": "demo-pose",
+            "use_active": True,
         },
         {
             "pipeline_role": "parcel_detection",
             "task": "detection",
             "model_id": "demo_synth_det",
+            "configured_model_id": "demo_synth_det",
+            "use_active": True,
         },
     ]
 

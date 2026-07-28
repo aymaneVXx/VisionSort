@@ -4,7 +4,10 @@ import uuid
 
 import numpy as np
 
-from visionsort.acquisition.worker import build_inference_request
+from visionsort.acquisition.worker import (
+    build_inference_request,
+    resolve_pipeline_model,
+)
 from visionsort.core.types import Frame
 from visionsort.runtime.supervisor import RuntimeSupervisor
 from visionsort.sources import frame_sources
@@ -71,6 +74,41 @@ def test_request_ids_never_collide_between_sessions_or_stream_epochs():
     assert all(uuid.UUID(request["request_id"]) for request in requests)
     assert requests[0]["session_id"] != requests[1]["session_id"]
     assert requests[1]["stream_epoch"] != requests[2]["stream_epoch"]
+
+
+def test_dynamic_pipeline_uses_shared_route_while_fixed_pipeline_is_stable():
+    routes = {
+        "detection": {
+            "task": "detection",
+            "model_id": "model-a",
+            "generation": 4,
+            "activated_at": 1.0,
+        }
+    }
+    dynamic = {
+        "pipeline_role": "parcel_detection",
+        "task": "detection",
+        "model_id": "model-a",
+        "configured_model_id": "configured-model",
+        "use_active": True,
+    }
+    fixed = {
+        **dynamic,
+        "configured_model_id": "fixed-model",
+        "use_active": False,
+    }
+
+    assert resolve_pipeline_model(dynamic, routes) == ("model-a", 4)
+    assert resolve_pipeline_model(fixed, routes) == ("fixed-model", 0)
+
+    routes["detection"] = {
+        "task": "detection",
+        "model_id": "model-b",
+        "generation": 5,
+        "activated_at": 2.0,
+    }
+    assert resolve_pipeline_model(dynamic, routes) == ("model-b", 5)
+    assert resolve_pipeline_model(fixed, routes) == ("fixed-model", 0)
 
 
 def test_replay_is_non_looping_by_default_and_explicit_loop_increments_epoch(
