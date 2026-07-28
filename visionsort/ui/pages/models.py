@@ -85,6 +85,12 @@ def render(context: UIContext) -> None:
         )
     task_states = consistency.get("tasks") or []
     if task_states:
+        latest_activations = runtime_state.get(
+            "latest_activation_by_task", {}
+        )
+        latest_rollbacks = runtime_state.get(
+            "latest_rollback_by_task", {}
+        )
         st.dataframe(
             pd.DataFrame(
                 [
@@ -103,6 +109,16 @@ def render(context: UIContext) -> None:
                         "références": row.get("references"),
                         "in-flight": row.get("inflight"),
                         "cohérent": row.get("consistent"),
+                        "dernière activation": (
+                            latest_activations.get(
+                                str(row.get("task")), {}
+                            ).get("activated_model_id")
+                        ),
+                        "dernier rollback": (
+                            latest_rollbacks.get(
+                                str(row.get("task")), {}
+                            ).get("activated_model_id")
+                        ),
                     }
                     for row in task_states
                 ]

@@ -1084,7 +1084,8 @@ class RuntimeSupervisor:
         )
         current_activation = self.db.fetch_one(
             """
-            SELECT id FROM model_activation_history
+            SELECT id, status, completed_at
+            FROM model_activation_history
             WHERE task = ? AND activated_model_id = ?
               AND status = 'ACTIVE' AND runtime_applied = 1
             ORDER BY COALESCE(completed_at, activated_at) DESC LIMIT 1
@@ -1120,6 +1121,7 @@ class RuntimeSupervisor:
         registry_snapshot = self._registry_task_snapshot(task)
         route_applied = False
         registry_persisted = False
+        previous_history_marked = False
         validation: dict[str, Any] | None = None
         unload_result: dict[str, Any] | None = None
         steps = {
@@ -1156,11 +1158,17 @@ class RuntimeSupervisor:
                 activate_model(self.db, str(model_id))
             registry_persisted = True
             steps["registry"] = "COMPLETED"
-            mark_previous_activation(
-                self.db,
-                task=task,
-                model_id=previous_model_id,
-                status="ROLLED_BACK" if rollback else "SUPERSEDED",
+            previous_history_marked = bool(
+                mark_previous_activation(
+                    self.db,
+                    task=task,
+                    model_id=previous_model_id,
+                    status=(
+                        "ROLLED_BACK"
+                        if rollback
+                        else "SUPERSEDED"
+                    ),
+                )
             )
             finish_activation_history(
                 self.db,
@@ -1257,6 +1265,22 @@ class RuntimeSupervisor:
                 if registry_persisted:
                     self._restore_registry_task_snapshot(
                         task, registry_snapshot
+                    )
+                if (
+                    previous_history_marked
+                    and current_activation is not None
+                ):
+                    self.db.execute(
+                        """
+                        UPDATE model_activation_history
+                        SET status = ?, completed_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            str(current_activation["status"]),
+                            current_activation["completed_at"],
+                            str(current_activation["id"]),
+                        ),
                     )
             except Exception as restore_exc:
                 rollback_error = str(restore_exc)

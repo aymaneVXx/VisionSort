@@ -19,6 +19,13 @@ VisionSort est une plateforme locale Python + Streamlit pour piloter un cycle co
 - Les observations détaillées sont stockées en `JSONL`, avec export `Parquet` possible via un step pipeline dédié.
 - L’inférence utilise un scheduler central et un cache partagé par `model_id`;
   une source peut combiner les rôles colis et pose.
+- Les pipelines `use_active=true` lisent un routage partagé par tâche et
+  changent de version sans redémarrer la source; les pipelines
+  `use_active=false` conservent leur modèle fixe.
+- Chaque résultat d’inférence conserve le modèle réellement utilisé et la
+  génération de routage. La bascule charge et vérifie la nouvelle version
+  avant de router les frames suivantes, puis décharge l’ancienne version
+  après drainage de ses requêtes.
 - Chaque caméra conserve son tracker local indépendant.
 - `bytetrack_cpu` et `botsort_cpu` utilisent les implémentations natives Ultralytics; `greedy_iou` reste une option de démonstration explicite.
 - L'acquisition utilise un buffer borné `latest frame wins` et ne bloque plus sur le temps d'inférence.
@@ -34,11 +41,13 @@ VisionSort est une plateforme locale Python + Streamlit pour piloter un cycle co
   `parcel_detection`, `parcel_segmentation` et `operator_pose`;
   `capture_session_sources.model_pipeline_json` en garde le snapshot.
 - `model_registry.is_active` est unique par tâche, et non plus global.
+- `model_activation_history` conserve les activations, échecs, remplacements
+  et rollbacks réellement appliqués au runtime, par tâche.
 - `handoff_hypotheses` conserve les ambiguïtés;
   `handoff_resolution_audit` journalise chaque résolution ou refus avec
   l’ancienne et la nouvelle chaîne.
 
-Les migrations incrémentales SQLite v6, v7 et v8 ajoutent ces structures
+Les migrations incrémentales SQLite v6, v7, v8 et v9 ajoutent ces structures
 sans recréer les bases existantes.
 
 ## Modules Principaux
@@ -184,9 +193,55 @@ Des rapports JSON machine-readable sont produits dans `data/runtime/reports/`.
 - évaluation post-training
 - registre modèles avec `CANDIDATE / CHAMPION / REJECTED / ARCHIVED`
 - activation, promotion et rollback
+- activation à chaud transactionnelle, isolée par tâche, avec rollback fondé
+  uniquement sur un ancien déploiement vérifié
 - jobs idempotents et reprenables, verrou anti-doublon, annulation persistée
 - artefacts `best.pt` copiés dans un répertoire de version immuable
 - activation suivie d'un rechargement contrôlé du worker d'inférence
+- diagnostic Models comparant registre SQLite, routage runtime, modèles
+  chargés, références et requêtes en vol
+
+## Archive média et `latest frame wins`
+
+L’archive actuelle contient les frames retenues par le runtime après le
+mécanisme de buffer borné `latest frame wins`. Elle garantit la
+reproductibilité des observations, la génération du dataset et la traçabilité
+des décisions prises sur ces frames.
+
+Elle ne garantit pas l’enregistrement brut de toutes les frames reçues par un
+flux RTSP. Un enregistreur brut intégral reste une fonctionnalité optionnelle
+future si le cahier des charges terrain l’exige; il n’est pas ajouté par cette
+correction.
+
+## Smoke test local RTX 4050
+
+Ce test est volontairement hors CI et exige trois fichiers de poids
+Ultralytics locaux: deux versions détection (ou segmentation) et un modèle
+Pose. Il refuse les backends `demo`, vérifie CUDA, exécute de vraies
+inférences, bascule parcel v1 vers v2, protège puis décharge v1, et mesure la
+mémoire dans le processus GPU.
+
+```powershell
+$env:DEMO_MODE="0"
+$env:YOLO_CONFIG_DIR="$PWD\data\ultralytics"
+nvidia-smi
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+python -m visionsort.runtime.gpu_smoke_test `
+  --parcel-v1 "C:\models\parcel-v1.pt" `
+  --parcel-v2 "C:\models\parcel-v2.pt" `
+  --pose "C:\models\yolo11n-pose.pt" `
+  --parcel-task detection `
+  --iterations 30 `
+  --report "data\runtime\reports\gpu-smoke.json"
+```
+
+Le rapport compare `before_activation`, `after_activation` et
+`after_unload`, donne les échantillons de mémoire du benchmark, le FPS
+approximatif, la confirmation `MODEL_UNLOADED`, les modèles encore chargés et
+l’arrêt propre. Par défaut, une croissance persistante supérieure à
+128 MiB fait échouer le test; le seuil est ajustable avec
+`--memory-growth-limit-mb`. Sans CUDA, le script retourne `SKIPPED` et ne fait
+pas échouer la CI.
 
 ## Limites Connues
 
@@ -244,8 +299,11 @@ $env:DEMO_MODE="1"
 python -m visionsort.runtime.multimodel_e2e --db data/runtime/multimodel-e2e.db --report data/runtime/reports/multimodel-e2e.json
 ```
 
-Il vérifie une source parcelle seule, une source parcelle + pose, la
-consommation des 17 keypoints par le moteur d'événements et l'activation d'une
-nouvelle version pose sans recharger ni désactiver le modèle parcelle. La CI
-exécute installation, compilation et tests sous Python 3.10 et 3.12; les trois
+Il maintient les Replay actifs en boucle pendant les bascules. Il vérifie
+parcel v1 + pose v1, active pose v2 puis parcel v2 sur des frames ultérieures,
+confirme l’isolation par tâche et les déchargements, simule l’échec parcel v3,
+puis rollbacke explicitement vers parcel v1 réellement déployé. Le rapport
+contient la provenance par frame, la timeline, les références, les in-flight,
+les confirmations `MODEL_UNLOADED` et la cohérence finale. La CI exécute
+installation, compilation et tests sous Python 3.10 et 3.12; les trois
 scénarios E2E sont lancés sous Python 3.12.

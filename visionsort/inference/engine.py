@@ -64,6 +64,31 @@ def release_model_memory() -> None:
         pass
 
 
+def cuda_memory_snapshot() -> dict[str, Any]:
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return {"available": False}
+        return {
+            "available": True,
+            "device": torch.cuda.current_device(),
+            "device_name": torch.cuda.get_device_name(
+                torch.cuda.current_device()
+            ),
+            "allocated_bytes": int(torch.cuda.memory_allocated()),
+            "reserved_bytes": int(torch.cuda.memory_reserved()),
+            "max_allocated_bytes": int(
+                torch.cuda.max_memory_allocated()
+            ),
+            "max_reserved_bytes": int(
+                torch.cuda.max_memory_reserved()
+            ),
+        }
+    except Exception as exc:
+        return {"available": False, "error": str(exc)}
+
+
 class DemoDetectionBackend:
     def __init__(self):
         self.sidecars: dict[str, dict[int, list[dict[str, Any]]]] = {}
@@ -367,6 +392,7 @@ def inference_worker_loop(
                         model_id: dict(inference_metrics.get(model_id, {}))
                         for model_id in sorted(engines)
                     },
+                    "cuda_memory": cuda_memory_snapshot(),
                 }
             )
         elif kind == "VALIDATE_MODEL":

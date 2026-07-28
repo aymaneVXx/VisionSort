@@ -181,6 +181,17 @@ def test_multi_model_worker_caches_shared_models_and_reloads_independently(
     assert unloaded["model_id"] == "demo-pose"
     assert unloaded["loaded_model_ids"] == ["demo_synth_det"]
     assert unloaded["memory_cleanup_called"] is True
+    request_queue.put(
+        {
+            "kind": "GET_RUNTIME_STATUS",
+            "operation_id": "status-after-unload",
+        }
+    )
+    runtime_status = _next_result(
+        result_queue, "INFERENCE_RUNTIME_STATUS"
+    )
+    assert runtime_status["loaded_model_ids"] == ["demo_synth_det"]
+    assert "cuda_memory" in runtime_status
     stop_event.set()
     worker.join(timeout=2.0)
 
@@ -260,3 +271,42 @@ def test_pose_activation_does_not_deactivate_parcel_model(tmp_path):
         "detection": "demo_synth_det",
         "pose": "demo-pose",
     }
+
+
+def test_legacy_assignment_without_use_active_keeps_active_default(
+    tmp_path,
+):
+    db = VisionSortDB(tmp_path / "legacy-assignment.db")
+    db.initialize()
+    now = utc_now()
+    db.execute(
+        """
+        INSERT INTO model_registry
+        (id, name, task, backend, weights_path, status, is_active,
+         notes_json, metrics_json, created_at, updated_at)
+        VALUES ('legacy-fixed-id', 'Legacy', 'detection', 'demo', '',
+                'ARCHIVED', 0, '{}', '{}', ?, ?)
+        """,
+        (now, now),
+    )
+    supervisor = RuntimeSupervisor.__new__(RuntimeSupervisor)
+    supervisor.db = db
+    supervisor.config = AppConfig(
+        values={"runtime": {"model_selection": "active_registry"}}
+    )
+
+    pipeline = supervisor.resolve_model_pipeline(
+        "legacy-source",
+        configured_model_id="legacy-fixed-id",
+        snapshot=[
+            {
+                "pipeline_role": "parcel_detection",
+                "task": "detection",
+                "model_id": "legacy-fixed-id",
+            }
+        ],
+    )
+
+    assert pipeline[0]["use_active"] is True
+    assert pipeline[0]["configured_model_id"] == "legacy-fixed-id"
+    assert pipeline[0]["model_id"] == "demo_synth_det"

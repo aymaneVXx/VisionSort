@@ -10,6 +10,7 @@ from visionsort.database.repositories import (
 from visionsort.runtime.supervisor import RuntimeSupervisor
 from visionsort.inference.engine import SharedInferenceEngine
 import visionsort.inference.engine as inference_engine
+import visionsort.runtime.supervisor as supervisor_module
 
 
 class _AliveProcess:
@@ -208,3 +209,94 @@ def test_failed_activation_keeps_registry_and_runtime_on_previous_model(tmp_path
     assert failure["status"] == "FAILED"
     assert failure["runtime_applied"] == 0
     assert "simulated reload failure" in str(failure["error_text"])
+
+
+def test_failure_after_registry_write_restores_previous_history(
+    tmp_path, monkeypatch
+):
+    db = VisionSortDB(tmp_path / "late-activation-failure.db")
+    db.initialize()
+    now = utc_now()
+    db.execute("UPDATE model_registry SET is_active = 0")
+    for model_id, active in (("previous", 1), ("next", 0)):
+        db.execute(
+            """
+            INSERT INTO model_registry
+            (id, name, task, backend, weights_path, status, is_active,
+             notes_json, metrics_json, created_at, updated_at)
+            VALUES (?, ?, 'detection', 'demo', '', 'ARCHIVED', ?,
+                    '{}', '{}', ?, ?)
+            """,
+            (model_id, model_id, active, now, now),
+        )
+    with db.connect() as conn:
+        db._seed_model_activation_history(conn)
+    supervisor = RuntimeSupervisor.__new__(RuntimeSupervisor)
+    supervisor.db = db
+    supervisor.active_model_id = "previous"
+    supervisor.active_model_ids_by_task = {"detection": "previous"}
+    supervisor.active_runtime_models_by_task = {
+        "detection": {
+            "task": "detection",
+            "model_id": "previous",
+            "generation": 1,
+            "activated_at": 1.0,
+        }
+    }
+    supervisor.active_source_pipelines = {}
+    supervisor.active_source_sessions = {}
+    supervisor.rollback_model_holds = set()
+    supervisor.ensure_model_loaded = lambda model_id: None
+    supervisor.validate_model_routing = lambda **kwargs: kwargs
+    supervisor.safe_unload_model = lambda model_id: {
+        "model_id": model_id,
+        "status": "NOT_LOADED",
+        "unloaded": False,
+    }
+    original_finish = supervisor_module.finish_activation_history
+    calls = {"count": 0}
+
+    def fail_first_finish(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("late history failure")
+        return original_finish(*args, **kwargs)
+
+    monkeypatch.setattr(
+        supervisor_module,
+        "finish_activation_history",
+        fail_first_finish,
+    )
+
+    try:
+        supervisor.switch_runtime_model("next")
+    except RuntimeError as exc:
+        assert "late history failure" in str(exc)
+    else:
+        raise AssertionError("La bascule tardive devait échouer.")
+
+    active = db.fetch_one(
+        "SELECT id FROM model_registry WHERE is_active = 1"
+    )
+    previous_history = db.fetch_one(
+        """
+        SELECT status FROM model_activation_history
+        WHERE activated_model_id = 'previous'
+        ORDER BY activated_at DESC LIMIT 1
+        """
+    )
+    failed_history = db.fetch_one(
+        """
+        SELECT status FROM model_activation_history
+        WHERE activated_model_id = 'next'
+        ORDER BY activated_at DESC LIMIT 1
+        """
+    )
+    assert active is not None and active["id"] == "previous"
+    assert supervisor.runtime_route("detection")["model_id"] == (
+        "previous"
+    )
+    assert previous_history is not None
+    assert previous_history["status"] == "ACTIVE"
+    assert failed_history is not None
+    assert failed_history["status"] == "FAILED"

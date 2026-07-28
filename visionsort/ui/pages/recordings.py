@@ -13,6 +13,12 @@ from visionsort.ui.state import UIContext
 
 def render(context: UIContext) -> None:
     page_header("Recordings", "Segments enregistrés et métadonnées")
+    st.info(
+        "Cette archive contient les frames retenues après le mécanisme "
+        "« latest frame wins ». Elle permet de reproduire les observations, "
+        "datasets et décisions, mais ne garantit pas une copie brute de "
+        "toutes les frames reçues par le flux RTSP."
+    )
     recordings = context.repo.list_recordings()
     coverage = context.repo.list_media_coverage()
     if coverage:

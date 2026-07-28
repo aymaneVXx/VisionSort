@@ -22,7 +22,7 @@ DEFAULT_MODELS = [
         "task": ModelTask.DETECTION.value,
         "backend": "demo",
         "weights_path": "",
-        "status": ModelStatus.CHAMPION.value,
+        "status": ModelStatus.CANDIDATE.value,
         "is_active": 1,
         "notes_json": json.dumps(
             {
@@ -861,18 +861,6 @@ class VisionSortDB:
                 CREATE INDEX IF NOT EXISTS idx_model_activation_status
                     ON model_activation_history(status, runtime_applied);
                 """
-            )
-            conn.execute(
-                """
-                UPDATE model_registry
-                SET status = ?, updated_at = ?
-                WHERE is_active = 1 AND status = ?
-                """,
-                (
-                    ModelStatus.CHAMPION.value,
-                    utc_now(),
-                    ModelStatus.CANDIDATE.value,
-                ),
             )
             self._seed_model_activation_history(conn)
             conn.execute("PRAGMA user_version = 9")

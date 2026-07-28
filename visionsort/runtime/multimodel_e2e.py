@@ -24,12 +24,15 @@ from visionsort.runtime.supervisor_e2e import (
 )
 
 
-def _insert_demo_pose(
+def _insert_test_model(
     supervisor: RuntimeSupervisor,
     model_id: str,
     *,
+    task: str,
     active: bool,
     status: str,
+    backend: str = "demo",
+    weights_path: str = "",
 ) -> None:
     now = utc_now()
     supervisor.db.execute(
@@ -38,11 +41,14 @@ def _insert_demo_pose(
         (id, name, task, backend, weights_path, status, is_active,
          notes_json, metrics_json, parent_model_id, created_from_job_id,
          created_at, updated_at)
-        VALUES (?, ?, 'pose', 'demo', '', ?, ?, ?, '{}', NULL, NULL, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}', NULL, NULL, ?, ?)
         """,
         (
             model_id,
             model_id,
+            task,
+            backend,
+            weights_path,
             status,
             int(active),
             json.dumps(
@@ -196,21 +202,49 @@ def run_multimodel_e2e(
     )
     pose_model_id = f"demo-pose-{run_token}"
     next_pose_model_id = f"demo-pose-v2-{run_token}"
+    parcel_v2_model_id = f"demo-parcel-v2-{run_token}"
+    broken_parcel_model_id = f"broken-parcel-v3-{run_token}"
     parcel_source_id = f"multi-{run_token}-parcel"
     pose_source_id = f"multi-{run_token}-pose"
     session_id = ""
     try:
-        _insert_demo_pose(
+        supervisor.db.execute(
+            """
+            UPDATE model_registry
+            SET status = 'CHAMPION', updated_at = ?
+            WHERE id = 'demo_synth_det'
+            """,
+            (utc_now(),),
+        )
+        _insert_test_model(
             supervisor,
             pose_model_id,
+            task="pose",
             active=True,
             status="CHAMPION",
         )
-        _insert_demo_pose(
+        _insert_test_model(
             supervisor,
             next_pose_model_id,
+            task="pose",
             active=False,
             status="CHAMPION",
+        )
+        _insert_test_model(
+            supervisor,
+            parcel_v2_model_id,
+            task="detection",
+            active=False,
+            status="CHAMPION",
+        )
+        _insert_test_model(
+            supervisor,
+            broken_parcel_model_id,
+            task="detection",
+            active=False,
+            status="ARCHIVED",
+            backend="ultralytics",
+            weights_path=str(asset_dir / "missing-parcel-v3.pt"),
         )
         parcel_source_id = supervisor.control_repo.upsert_source(
             {
@@ -274,7 +308,7 @@ def run_multimodel_e2e(
                 },
             ],
             config={
-                "replay_loop": False,
+                "replay_loop": True,
                 "simulated_backend": True,
                 "validated_on_site": False,
             },
@@ -286,14 +320,270 @@ def run_multimodel_e2e(
             {"session_id": session_id},
         )
         expected_sources = {parcel_source_id, pose_source_id}
+
+        def current_frames(source_id: str) -> list[dict[str, Any]]:
+            return _observation_frames(
+                supervisor,
+                session_id=session_id,
+                source_id=source_id,
+            )
+
+        def matching_frames(
+            source_id: str,
+            *,
+            task: str,
+            model_id: str,
+            minimum_generation: int = 0,
+        ) -> list[dict[str, Any]]:
+            return [
+                frame
+                for frame in current_frames(source_id)
+                if any(
+                    str(result.get("task")) == task
+                    and str(result.get("model_id")) == model_id
+                    and int(
+                        result.get("routing_generation") or 0
+                    )
+                    >= int(minimum_generation)
+                    for result in frame.get("pipeline_results") or []
+                )
+            ]
+
         _wait_until(
             supervisor,
-            lambda: not expected_sources.intersection(
-                supervisor.camera_processes
+            lambda: (
+                expected_sources.issubset(supervisor.camera_processes)
+                and len(
+                    matching_frames(
+                        pose_source_id,
+                        task="pose",
+                        model_id=pose_model_id,
+                    )
+                )
+                >= 3
+                and len(
+                    matching_frames(
+                        parcel_source_id,
+                        task="detection",
+                        model_id="demo_synth_det",
+                    )
+                )
+                >= 3
             ),
-            description="fin des sources multi-modèles",
+            description="frames initiales parcel v1 + pose v1",
             timeout=120.0,
         )
+        loaded_initial = sorted(supervisor.loaded_model_ids)
+        references_initial = supervisor.models_in_use()
+        inflight_initial = supervisor.request_inference_runtime_status()
+        load_counts_initial = dict(supervisor.model_load_counts)
+
+        if not expected_sources.issubset(supervisor.camera_processes):
+            raise RuntimeError(
+                "Les sources doivent rester actives pendant la bascule."
+            )
+        _execute_command(
+            supervisor,
+            CommandType.ACTIVATE_MODEL,
+            {
+                "model_id": next_pose_model_id,
+                "reason": "E2E hot switch pose v1 vers v2",
+            },
+        )
+        pose_v2_generation = int(
+            supervisor.runtime_route("pose").get("generation") or 0
+        )
+        _wait_until(
+            supervisor,
+            lambda: len(
+                matching_frames(
+                    pose_source_id,
+                    task="pose",
+                    model_id=next_pose_model_id,
+                    minimum_generation=pose_v2_generation,
+                )
+            )
+            >= 2,
+            description="frames pose v2 après bascule à chaud",
+            timeout=90.0,
+        )
+        loaded_after_pose = sorted(supervisor.loaded_model_ids)
+        references_after_pose = supervisor.models_in_use()
+        inflight_after_pose = supervisor.request_inference_runtime_status()
+        load_counts_after_pose = dict(supervisor.model_load_counts)
+        parcel_not_reloaded = (
+            load_counts_initial.get("demo_synth_det") == 1
+            and load_counts_after_pose.get("demo_synth_det") == 1
+        )
+        if pose_model_id in loaded_after_pose:
+            raise RuntimeError(
+                "Pose v1 est encore chargé après drainage de ses requêtes."
+            )
+        if not parcel_not_reloaded:
+            raise RuntimeError(
+                "Le modèle parcel a été rechargé pendant la bascule pose."
+            )
+
+        _execute_command(
+            supervisor,
+            CommandType.ACTIVATE_MODEL,
+            {
+                "model_id": parcel_v2_model_id,
+                "reason": "E2E hot switch parcel v1 vers v2",
+            },
+        )
+        parcel_v2_generation = int(
+            supervisor.runtime_route("detection").get(
+                "generation"
+            )
+            or 0
+        )
+        _wait_until(
+            supervisor,
+            lambda: (
+                len(
+                    matching_frames(
+                        pose_source_id,
+                        task="detection",
+                        model_id=parcel_v2_model_id,
+                        minimum_generation=parcel_v2_generation,
+                    )
+                )
+                >= 2
+                and len(
+                    matching_frames(
+                        pose_source_id,
+                        task="pose",
+                        model_id=next_pose_model_id,
+                        minimum_generation=pose_v2_generation,
+                    )
+                )
+                >= 2
+            ),
+            description="parcel v2 sans interruption de pose v2",
+            timeout=90.0,
+        )
+        loaded_after_parcel = sorted(supervisor.loaded_model_ids)
+        references_after_parcel = supervisor.models_in_use()
+        inflight_after_parcel = (
+            supervisor.request_inference_runtime_status()
+        )
+        pose_not_reloaded = (
+            load_counts_after_pose.get(next_pose_model_id) == 1
+            and supervisor.model_load_counts.get(next_pose_model_id) == 1
+        )
+        if not pose_not_reloaded:
+            raise RuntimeError(
+                "Pose v2 a été rechargé pendant la bascule parcel."
+            )
+
+        broken_activation_error = ""
+        try:
+            _execute_command(
+                supervisor,
+                CommandType.ACTIVATE_MODEL,
+                {
+                    "model_id": broken_parcel_model_id,
+                    "reason": "E2E échec parcel v3 invalide",
+                },
+            )
+        except RuntimeError as exc:
+            broken_activation_error = str(exc)
+        if not broken_activation_error:
+            raise RuntimeError(
+                "L'activation du modèle parcel v3 invalide devait échouer."
+            )
+        if (
+            supervisor.runtime_route("detection").get("model_id")
+            != parcel_v2_model_id
+        ):
+            raise RuntimeError(
+                "Le routage parcel v2 n'a pas été conservé après l'échec."
+            )
+        registry_after_failure = supervisor.db.fetch_one(
+            """
+            SELECT id FROM model_registry
+            WHERE task = 'detection' AND is_active = 1
+            """
+        )
+        if (
+            registry_after_failure is None
+            or registry_after_failure["id"] != parcel_v2_model_id
+        ):
+            raise RuntimeError(
+                "Le registre n'a pas conservé parcel v2 après l'échec."
+            )
+        failed_history = supervisor.db.fetch_one(
+            """
+            SELECT * FROM model_activation_history
+            WHERE activated_model_id = ?
+            ORDER BY activated_at DESC LIMIT 1
+            """,
+            (broken_parcel_model_id,),
+        )
+        if (
+            failed_history is None
+            or failed_history["status"] != "FAILED"
+            or int(failed_history["runtime_applied"]) != 0
+        ):
+            raise RuntimeError(
+                "L'échec parcel v3 n'est pas tracé comme FAILED."
+            )
+
+        _execute_command(
+            supervisor,
+            CommandType.ROLLBACK_MODEL,
+            {
+                "task": "detection",
+                "reason": "rollback explicite E2E vers parcel v1",
+            },
+        )
+        rollback_generation = int(
+            supervisor.runtime_route("detection").get(
+                "generation"
+            )
+            or 0
+        )
+        rollback_model_id = str(
+            supervisor.runtime_route("detection").get("model_id")
+            or ""
+        )
+        if rollback_model_id != "demo_synth_det":
+            raise RuntimeError(
+                "Le rollback n'a pas sélectionné parcel v1 réellement "
+                f"déployé: {rollback_model_id}"
+            )
+        _wait_until(
+            supervisor,
+            lambda: len(
+                matching_frames(
+                    pose_source_id,
+                    task="detection",
+                    model_id="demo_synth_det",
+                    minimum_generation=rollback_generation,
+                )
+            )
+            >= 2,
+            description="frames parcel v1 après rollback explicite",
+            timeout=90.0,
+        )
+        final_runtime_state = supervisor.publish_runtime_model_state(
+            force=True
+        )
+        final_consistency = final_runtime_state.get(
+            "consistency", {}
+        )
+        if not final_consistency.get("consistent"):
+            raise RuntimeError(
+                "État final runtime/registre incohérent: "
+                f"{final_consistency.get('errors')}"
+            )
+        loaded_after_rollback = sorted(supervisor.loaded_model_ids)
+        references_after_rollback = supervisor.models_in_use()
+        inflight_after_rollback = (
+            supervisor.request_inference_runtime_status()
+        )
+
         _execute_command(
             supervisor,
             CommandType.STOP_SESSION,
@@ -305,49 +595,53 @@ def run_multimodel_e2e(
             step="PROCESS_SESSION",
         )
 
-        parcel_frames = _observation_frames(
-            supervisor,
-            session_id=session_id,
-            source_id=parcel_source_id,
-        )
-        pose_frames = _observation_frames(
-            supervisor,
-            session_id=session_id,
-            source_id=pose_source_id,
-        )
-        parcel_pipeline_verified = bool(parcel_frames) and all(
-            frame.get("tasks") == ["detection"]
-            and frame.get("model_ids") == ["demo_synth_det"]
-            for frame in parcel_frames
-        )
-        combined_frames = [
-            frame
-            for frame in pose_frames
-            if set(frame.get("tasks") or []) == {"detection", "pose"}
-            and set(frame.get("model_ids") or [])
-            == {"demo_synth_det", pose_model_id}
+        parcel_frames = current_frames(parcel_source_id)
+        pose_frames = current_frames(pose_source_id)
+        all_frames = [*parcel_frames, *pose_frames]
+        request_ids = [
+            str(request_id)
+            for frame in all_frames
+            for request_id in frame.get("request_ids") or []
         ]
+        unique_request_ids = len(request_ids) == len(set(request_ids))
+        session_frame_context_valid = all(
+            frame.get("session_id") == session_id
+            and frame.get("source_id")
+            in {parcel_source_id, pose_source_id}
+            and int(frame.get("frame_index", -1)) >= 0
+            and int(frame.get("stream_epoch", -1)) >= 0
+            for frame in all_frames
+        )
+        frame_coordinates = [
+            (
+                str(frame.get("source_id")),
+                int(frame.get("stream_epoch", -1)),
+                int(frame.get("frame_index", -1)),
+            )
+            for frame in all_frames
+        ]
+        unique_frame_coordinates = len(frame_coordinates) == len(
+            set(frame_coordinates)
+        )
+        if not (
+            unique_request_ids
+            and session_frame_context_valid
+            and unique_frame_coordinates
+        ):
+            raise RuntimeError(
+                "La provenance request/session/epoch/frame est invalide."
+            )
         pose_observations = [
             observation
-            for frame in combined_frames
+            for frame in pose_frames
             for observation in frame.get("observations") or []
             if observation.get("class_name") == "person"
             and len(observation.get("keypoints") or []) == 17
-            and observation.get("model_id") == pose_model_id
         ]
-        model_requests: dict[str, int] = {}
-        for frame in [*parcel_frames, *pose_frames]:
-            for pipeline in frame.get("pipeline_results") or []:
-                model_id = str(pipeline["model_id"])
-                requests = int(
-                    (pipeline.get("model_metrics") or {}).get(
-                        "requests", 0
-                    )
-                )
-                model_requests[model_id] = max(
-                    model_requests.get(model_id, 0),
-                    requests,
-                )
+        if not pose_observations:
+            raise RuntimeError(
+                "Le pipeline pose n'a produit aucun jeu de 17 keypoints."
+            )
         event_types = [
             str(row["event_type"])
             for row in supervisor.db.fetch_all(
@@ -367,32 +661,90 @@ def run_multimodel_e2e(
             }
             for event_type in event_types
         )
-        if not parcel_pipeline_verified:
-            raise RuntimeError(
-                "La source parcelle seule n'a pas conservé son pipeline dédié."
-            )
-        if not combined_frames or not pose_observations:
-            raise RuntimeError(
-                "Le pipeline parcelle + pose n'a pas produit les deux tâches."
-            )
-        if (
-            model_requests.get("demo_synth_det", 0) <= 0
-            or model_requests.get(pose_model_id, 0) <= 0
-        ):
-            raise RuntimeError(
-                f"Les deux modèles n'ont pas été appelés: {model_requests}"
-            )
         if not keypoint_event_verified:
             raise RuntimeError(
-                f"Les keypoints n'ont déclenché aucun événement: {event_types}"
+                "Les keypoints n'ont déclenché aucun événement métier: "
+                f"{event_types}"
             )
-
-        load_counts_before = dict(supervisor.model_load_counts)
-        _execute_command(
-            supervisor,
-            CommandType.ACTIVATE_MODEL,
-            {"model_id": next_pose_model_id},
+        parcel_pipeline_verified = bool(parcel_frames) and all(
+            frame.get("tasks") == ["detection"]
+            for frame in parcel_frames
         )
+        combined_frames = [
+            frame
+            for frame in pose_frames
+            if set(frame.get("tasks") or []) == {"detection", "pose"}
+        ]
+        if not parcel_pipeline_verified or not combined_frames:
+            raise RuntimeError(
+                "Les pipelines parcel seul et parcel + pose sont invalides."
+            )
+        model_requests: dict[str, int] = {}
+        for frame in all_frames:
+            for pipeline in frame.get("pipeline_results") or []:
+                model_id = str(pipeline["model_id"])
+                requests = int(
+                    (pipeline.get("model_metrics") or {}).get(
+                        "requests", 0
+                    )
+                )
+                model_requests[model_id] = max(
+                    model_requests.get(model_id, 0),
+                    requests,
+                )
+        history = [
+            dict(row)
+            for row in supervisor.db.fetch_all(
+                """
+                SELECT * FROM model_activation_history
+                WHERE task IN ('detection', 'pose')
+                ORDER BY activated_at
+                """
+            )
+        ]
+        activation_timeline = [
+            {
+                **row,
+                "source_ids": json.loads(
+                    row.get("source_ids_json") or "[]"
+                ),
+                "metadata": json.loads(
+                    row.get("metadata_json") or "{}"
+                ),
+            }
+            for row in history
+        ]
+        unload_confirmations = [
+            {
+                "activation_id": row["id"],
+                "old_model_id": row.get("previous_model_id"),
+                "unload": (
+                    json.loads(row.get("metadata_json") or "{}").get(
+                        "unload_previous"
+                    )
+                    or {}
+                ),
+            }
+            for row in history
+            if (
+                json.loads(row.get("metadata_json") or "{}").get(
+                    "unload_previous"
+                )
+            )
+        ]
+        models_by_frame = [
+            {
+                "source_id": frame.get("source_id"),
+                "stream_epoch": frame.get("stream_epoch"),
+                "frame_index": frame.get("frame_index"),
+                "request_ids": frame.get("request_ids"),
+                "model_ids": frame.get("model_ids"),
+                "routing_generations": frame.get(
+                    "routing_generations"
+                ),
+            }
+            for frame in all_frames
+        ]
         active_models = {
             str(row["task"]): str(row["id"])
             for row in supervisor.db.fetch_all(
@@ -402,23 +754,6 @@ def run_multimodel_e2e(
                 """
             )
         }
-        load_counts_after = dict(supervisor.model_load_counts)
-        parcel_not_reloaded = (
-            load_counts_before.get("demo_synth_det") == 1
-            and load_counts_after.get("demo_synth_det") == 1
-        )
-        if active_models.get("detection") != "demo_synth_det":
-            raise RuntimeError(
-                f"Le modèle parcelle a été désactivé: {active_models}"
-            )
-        if active_models.get("pose") != next_pose_model_id:
-            raise RuntimeError(
-                f"La nouvelle pose n'est pas active: {active_models}"
-            )
-        if not parcel_not_reloaded:
-            raise RuntimeError(
-                "Le modèle parcelle a été rechargé pendant l'activation pose."
-            )
 
         supervisor.shutdown()
         shutdown_clean = (
@@ -445,11 +780,71 @@ def run_multimodel_e2e(
             "model_requests": model_requests,
             "event_types": event_types,
             "keypoint_event_verified": keypoint_event_verified,
-            "load_counts_before_pose_activation": load_counts_before,
-            "load_counts_after_pose_activation": load_counts_after,
+            "sources_active_during_switches": True,
+            "request_ids_unique": unique_request_ids,
+            "session_frame_context_valid": session_frame_context_valid,
+            "frame_coordinates_unique": unique_frame_coordinates,
+            "models_by_frame": models_by_frame,
+            "activation_timeline": activation_timeline,
+            "loaded_models": {
+                "initial": loaded_initial,
+                "after_pose_v2": loaded_after_pose,
+                "after_parcel_v2": loaded_after_parcel,
+                "after_rollback": loaded_after_rollback,
+            },
+            "references": {
+                "initial": references_initial,
+                "after_pose_v2": references_after_pose,
+                "after_parcel_v2": references_after_parcel,
+                "after_rollback": references_after_rollback,
+            },
+            "inflight": {
+                "initial": inflight_initial.get("inflight_by_model", {}),
+                "after_pose_v2": inflight_after_pose.get(
+                    "inflight_by_model", {}
+                ),
+                "after_parcel_v2": inflight_after_parcel.get(
+                    "inflight_by_model", {}
+                ),
+                "after_rollback": inflight_after_rollback.get(
+                    "inflight_by_model", {}
+                ),
+            },
+            "unload_confirmations": unload_confirmations,
+            "load_counts": {
+                "initial": load_counts_initial,
+                "after_pose_v2": load_counts_after_pose,
+                "final": dict(supervisor.model_load_counts),
+            },
+            "pose_v2_generation": pose_v2_generation,
+            "parcel_v2_generation": parcel_v2_generation,
+            "rollback_generation": rollback_generation,
+            "broken_activation_error": broken_activation_error,
+            "failed_activation_history_id": str(
+                failed_history["id"]
+            ),
+            "rollback": {
+                "selected_model_id": rollback_model_id,
+                "was_previously_deployed": any(
+                    row.get("activated_model_id")
+                    == "demo_synth_det"
+                    and row.get("status")
+                    in {"SUPERSEDED", "ROLLED_BACK", "ACTIVE"}
+                    and int(row.get("runtime_applied") or 0) == 1
+                    for row in history
+                ),
+                "candidate_selected": False,
+            },
+            "final_consistency": final_consistency,
             "active_models": active_models,
             "parcel_model_not_reloaded": parcel_not_reloaded,
-            "loaded_model_ids": sorted(supervisor.loaded_model_ids),
+            "pose_model_not_reloaded": pose_not_reloaded,
+            "old_pose_unloaded": pose_model_id
+            not in loaded_after_pose,
+            "old_parcel_v2_unloaded_after_rollback": (
+                parcel_v2_model_id not in loaded_after_rollback
+            ),
+            "loaded_model_ids": loaded_after_rollback,
             "shutdown_clean": shutdown_clean,
             "limits": [
                 "Backend, modèles, vidéos et keypoints simulés.",
