@@ -46,14 +46,36 @@ def test_activation_reloads_inference_worker_and_next_job_uses_active_model(tmp_
     supervisor.control_repo = repo
     supervisor.event_repo = EventRepository(db)
     supervisor.inference_process = _AliveProcess()
-    supervisor.active_model_id = "old-model"
+    supervisor.active_model_id = "demo_synth_det"
+    supervisor.active_model_ids_by_task = {
+        "detection": "demo_synth_det"
+    }
+    supervisor.active_runtime_models_by_task = {
+        "detection": {
+            "task": "detection",
+            "model_id": "demo_synth_det",
+            "generation": 1,
+            "activated_at": 1.0,
+        }
+    }
+    supervisor.active_source_pipelines = {}
+    supervisor.active_source_sessions = {}
+    supervisor.rollback_model_holds = set()
     loaded: list[str] = []
 
     def fake_ensure_model_loaded(model_id: str) -> None:
         loaded.append(model_id)
-        supervisor.active_model_id = model_id
 
     supervisor.ensure_model_loaded = fake_ensure_model_loaded
+    supervisor.validate_model_routing = lambda **kwargs: {
+        "kind": "MODEL_VALIDATED",
+        **kwargs,
+    }
+    supervisor.safe_unload_model = lambda model_id: {
+        "model_id": model_id,
+        "status": "MODEL_UNLOADED",
+        "unloaded": True,
+    }
     supervisor.handle_command(dict(command))
 
     active = db.fetch_one(
@@ -140,21 +162,49 @@ def test_failed_activation_keeps_registry_and_runtime_on_previous_model(tmp_path
     supervisor.control_repo = repo
     supervisor.event_repo = EventRepository(db)
     supervisor.active_model_id = "previous"
+    supervisor.active_model_ids_by_task = {"detection": "previous"}
+    supervisor.active_runtime_models_by_task = {
+        "detection": {
+            "task": "detection",
+            "model_id": "previous",
+            "generation": 1,
+            "activated_at": 1.0,
+        }
+    }
+    supervisor.active_source_pipelines = {}
+    supervisor.active_source_sessions = {}
+    supervisor.rollback_model_holds = set()
     attempts: list[str] = []
 
-    def fake_reload(model_id: str) -> bool:
+    def fake_load(model_id: str) -> None:
         attempts.append(model_id)
         if model_id == "broken":
             raise RuntimeError("simulated reload failure")
-        supervisor.active_model_id = model_id
-        return True
 
-    supervisor.reload_runtime_model = fake_reload
+    supervisor.ensure_model_loaded = fake_load
+    supervisor.validate_model_routing = lambda **kwargs: kwargs
+    supervisor.safe_unload_model = lambda model_id: {
+        "model_id": model_id,
+        "status": "NOT_LOADED",
+        "unloaded": False,
+    }
     supervisor.handle_command(dict(command))
 
     active = db.fetch_one("SELECT id FROM model_registry WHERE is_active = 1")
     status = db.fetch_one("SELECT status FROM commands WHERE id = ?", (command_id,))
     assert active is not None and active["id"] == "previous"
     assert status is not None and status["status"] == "FAILED"
-    assert attempts == ["broken", "previous"]
+    assert attempts == ["broken"]
     assert supervisor.active_model_id == "previous"
+    failure = db.fetch_one(
+        """
+        SELECT status, runtime_applied, error_text
+        FROM model_activation_history
+        WHERE activated_model_id = 'broken'
+        ORDER BY activated_at DESC LIMIT 1
+        """
+    )
+    assert failure is not None
+    assert failure["status"] == "FAILED"
+    assert failure["runtime_applied"] == 0
+    assert "simulated reload failure" in str(failure["error_text"])
