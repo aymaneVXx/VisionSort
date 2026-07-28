@@ -111,6 +111,30 @@ def test_training_then_promote_then_rollback_cycle(tmp_path):
     assert candidate is not None
     assert candidate["status"] == ModelStatus.CANDIDATE.value
 
+    db.execute(
+        """
+        INSERT INTO model_registry
+        (id, name, task, backend, weights_path, status, is_active,
+         notes_json, metrics_json, parent_model_id,
+         created_from_job_id, created_at, updated_at)
+        VALUES ('deployed-before-cycle', 'Previously deployed',
+                'detection', 'demo', '', 'ARCHIVED', 0, '{}', '{}',
+                NULL, NULL, ?, ?)
+        """,
+        (now, now),
+    )
+    db.execute(
+        """
+        INSERT INTO model_activation_history
+        (id, task, previous_model_id, activated_model_id,
+         routing_generation, status, runtime_applied, actor, reason,
+         source_ids_json, activated_at, completed_at, metadata_json)
+        VALUES ('cycle-previous-activation', 'detection', NULL,
+                'deployed-before-cycle', 1, 'SUPERSEDED', 1, 'test',
+                'déploiement antérieur réel', '[]', ?, ?, '{}')
+        """,
+        (now, now),
+    )
     promote_model(db, candidate_id)
     promoted = db.fetch_one("SELECT * FROM model_registry WHERE id = ?", (candidate_id,))
     session = db.fetch_one("SELECT * FROM capture_sessions WHERE id = ?", ("session-cycle",))
@@ -124,4 +148,5 @@ def test_training_then_promote_then_rollback_cycle(tmp_path):
     rolled_back = db.fetch_one("SELECT * FROM model_registry WHERE id = ?", (rolled_back_id,))
     assert rolled_back_id is not None
     assert rolled_back is not None
+    assert rolled_back_id == "deployed-before-cycle"
     assert rolled_back["is_active"] == 1

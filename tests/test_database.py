@@ -38,3 +38,40 @@ def test_source_state_partial_update_preserves_recording_flag(tmp_path):
         (source_id,),
     )
     assert state["recording_enabled"] == 1
+
+
+def test_v9_migration_seeds_existing_active_models(tmp_path):
+    db = VisionSortDB(tmp_path / "legacy-v8.db")
+    db.initialize()
+    with db.connect() as conn:
+        conn.execute("DROP TABLE model_activation_history")
+        conn.execute(
+            """
+            UPDATE model_registry
+            SET status = 'CANDIDATE', is_active = 1
+            WHERE id = 'demo_synth_det'
+            """
+        )
+        conn.execute("PRAGMA user_version = 8")
+
+    db.initialize()
+
+    version = db.fetch_one("PRAGMA user_version")
+    model = db.fetch_one(
+        """
+        SELECT status, is_active FROM model_registry
+        WHERE id = 'demo_synth_det'
+        """
+    )
+    history = db.fetch_one(
+        """
+        SELECT status, runtime_applied
+        FROM model_activation_history
+        WHERE activated_model_id = 'demo_synth_det'
+        """
+    )
+    assert version is not None and version[0] == 9
+    assert model is not None and model["status"] == "CANDIDATE"
+    assert history is not None
+    assert history["status"] == "ACTIVE"
+    assert history["runtime_applied"] == 1

@@ -2,6 +2,7 @@ import json
 
 import cv2
 import numpy as np
+import pytest
 
 from visionsort.core.enums import ModelStatus, PipelineState
 from visionsort.database.db import VisionSortDB, utc_now
@@ -113,6 +114,18 @@ def test_promote_and_rollback_model_registry(tmp_path):
     )
     db.execute(
         """
+        INSERT INTO model_activation_history
+        (id, task, previous_model_id, activated_model_id,
+         routing_generation, status, runtime_applied, actor, reason,
+         source_ids_json, activated_at, completed_at, metadata_json)
+        VALUES ('activation-archived-base', 'detection', NULL,
+                'archived-base', 1, 'SUPERSEDED', 1, 'test',
+                'Déploiement historique vérifié', '[]', ?, ?, '{}')
+        """,
+        (now, now),
+    )
+    db.execute(
+        """
         INSERT INTO model_registry
         (id, name, task, backend, weights_path, status, is_active, notes_json, metrics_json, parent_model_id, created_from_job_id, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -168,6 +181,87 @@ def test_promote_and_rollback_model_registry(tmp_path):
     assert rolled_back == "archived-base"
     assert archived is not None
     assert archived["is_active"] == 1
+
+
+def test_rollback_ignores_candidates_and_never_deployed_archives(tmp_path):
+    db = VisionSortDB(tmp_path / "strict-rollback.db")
+    db.initialize()
+    now = utc_now()
+    for model_id, status in (
+        ("never-deployed", ModelStatus.ARCHIVED.value),
+        ("old-candidate", ModelStatus.CANDIDATE.value),
+    ):
+        db.execute(
+            """
+            INSERT INTO model_registry
+            (id, name, task, backend, weights_path, status, is_active,
+             notes_json, metrics_json, parent_model_id,
+             created_from_job_id, created_at, updated_at)
+            VALUES (?, ?, 'detection', 'demo', '', ?, 0, '{}', '{}',
+                    NULL, NULL, ?, ?)
+            """,
+            (model_id, model_id, status, now, now),
+        )
+    db.execute(
+        """
+        INSERT INTO model_activation_history
+        (id, task, previous_model_id, activated_model_id,
+         routing_generation, status, runtime_applied, actor, reason,
+         source_ids_json, activated_at, completed_at, metadata_json)
+        VALUES ('candidate-history', 'detection', NULL, 'old-candidate',
+                1, 'SUPERSEDED', 1, 'test', 'candidate interdit',
+                '[]', ?, ?, '{}')
+        """,
+        (now, now),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="aucun modèle précédemment déployé",
+    ):
+        rollback_to_previous_active(db)
+
+
+def test_rollback_rejects_deployed_model_with_invalid_artifact_hash(
+    tmp_path,
+):
+    db = VisionSortDB(tmp_path / "invalid-artifact.db")
+    db.initialize()
+    now = utc_now()
+    weights = tmp_path / "previous.pt"
+    weights.write_bytes(b"altered-model")
+    db.execute(
+        """
+        INSERT INTO model_registry
+        (id, name, task, backend, weights_path, status, is_active,
+         notes_json, metrics_json, parent_model_id,
+         created_from_job_id, created_at, updated_at)
+        VALUES ('invalid-previous', 'Invalid Previous', 'detection',
+                'ultralytics', ?, 'ARCHIVED', 0, ?, '{}', NULL, NULL,
+                ?, ?)
+        """,
+        (
+            str(weights),
+            json.dumps({"artifact_sha256": "0" * 64}),
+            now,
+            now,
+        ),
+    )
+    db.execute(
+        """
+        INSERT INTO model_activation_history
+        (id, task, previous_model_id, activated_model_id,
+         routing_generation, status, runtime_applied, actor, reason,
+         source_ids_json, activated_at, completed_at, metadata_json)
+        VALUES ('invalid-history', 'detection', NULL, 'invalid-previous',
+                1, 'SUPERSEDED', 1, 'test', 'ancien déploiement',
+                '[]', ?, ?, '{}')
+        """,
+        (now, now),
+    )
+
+    with pytest.raises(RuntimeError, match="Artefacts invalides"):
+        rollback_to_previous_active(db)
 
 
 def test_promotion_refuses_candidate_without_frozen_test_and_criteria(tmp_path):

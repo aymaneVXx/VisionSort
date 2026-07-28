@@ -22,6 +22,7 @@ from visionsort.core.enums import (
     CommandType,
     JobType,
     MatchResult,
+    ModelStatus,
     ParcelState,
     SourceStatus,
 )
@@ -37,7 +38,15 @@ from visionsort.database.repositories import (
     TrackingRepository,
 )
 from visionsort.datasets.pipeline import build_dataset
-from visionsort.deployment.registry import activate_model, promote_model, rollback_to_previous_active, set_model_status
+from visionsort.deployment.registry import (
+    activate_model,
+    create_activation_history,
+    finish_activation_history,
+    mark_previous_activation,
+    promote_model,
+    rollback_to_previous_active,
+    set_model_status,
+)
 from visionsort.inference.engine import inference_worker_loop
 from visionsort.media.archive import build_session_media_report
 from visionsort.runtime.demo_assets import ensure_demo_assets
@@ -92,7 +101,9 @@ class RuntimeSupervisor:
         self.runtime_queue = self.ctx.Queue()
         self.inference_stop_event = self.ctx.Event()
         self.control_flags = self.manager.dict()
+        self.active_runtime_models_by_task = self.manager.dict()
         self.active_source_sessions: dict[str, str] = {}
+        self.active_source_pipelines: dict[str, list[dict[str, Any]]] = {}
         self.latest_stream_epoch_by_source: dict[str, int] = {}
         self.camera_processes: dict[str, tuple[mp.Process, Any]] = {}
         self.training_processes: dict[str, mp.Process] = {}
@@ -100,12 +111,29 @@ class RuntimeSupervisor:
         self.active_model_id: str | None = None
         self.loaded_model_ids: set[str] = set()
         self.model_load_counts: dict[str, int] = {}
+        self.rollback_model_holds: set[str] = set()
+        self.last_model_load_error: dict[str, str] = {}
+        self.last_model_unload_error: dict[str, str] = {}
+        self.inference_runtime_snapshot: dict[str, Any] = {}
+        self.last_inference_by_task: dict[str, dict[str, Any]] = {}
+        self._last_runtime_model_state_publish = 0.0
         self.active_model_ids_by_task: dict[str, str] = {
             str(row["task"]): str(row["id"])
             for row in self.db.fetch_all(
                 "SELECT id, task FROM model_registry WHERE is_active = 1"
             )
         }
+        activated_at = time.time()
+        for task, model_id in self.active_model_ids_by_task.items():
+            self.active_runtime_models_by_task[task] = {
+                "task": task,
+                "model_id": model_id,
+                "generation": 1,
+                "activated_at": activated_at,
+            }
+        self.active_model_id = self.active_model_ids_by_task.get(
+            "detection"
+        ) or self.active_model_ids_by_task.get("segmentation")
         self._shutdown_complete = False
         self.arbiter = GPUResourceArbiter(
             allow_training_while_inference=bool(self.config.get("gpu", "allow_training_while_inference", default=False)),
@@ -239,9 +267,31 @@ class RuntimeSupervisor:
     def start(self) -> None:
         self.recover_interrupted_jobs()
         self.bootstrap_demo_sources()
+        self.refresh_runtime_routes_from_registry()
         if not self.inference_process.is_alive():
             self.inference_process.start()
-            self.job_repo.upsert_job_run(JobType.GPU_INFERENCE.value, "shared", self.inference_process.pid or 0, "RUNNING", {"active_model_id": self.active_model_id})
+        for task in sorted(self.active_model_ids_by_task):
+            model_id = str(
+                self.runtime_route(task).get("model_id") or ""
+            )
+            if not model_id:
+                continue
+            try:
+                self.ensure_model_loaded(model_id, task=task)
+                self.last_model_load_error.pop(model_id, None)
+            except Exception as exc:
+                self.last_model_load_error[model_id] = str(exc)
+                self.event_repo.add_event(
+                    "active_model_load_failed",
+                    {
+                        "task": task,
+                        "model_id": model_id,
+                        "error": str(exc),
+                    },
+                    severity="error",
+                    model_id=model_id,
+                )
+        self.publish_runtime_model_state(force=True)
         self.job_repo.upsert_job_run(JobType.SUPERVISOR.value, "main", mp.current_process().pid or 0, "RUNNING", {"demo_mode": self.config.demo_mode})
 
     def recover_interrupted_jobs(self) -> None:
@@ -294,6 +344,992 @@ class RuntimeSupervisor:
     def sync_inference_sources(self) -> None:
         sources = {row["id"]: dict(row) for row in self.db.fetch_all("SELECT * FROM sources")}
         self.inference_request_queue.put({"kind": "SYNC_SOURCES", "source_map": sources})
+
+    def runtime_route(self, task: str) -> dict[str, Any]:
+        routes = getattr(self, "active_runtime_models_by_task", None)
+        if routes is not None:
+            route = dict(routes.get(str(task), {}) or {})
+            if route:
+                return route
+        model_id = getattr(self, "active_model_ids_by_task", {}).get(
+            str(task)
+        )
+        return {
+            "task": str(task),
+            "model_id": model_id,
+            "generation": 0,
+            "activated_at": None,
+        }
+
+    def refresh_runtime_routes_from_registry(self) -> None:
+        with self.db.connect() as conn:
+            self.db._seed_model_activation_history(conn)
+        rows = self.db.fetch_all(
+            """
+            SELECT id, task FROM model_registry
+            WHERE is_active = 1 ORDER BY updated_at DESC
+            """
+        )
+        for row in rows:
+            task = str(row["task"])
+            model_id = str(row["id"])
+            current = self.runtime_route(task)
+            if current.get("model_id") == model_id:
+                continue
+            self.apply_runtime_route(
+                task,
+                model_id,
+                generation=max(1, int(current.get("generation") or 0)),
+            )
+
+    def apply_runtime_route(
+        self,
+        task: str,
+        model_id: str,
+        *,
+        generation: int | None = None,
+        activated_at: float | None = None,
+    ) -> dict[str, Any]:
+        task = str(task)
+        previous = self.runtime_route(task)
+        next_generation = int(
+            generation
+            if generation is not None
+            else int(previous.get("generation") or 0) + 1
+        )
+        route = {
+            "task": task,
+            "model_id": str(model_id),
+            "generation": next_generation,
+            "activated_at": float(
+                activated_at if activated_at is not None else time.time()
+            ),
+        }
+        routes = getattr(self, "active_runtime_models_by_task", None)
+        if routes is not None:
+            routes[task] = route
+        if not hasattr(self, "active_model_ids_by_task"):
+            self.active_model_ids_by_task = {}
+        self.active_model_ids_by_task[task] = str(model_id)
+        if task in {"detection", "segmentation"}:
+            self.active_model_id = str(model_id)
+        return route
+
+    def model_references(self, model_id: str) -> dict[str, Any]:
+        model_id = str(model_id)
+        route_tasks = [
+            str(task)
+            for task in set(
+                list(
+                    getattr(
+                        self, "active_model_ids_by_task", {}
+                    ).keys()
+                )
+                + list(
+                    getattr(
+                        self, "active_runtime_models_by_task", {}
+                    ).keys()
+                )
+            )
+            if str(self.runtime_route(task).get("model_id") or "")
+            == model_id
+        ]
+        fixed_sources: list[str] = []
+        for source_id, pipelines in getattr(
+            self, "active_source_pipelines", {}
+        ).items():
+            if any(
+                not bool(pipeline.get("use_active", True))
+                and str(
+                    pipeline.get("configured_model_id")
+                    or pipeline.get("model_id")
+                    or ""
+                )
+                == model_id
+                for pipeline in pipelines
+            ):
+                fixed_sources.append(str(source_id))
+        inflight_request_ids: list[str] = []
+        flags = getattr(self, "control_flags", {})
+        for key, value in list(flags.items()):
+            if not str(key).startswith("__inflight__:"):
+                continue
+            if isinstance(value, dict) and str(
+                value.get("model_id") or ""
+            ) == model_id:
+                inflight_request_ids.append(
+                    str(key).split(":", 1)[-1]
+                )
+        rollback_hold = model_id in getattr(
+            self, "rollback_model_holds", set()
+        )
+        total = (
+            len(route_tasks)
+            + len(fixed_sources)
+            + len(inflight_request_ids)
+            + int(rollback_hold)
+        )
+        return {
+            "model_id": model_id,
+            "route_tasks": sorted(route_tasks),
+            "fixed_sources": sorted(fixed_sources),
+            "inflight_request_ids": sorted(inflight_request_ids),
+            "rollback_hold": rollback_hold,
+            "total": total,
+        }
+
+    def models_in_use(self) -> dict[str, dict[str, Any]]:
+        candidates = set(getattr(self, "loaded_model_ids", set()))
+        candidates.update(
+            str(route.get("model_id"))
+            for route in (
+                self.runtime_route(task)
+                for task in getattr(
+                    self, "active_model_ids_by_task", {}
+                )
+            )
+            if route.get("model_id")
+        )
+        for pipelines in getattr(
+            self, "active_source_pipelines", {}
+        ).values():
+            for pipeline in pipelines:
+                model_id = pipeline.get("configured_model_id") or pipeline.get(
+                    "model_id"
+                )
+                if model_id:
+                    candidates.add(str(model_id))
+        return {
+            model_id: self.model_references(model_id)
+            for model_id in sorted(candidates)
+        }
+
+    def runtime_registry_consistency(
+        self,
+        *,
+        worker_status: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        active_rows = [
+            dict(row)
+            for row in self.db.fetch_all(
+                """
+                SELECT id, task, status, updated_at
+                FROM model_registry
+                WHERE is_active = 1
+                ORDER BY task, updated_at DESC
+                """
+            )
+        ]
+        registry_by_task: dict[str, list[str]] = {}
+        for row in active_rows:
+            registry_by_task.setdefault(
+                str(row["task"]), []
+            ).append(str(row["id"]))
+        routes_proxy = getattr(
+            self, "active_runtime_models_by_task", {}
+        )
+        route_tasks = set(str(task) for task in routes_proxy.keys())
+        tasks = sorted(set(registry_by_task) | route_tasks)
+        status = dict(
+            worker_status
+            or getattr(self, "inference_runtime_snapshot", {})
+            or {}
+        )
+        loaded = sorted(
+            set(
+                str(item)
+                for item in status.get(
+                    "loaded_model_ids",
+                    getattr(self, "loaded_model_ids", set()),
+                )
+            )
+        )
+        inflight = {
+            str(model_id): int(count)
+            for model_id, count in dict(
+                status.get("inflight_by_model", {})
+            ).items()
+        }
+        references = self.models_in_use()
+        errors: list[str] = []
+        warnings: list[str] = []
+        task_rows: list[dict[str, Any]] = []
+        for task in tasks:
+            registry_ids = registry_by_task.get(task, [])
+            route = self.runtime_route(task)
+            runtime_model_id = str(route.get("model_id") or "")
+            registry_model_id = (
+                registry_ids[0] if len(registry_ids) == 1 else ""
+            )
+            task_errors: list[str] = []
+            if len(registry_ids) != 1:
+                task_errors.append(
+                    f"{len(registry_ids)} modèle(s) actif(s) en base"
+                )
+            if registry_model_id != runtime_model_id:
+                task_errors.append(
+                    "registre et routage runtime différents"
+                )
+            if runtime_model_id and runtime_model_id not in loaded:
+                task_errors.append("modèle routé non chargé")
+            task_errors.extend(
+                str(error)
+                for model_id, error in getattr(
+                    self, "last_model_load_error", {}
+                ).items()
+                if model_id == runtime_model_id
+            )
+            errors.extend(f"{task}: {item}" for item in task_errors)
+            task_rows.append(
+                {
+                    "task": task,
+                    "registry_model_id": registry_model_id or None,
+                    "registry_active_ids": registry_ids,
+                    "runtime_model_id": runtime_model_id or None,
+                    "routing_generation": int(
+                        route.get("generation") or 0
+                    ),
+                    "loaded": runtime_model_id in loaded,
+                    "references": int(
+                        references.get(
+                            runtime_model_id, {}
+                        ).get("total", 0)
+                    ),
+                    "inflight": int(
+                        inflight.get(runtime_model_id, 0)
+                    ),
+                    "consistent": not task_errors,
+                    "errors": task_errors,
+                }
+            )
+        required_by_sources: dict[str, list[str]] = {}
+        for source_id, pipelines in getattr(
+            self, "active_source_pipelines", {}
+        ).items():
+            for pipeline in pipelines:
+                task = str(pipeline.get("task") or "detection")
+                if bool(pipeline.get("use_active", True)):
+                    target = str(
+                        self.runtime_route(task).get("model_id") or ""
+                    )
+                else:
+                    target = str(
+                        pipeline.get("configured_model_id")
+                        or pipeline.get("model_id")
+                        or ""
+                    )
+                if target:
+                    required_by_sources.setdefault(
+                        target, []
+                    ).append(str(source_id))
+        for model_id, source_ids in sorted(required_by_sources.items()):
+            if model_id not in loaded:
+                errors.append(
+                    f"{model_id}: requis par les sources actives "
+                    f"{sorted(set(source_ids))}, mais non chargé"
+                )
+        unreferenced_loaded = [
+            model_id
+            for model_id in loaded
+            if int(references.get(model_id, {}).get("total", 0)) == 0
+        ]
+        if unreferenced_loaded:
+            warnings.append(
+                "Modèles chargés sans référence: "
+                + ", ".join(unreferenced_loaded)
+            )
+        return {
+            "consistent": not errors,
+            "checked_at": utc_now(),
+            "tasks": task_rows,
+            "loaded_model_ids": loaded,
+            "inflight_by_model": inflight,
+            "references_by_model": references,
+            "required_by_active_sources": required_by_sources,
+            "unreferenced_loaded_model_ids": unreferenced_loaded,
+            "load_errors": dict(
+                getattr(self, "last_model_load_error", {})
+            ),
+            "unload_errors": dict(
+                getattr(self, "last_model_unload_error", {})
+            ),
+            "errors": errors,
+            "warnings": warnings,
+        }
+
+    def publish_runtime_model_state(
+        self, *, force: bool = False
+    ) -> dict[str, Any]:
+        now = time.monotonic()
+        last_publish = float(
+            getattr(self, "_last_runtime_model_state_publish", 0.0)
+        )
+        if not force and now - last_publish < 1.0:
+            return {}
+        self._last_runtime_model_state_publish = now
+        worker_status = dict(
+            getattr(self, "inference_runtime_snapshot", {}) or {}
+        )
+        worker_error = None
+        inference_process = getattr(self, "inference_process", None)
+        if (
+            inference_process is not None
+            and inference_process.is_alive()
+            and hasattr(self, "inference_request_queue")
+        ):
+            try:
+                worker_status = self.request_inference_runtime_status(
+                    timeout=0.75
+                )
+            except Exception as exc:
+                worker_error = str(exc)
+        consistency = self.runtime_registry_consistency(
+            worker_status=worker_status
+        )
+        if worker_error:
+            consistency["warnings"].append(worker_error)
+        history_rows = [
+            dict(row)
+            for row in self.db.fetch_all(
+                """
+                SELECT * FROM model_activation_history
+                ORDER BY activated_at DESC LIMIT 50
+                """
+            )
+        ]
+        latest_by_task: dict[str, dict[str, Any]] = {}
+        latest_rollback_by_task: dict[str, dict[str, Any]] = {}
+        for row in history_rows:
+            task = str(row["task"])
+            latest_by_task.setdefault(task, row)
+            if (
+                row.get("rolled_back_from_activation_id")
+                or str(row.get("reason") or "").lower().startswith(
+                    "rollback"
+                )
+            ):
+                latest_rollback_by_task.setdefault(task, row)
+        state = {
+            "active_model_id": self.active_model_id,
+            "runtime_routes": {
+                task: self.runtime_route(task)
+                for task in sorted(
+                    set(
+                        getattr(
+                            self,
+                            "active_model_ids_by_task",
+                            {},
+                        )
+                    )
+                    | set(
+                        getattr(
+                            self,
+                            "active_runtime_models_by_task",
+                            {},
+                        ).keys()
+                    )
+                )
+            },
+            "worker": worker_status,
+            "consistency": consistency,
+            "latest_activation_by_task": latest_by_task,
+            "latest_rollback_by_task": latest_rollback_by_task,
+            "published_at": utc_now(),
+        }
+        if hasattr(self, "job_repo"):
+            self.job_repo.upsert_job_run(
+                JobType.GPU_INFERENCE.value,
+                "shared",
+                (
+                    int(inference_process.pid or 0)
+                    if inference_process is not None
+                    else 0
+                ),
+                (
+                    "RUNNING"
+                    if inference_process is not None
+                    and inference_process.is_alive()
+                    else "STOPPED"
+                ),
+                state,
+            )
+        return state
+
+    def request_inference_runtime_status(
+        self, *, timeout: float = 2.0
+    ) -> dict[str, Any]:
+        operation_id = str(uuid.uuid4())
+        key = f"__inference_runtime_status__:{operation_id}"
+        self.inference_result_store.pop(key, None)
+        self.inference_request_queue.put(
+            {
+                "kind": "GET_RUNTIME_STATUS",
+                "operation_id": operation_id,
+            }
+        )
+        deadline = time.monotonic() + max(0.1, float(timeout))
+        while time.monotonic() < deadline:
+            self.drain_inference_results()
+            status = self.inference_result_store.pop(key, None)
+            if status:
+                self.inference_runtime_snapshot = dict(status)
+                return dict(status)
+            time.sleep(0.02)
+        raise RuntimeError("Timeout du statut du worker d'inférence.")
+
+    def safe_unload_model(
+        self,
+        model_id: str,
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        model_id = str(model_id)
+        if model_id not in getattr(self, "loaded_model_ids", set()):
+            return {
+                "model_id": model_id,
+                "status": "NOT_LOADED",
+                "unloaded": False,
+                "references": self.model_references(model_id),
+            }
+        references = self.model_references(model_id)
+        blocking = (
+            len(references["route_tasks"])
+            + len(references["fixed_sources"])
+            + int(references["rollback_hold"])
+        )
+        if blocking:
+            return {
+                "model_id": model_id,
+                "status": "REFERENCED",
+                "unloaded": False,
+                "references": references,
+            }
+        deadline = time.monotonic() + float(
+            timeout
+            if timeout is not None
+            else self.config.get(
+                "runtime",
+                "model_unload_timeout_seconds",
+                default=5.0,
+            )
+        )
+        stable_zero_checks = 0
+        while time.monotonic() < deadline:
+            self.drain_inference_results()
+            references = self.model_references(model_id)
+            if references["inflight_request_ids"]:
+                stable_zero_checks = 0
+                time.sleep(0.02)
+                continue
+            stable_zero_checks += 1
+            if stable_zero_checks >= 2:
+                break
+            time.sleep(0.02)
+        else:
+            error = (
+                "Timeout: requêtes en vol encore présentes; "
+                "modèle conservé en mémoire."
+            )
+            if not hasattr(self, "last_model_unload_error"):
+                self.last_model_unload_error = {}
+            self.last_model_unload_error[model_id] = error
+            if hasattr(self, "event_repo"):
+                self.event_repo.add_event(
+                    "model_unload_timeout",
+                    {
+                        "model_id": model_id,
+                        "references": references,
+                        "error": error,
+                    },
+                    severity="warning",
+                )
+            return {
+                "model_id": model_id,
+                "status": "TIMEOUT",
+                "unloaded": False,
+                "references": references,
+                "error": error,
+            }
+        operation_id = str(uuid.uuid4())
+        unloaded_key = f"__model_unloaded__:{operation_id}"
+        deferred_key = f"__model_unload_deferred__:{operation_id}"
+        self.inference_result_store.pop(unloaded_key, None)
+        self.inference_result_store.pop(deferred_key, None)
+        self.inference_request_queue.put(
+            {
+                "kind": "UNLOAD_MODEL",
+                "model_id": model_id,
+                "operation_id": operation_id,
+            }
+        )
+        while time.monotonic() < deadline:
+            self.drain_inference_results()
+            deferred = self.inference_result_store.pop(
+                deferred_key, None
+            )
+            if deferred:
+                return {
+                    "model_id": model_id,
+                    "status": "DEFERRED",
+                    "unloaded": False,
+                    "references": self.model_references(model_id),
+                    "worker": deferred,
+                }
+            confirmation = self.inference_result_store.pop(
+                unloaded_key, None
+            )
+            if confirmation:
+                self.loaded_model_ids.discard(model_id)
+                getattr(self, "last_model_unload_error", {}).pop(
+                    model_id, None
+                )
+                return {
+                    "model_id": model_id,
+                    "status": "UNLOADED",
+                    "unloaded": True,
+                    "references": self.model_references(model_id),
+                    "worker": confirmation,
+                }
+            time.sleep(0.02)
+        error = "Timeout en attente de MODEL_UNLOADED; modèle conservé."
+        if not hasattr(self, "last_model_unload_error"):
+            self.last_model_unload_error = {}
+        self.last_model_unload_error[model_id] = error
+        return {
+            "model_id": model_id,
+            "status": "TIMEOUT",
+            "unloaded": False,
+            "references": self.model_references(model_id),
+            "error": error,
+        }
+
+    def active_dynamic_sources_for_task(self, task: str) -> list[str]:
+        task = str(task)
+        active_processes = set(
+            getattr(self, "camera_processes", {}).keys()
+        )
+        return sorted(
+            str(source_id)
+            for source_id, pipelines in getattr(
+                self, "active_source_pipelines", {}
+            ).items()
+            if source_id in active_processes
+            and any(
+                bool(pipeline.get("use_active", True))
+                and str(pipeline.get("task") or "") == task
+                for pipeline in pipelines
+            )
+        )
+
+    def validate_model_routing(
+        self,
+        *,
+        task: str,
+        model_id: str,
+        routing_generation: int,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        task = str(task)
+        model_id = str(model_id)
+        deadline = time.monotonic() + float(
+            timeout
+            if timeout is not None
+            else self.config.get(
+                "runtime",
+                "model_switch_validation_timeout_seconds",
+                default=8.0,
+            )
+        )
+        dynamic_sources = self.active_dynamic_sources_for_task(task)
+        if dynamic_sources:
+            while time.monotonic() < deadline:
+                self.drain_inference_results()
+                latest = dict(
+                    getattr(self, "last_inference_by_task", {}).get(
+                        task, {}
+                    )
+                )
+                if (
+                    latest.get("model_id") == model_id
+                    and int(latest.get("routing_generation") or 0)
+                    == int(routing_generation)
+                    and latest.get("source_id") in dynamic_sources
+                    and latest.get("kind") == "INFER_RESULT"
+                ):
+                    return {
+                        "mode": "ACTIVE_SOURCE_INFERENCE",
+                        "dynamic_sources": dynamic_sources,
+                        **latest,
+                    }
+                time.sleep(0.02)
+            raise RuntimeError(
+                "Aucune frame active n'a confirmé le nouveau routage "
+                f"{task} -> {model_id} génération {routing_generation}."
+            )
+        operation_id = str(uuid.uuid4())
+        key = f"__model_validation__:{operation_id}"
+        self.inference_result_store.pop(key, None)
+        self.inference_request_queue.put(
+            {
+                "kind": "VALIDATE_MODEL",
+                "operation_id": operation_id,
+                "task": task,
+                "model_id": model_id,
+                "routing_generation": int(routing_generation),
+            }
+        )
+        while time.monotonic() < deadline:
+            self.drain_inference_results()
+            result = self.inference_result_store.pop(key, None)
+            if result:
+                if result["kind"] == "MODEL_VALIDATION_FAILED":
+                    raise RuntimeError(str(result.get("error")))
+                return {
+                    "mode": "WORKER_READINESS_REQUEST",
+                    **dict(result),
+                }
+            time.sleep(0.02)
+        raise RuntimeError(
+            f"Validation du modèle expirée: {task} -> {model_id}."
+        )
+
+    def _registry_task_snapshot(
+        self, task: str
+    ) -> list[dict[str, Any]]:
+        return [
+            dict(row)
+            for row in self.db.fetch_all(
+                """
+                SELECT id, status, is_active, updated_at
+                FROM model_registry WHERE task = ?
+                """,
+                (str(task),),
+            )
+        ]
+
+    def _restore_registry_task_snapshot(
+        self, task: str, snapshot: list[dict[str, Any]]
+    ) -> None:
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE model_registry
+                SET is_active = 0, updated_at = ?
+                WHERE task = ?
+                """,
+                (utc_now(), str(task)),
+            )
+            for row in snapshot:
+                conn.execute(
+                    """
+                    UPDATE model_registry
+                    SET status = ?, is_active = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        str(row["status"]),
+                        int(row["is_active"]),
+                        str(row["updated_at"]),
+                        str(row["id"]),
+                    ),
+                )
+
+    def switch_runtime_model(
+        self,
+        model_id: str,
+        *,
+        actor: str = "runtime-supervisor",
+        reason: str = "activation demandée",
+        promote: bool = False,
+        rollback: bool = False,
+    ) -> dict[str, Any]:
+        model = self.db.fetch_one(
+            "SELECT * FROM model_registry WHERE id = ?",
+            (str(model_id),),
+        )
+        if model is None:
+            raise RuntimeError("Modèle introuvable.")
+        model = dict(model)
+        task = str(model["task"])
+        allowed_statuses = (
+            {ModelStatus.CANDIDATE.value}
+            if promote
+            else {
+                ModelStatus.CHAMPION.value,
+                ModelStatus.ARCHIVED.value,
+            }
+        )
+        if str(model["status"]) not in allowed_statuses:
+            raise RuntimeError(
+                f"Activation refusée: statut {model['status']} invalide."
+            )
+        previous_route = self.runtime_route(task)
+        previous_model_id = str(
+            previous_route.get("model_id") or ""
+        ) or None
+        next_generation = int(previous_route.get("generation") or 0) + 1
+        source_ids = self.active_dynamic_sources_for_task(task)
+        session_ids = sorted(
+            {
+                str(
+                    getattr(self, "active_source_sessions", {}).get(
+                        source_id
+                    )
+                )
+                for source_id in source_ids
+                if getattr(self, "active_source_sessions", {}).get(
+                    source_id
+                )
+            }
+        )
+        current_activation = self.db.fetch_one(
+            """
+            SELECT id, status, completed_at
+            FROM model_activation_history
+            WHERE task = ? AND activated_model_id = ?
+              AND status = 'ACTIVE' AND runtime_applied = 1
+            ORDER BY COALESCE(completed_at, activated_at) DESC LIMIT 1
+            """,
+            (task, previous_model_id),
+        )
+        activation_id = create_activation_history(
+            self.db,
+            task=task,
+            previous_model_id=previous_model_id,
+            activated_model_id=str(model_id),
+            routing_generation=next_generation,
+            actor=actor,
+            reason=reason,
+            session_id=session_ids[0] if len(session_ids) == 1 else None,
+            source_ids=source_ids,
+            rolled_back_from_activation_id=(
+                str(current_activation["id"])
+                if rollback and current_activation is not None
+                else None
+            ),
+            metadata={
+                "session_ids": session_ids,
+                "switch_steps": {
+                    "loading": "PENDING",
+                    "routing": "PENDING",
+                    "verification": "PENDING",
+                    "registry": "PENDING",
+                    "unload_previous": "PENDING",
+                },
+            },
+        )
+        registry_snapshot = self._registry_task_snapshot(task)
+        route_applied = False
+        registry_persisted = False
+        previous_history_marked = False
+        validation: dict[str, Any] | None = None
+        unload_result: dict[str, Any] | None = None
+        steps = {
+            "loading": "PENDING",
+            "routing": "PENDING",
+            "verification": "PENDING",
+            "registry": "PENDING",
+            "unload_previous": "PENDING",
+        }
+        if not hasattr(self, "rollback_model_holds"):
+            self.rollback_model_holds = set()
+        if previous_model_id:
+            self.rollback_model_holds.add(previous_model_id)
+        self.rollback_model_holds.add(str(model_id))
+        try:
+            self.ensure_model_loaded(str(model_id))
+            steps["loading"] = "COMPLETED"
+            route = self.apply_runtime_route(
+                task,
+                str(model_id),
+                generation=next_generation,
+            )
+            route_applied = True
+            steps["routing"] = "COMPLETED"
+            validation = self.validate_model_routing(
+                task=task,
+                model_id=str(model_id),
+                routing_generation=int(route["generation"]),
+            )
+            steps["verification"] = "COMPLETED"
+            if promote:
+                promote_model(self.db, str(model_id))
+            else:
+                activate_model(self.db, str(model_id))
+            registry_persisted = True
+            steps["registry"] = "COMPLETED"
+            previous_history_marked = bool(
+                mark_previous_activation(
+                    self.db,
+                    task=task,
+                    model_id=previous_model_id,
+                    status=(
+                        "ROLLED_BACK"
+                        if rollback
+                        else "SUPERSEDED"
+                    ),
+                )
+            )
+            finish_activation_history(
+                self.db,
+                activation_id,
+                status="ACTIVE",
+                runtime_applied=True,
+                metadata={
+                    "switch_steps": steps,
+                    "validation": validation,
+                },
+            )
+            self.rollback_model_holds.discard(str(model_id))
+            if previous_model_id:
+                self.rollback_model_holds.discard(previous_model_id)
+            if previous_model_id and previous_model_id != str(model_id):
+                unload_result = self.safe_unload_model(
+                    previous_model_id
+                )
+            else:
+                unload_result = {
+                    "status": "NOT_REQUIRED",
+                    "unloaded": False,
+                }
+            steps["unload_previous"] = str(
+                unload_result.get("status") or "UNKNOWN"
+            )
+            finish_activation_history(
+                self.db,
+                activation_id,
+                status="ACTIVE",
+                runtime_applied=True,
+                metadata={
+                    "switch_steps": steps,
+                    "validation": validation,
+                    "unload_previous": unload_result,
+                },
+            )
+            if hasattr(self, "event_repo"):
+                self.event_repo.add_event(
+                    "runtime_model_switched",
+                    {
+                        "activation_id": activation_id,
+                        "task": task,
+                        "previous_model_id": previous_model_id,
+                        "new_model_id": str(model_id),
+                        "routing_generation": next_generation,
+                        "session_ids": session_ids,
+                        "source_ids": source_ids,
+                        "validation": validation,
+                        "unload_previous": unload_result,
+                    },
+                    severity="info",
+                    session_id=(
+                        session_ids[0]
+                        if len(session_ids) == 1
+                        else None
+                    ),
+                    model_id=str(model_id),
+                )
+            result = {
+                "activation_id": activation_id,
+                "task": task,
+                "previous_model_id": previous_model_id,
+                "model_id": str(model_id),
+                "routing_generation": next_generation,
+                "runtime_applied": True,
+                "validation": validation,
+                "unload_previous": unload_result,
+                "steps": steps,
+            }
+            if hasattr(self, "job_repo"):
+                self.publish_runtime_model_state(force=True)
+            return result
+        except Exception as exc:
+            rollback_validation = None
+            rollback_error = None
+            try:
+                if route_applied and previous_model_id:
+                    restored = self.apply_runtime_route(
+                        task,
+                        previous_model_id,
+                        generation=int(
+                            previous_route.get("generation") or 0
+                        ),
+                        activated_at=previous_route.get("activated_at"),
+                    )
+                    rollback_validation = self.validate_model_routing(
+                        task=task,
+                        model_id=previous_model_id,
+                        routing_generation=int(
+                            restored["generation"]
+                        ),
+                    )
+                if registry_persisted:
+                    self._restore_registry_task_snapshot(
+                        task, registry_snapshot
+                    )
+                if (
+                    previous_history_marked
+                    and current_activation is not None
+                ):
+                    self.db.execute(
+                        """
+                        UPDATE model_activation_history
+                        SET status = ?, completed_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            str(current_activation["status"]),
+                            current_activation["completed_at"],
+                            str(current_activation["id"]),
+                        ),
+                    )
+            except Exception as restore_exc:
+                rollback_error = str(restore_exc)
+            finally:
+                self.rollback_model_holds.discard(str(model_id))
+                if previous_model_id:
+                    self.rollback_model_holds.discard(previous_model_id)
+            failed_unload = None
+            if str(model_id) != previous_model_id:
+                failed_unload = self.safe_unload_model(str(model_id))
+            finish_activation_history(
+                self.db,
+                activation_id,
+                status="FAILED",
+                runtime_applied=False,
+                error_text=str(exc),
+                metadata={
+                    "switch_steps": steps,
+                    "rollback_validation": rollback_validation,
+                    "rollback_error": rollback_error,
+                    "failed_model_unload": failed_unload,
+                },
+            )
+            if hasattr(self, "event_repo"):
+                self.event_repo.add_event(
+                    "runtime_model_switch_failed",
+                    {
+                        "activation_id": activation_id,
+                        "task": task,
+                        "previous_model_id": previous_model_id,
+                        "new_model_id": str(model_id),
+                        "routing_generation": next_generation,
+                        "error": str(exc),
+                        "rollback_error": rollback_error,
+                        "failed_model_unload": failed_unload,
+                    },
+                    severity="error",
+                    model_id=str(model_id),
+                )
+            if hasattr(self, "job_repo"):
+                self.publish_runtime_model_state(force=True)
+            suffix = (
+                f" Restauration incomplète: {rollback_error}"
+                if rollback_error
+                else ""
+            )
+            raise RuntimeError(
+                f"Échec de la bascule {task} vers {model_id}: {exc}.{suffix}"
+            ) from exc
 
     def ensure_model_loaded(
         self,
@@ -365,14 +1401,12 @@ class RuntimeSupervisor:
                             "loaded_model_ids", [model_id]
                         )
                     )
+                    getattr(
+                        self, "last_model_load_error", {}
+                    ).pop(model_id, None)
                     resolved_task = str(
                         ready.get("task") or task or "detection"
                     )
-                    if not hasattr(self, "active_model_ids_by_task"):
-                        self.active_model_ids_by_task = {}
-                    self.active_model_ids_by_task[resolved_task] = model_id
-                    if resolved_task in {"detection", "segmentation"}:
-                        self.active_model_id = model_id
                     if hasattr(self, "job_repo"):
                         self.job_repo.upsert_job_run(
                             JobType.GPU_INFERENCE.value,
@@ -401,15 +1435,8 @@ class RuntimeSupervisor:
             (configured_model_id,),
         )
         task = str(configured["task"] if configured else "detection")
-        active = self.db.fetch_one(
-            """
-            SELECT id FROM model_registry
-            WHERE is_active = 1 AND task = ?
-            ORDER BY updated_at DESC LIMIT 1
-            """,
-            (task,),
-        )
-        return str(active["id"]) if active is not None else configured_model_id
+        route = self.runtime_route(task)
+        return str(route.get("model_id") or configured_model_id)
 
     def resolve_model_pipeline(
         self,
@@ -417,7 +1444,7 @@ class RuntimeSupervisor:
         *,
         configured_model_id: str,
         snapshot: str | list[dict[str, Any]] | None = None,
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         if isinstance(snapshot, str):
             try:
                 raw_assignments = json.loads(snapshot or "[]")
@@ -450,7 +1477,7 @@ class RuntimeSupervisor:
                     "enabled": True,
                 }
             ]
-        pipeline: list[dict[str, str]] = []
+        pipeline: list[dict[str, Any]] = []
         seen_roles: set[str] = set()
         use_registry = (
             self.config.get(
@@ -468,8 +1495,10 @@ class RuntimeSupervisor:
                     f"Pipeline dupliqué pour {source_id}: {role}"
                 )
             seen_roles.add(role)
-            model_id = assignment.get("model_id")
-            if use_registry and bool(assignment.get("use_active", True)):
+            configured_assignment_model_id = assignment.get("model_id")
+            use_active = bool(assignment.get("use_active", True))
+            model_id = configured_assignment_model_id
+            if use_registry and use_active:
                 active = self.db.fetch_one(
                     """
                     SELECT id FROM model_registry
@@ -497,6 +1526,12 @@ class RuntimeSupervisor:
                     "pipeline_role": role,
                     "task": task,
                     "model_id": str(model_id),
+                    "configured_model_id": (
+                        str(configured_assignment_model_id)
+                        if configured_assignment_model_id
+                        else str(model_id)
+                    ),
+                    "use_active": use_active,
                 }
             )
         if not pipeline:
@@ -512,14 +1547,14 @@ class RuntimeSupervisor:
                 "SELECT task FROM model_registry WHERE id = ?",
                 (model_id,),
             )
-            if model_id in getattr(self, "loaded_model_ids", set()):
-                self.ensure_model_loaded(
-                    model_id,
-                    task=str(row["task"] if row else ""),
-                    force_reload=True,
-                )
-            else:
-                self.ensure_model_loaded(model_id)
+            task = str(row["task"] if row else "")
+            previous_model_id = str(
+                self.runtime_route(task).get("model_id") or ""
+            )
+            self.ensure_model_loaded(model_id)
+            self.apply_runtime_route(task, model_id)
+            if previous_model_id and previous_model_id != model_id:
+                self.safe_unload_model(previous_model_id)
             return True
         return False
 
@@ -568,6 +1603,9 @@ class RuntimeSupervisor:
         cfg["replay_loop"] = bool(replay_loop)
         cfg["archive_required"] = bool(archive_required)
         self.active_source_sessions[source_id] = session_id
+        self.active_source_pipelines[source_id] = [
+            dict(item) for item in model_pipeline
+        ]
         self.latest_stream_epoch_by_source[source_id] = -1
         self.control_flags[source_id] = {"recording": False}
         process = self.ctx.Process(
@@ -581,6 +1619,7 @@ class RuntimeSupervisor:
                 self.runtime_queue,
                 stop_event,
                 self.control_flags,
+                self.active_runtime_models_by_task,
             ),
             daemon=True,
             name=f"visionsort-camera-{row['role']}",
@@ -668,6 +1707,8 @@ class RuntimeSupervisor:
     def stop_source(self, source_id: str) -> None:
         if hasattr(self, "active_source_sessions"):
             self.active_source_sessions.pop(source_id, None)
+        if hasattr(self, "active_source_pipelines"):
+            self.active_source_pipelines.pop(source_id, None)
         if hasattr(self, "latest_stream_epoch_by_source"):
             self.latest_stream_epoch_by_source.pop(source_id, None)
         data = self.camera_processes.pop(source_id, None)
@@ -1161,32 +2202,25 @@ class RuntimeSupervisor:
                     "status": "REJECTED",
                 }
             elif command_type == CommandType.PROMOTE_MODEL.value:
-                candidate = self.db.fetch_one(
-                    "SELECT task FROM model_registry WHERE id = ?",
-                    (payload["model_id"],),
+                switch = self.switch_runtime_model(
+                    str(payload["model_id"]),
+                    actor=str(
+                        payload.get("actor")
+                        or command.get("owner")
+                        or "streamlit"
+                    ),
+                    reason=str(
+                        payload.get("reason")
+                        or "promotion du modèle candidat"
+                    ),
+                    promote=True,
                 )
-                if candidate is None:
-                    raise RuntimeError("Modèle introuvable.")
-                task = str(candidate["task"])
-                previous_active = self.db.fetch_one(
-                    """
-                    SELECT id FROM model_registry
-                    WHERE is_active = 1 AND task = ? LIMIT 1
-                    """,
-                    (task,),
-                )
-                try:
-                    reloaded = self.reload_runtime_model(payload["model_id"])
-                    promote_model(self.db, payload["model_id"])
-                except Exception:
-                    if previous_active is not None:
-                        self.reload_runtime_model(str(previous_active["id"]))
-                    raise
                 result_payload = {
                     "model_id": payload["model_id"],
                     "status": "CHAMPION",
-                    "task": task,
-                    "runtime_reloaded": reloaded,
+                    "task": switch["task"],
+                    "runtime_reloaded": True,
+                    **switch,
                 }
             elif command_type == CommandType.REJECT_MODEL.value:
                 set_model_status(self.db, payload["model_id"], "REJECTED")
@@ -1195,61 +2229,47 @@ class RuntimeSupervisor:
                 set_model_status(self.db, payload["model_id"], "ARCHIVED")
                 result_payload = {"model_id": payload["model_id"], "status": "ARCHIVED"}
             elif command_type == CommandType.ACTIVATE_MODEL.value:
-                candidate = self.db.fetch_one(
-                    "SELECT task FROM model_registry WHERE id = ?",
-                    (payload["model_id"],),
+                switch = self.switch_runtime_model(
+                    str(payload["model_id"]),
+                    actor=str(
+                        payload.get("actor")
+                        or command.get("owner")
+                        or "streamlit"
+                    ),
+                    reason=str(
+                        payload.get("reason")
+                        or "activation manuelle"
+                    ),
                 )
-                if candidate is None:
-                    raise RuntimeError("Modèle introuvable.")
-                task = str(candidate["task"])
-                previous_active = self.db.fetch_one(
-                    """
-                    SELECT id FROM model_registry
-                    WHERE is_active = 1 AND task = ? LIMIT 1
-                    """,
-                    (task,),
-                )
-                try:
-                    reloaded = self.reload_runtime_model(payload["model_id"])
-                    activate_model(self.db, payload["model_id"])
-                except Exception:
-                    if previous_active is not None:
-                        self.reload_runtime_model(str(previous_active["id"]))
-                    raise
                 result_payload = {
                     "model_id": payload["model_id"],
-                    "task": task,
-                    "runtime_reloaded": reloaded,
+                    "task": switch["task"],
+                    "runtime_reloaded": True,
+                    **switch,
                 }
             elif command_type == CommandType.ROLLBACK_MODEL.value:
                 task = str(payload.get("task") or "detection")
-                previous_active = self.db.fetch_one(
-                    """
-                    SELECT id FROM model_registry
-                    WHERE is_active = 1 AND task = ? LIMIT 1
-                    """,
-                    (task,),
-                )
                 rollback_model_id = rollback_to_previous_active(
-                    self.db, task
+                    self.db, task, apply=False
                 )
-                try:
-                    reloaded = (
-                        self.reload_runtime_model(rollback_model_id)
-                        if rollback_model_id
-                        else False
-                    )
-                except Exception:
-                    if previous_active is not None:
-                        activate_model(
-                            self.db, str(previous_active["id"])
-                        )
-                        self.reload_runtime_model(str(previous_active["id"]))
-                    raise
+                switch = self.switch_runtime_model(
+                    rollback_model_id,
+                    actor=str(
+                        payload.get("actor")
+                        or command.get("owner")
+                        or "streamlit"
+                    ),
+                    reason=str(
+                        payload.get("reason")
+                        or "rollback explicite"
+                    ),
+                    rollback=True,
+                )
                 result_payload = {
                     "model_id": rollback_model_id,
                     "task": task,
-                    "runtime_reloaded": reloaded,
+                    "runtime_reloaded": True,
+                    **switch,
                 }
             elif command_type == CommandType.BOOTSTRAP_DEMO.value:
                 self.bootstrap_demo_sources()
@@ -1381,6 +2401,36 @@ class RuntimeSupervisor:
                 model_id = str(message["model_id"])
                 if hasattr(self, "loaded_model_ids"):
                     self.loaded_model_ids.discard(model_id)
+                operation_id = str(message.get("operation_id") or "")
+                if operation_id:
+                    self.inference_result_store[
+                        f"__model_unloaded__:{operation_id}"
+                    ] = message
+                continue
+            if message["kind"] == "MODEL_UNLOAD_DEFERRED":
+                operation_id = str(message.get("operation_id") or "")
+                if operation_id:
+                    self.inference_result_store[
+                        f"__model_unload_deferred__:{operation_id}"
+                    ] = message
+                continue
+            if message["kind"] == "INFERENCE_RUNTIME_STATUS":
+                operation_id = str(message.get("operation_id") or "")
+                self.inference_runtime_snapshot = dict(message)
+                if operation_id:
+                    self.inference_result_store[
+                        f"__inference_runtime_status__:{operation_id}"
+                    ] = message
+                continue
+            if message["kind"] in {
+                "MODEL_VALIDATED",
+                "MODEL_VALIDATION_FAILED",
+            }:
+                operation_id = str(message.get("operation_id") or "")
+                if operation_id:
+                    self.inference_result_store[
+                        f"__model_validation__:{operation_id}"
+                    ] = message
                 continue
             if message["kind"] not in {"INFER_RESULT", "INFER_ERROR"}:
                 continue
@@ -1412,6 +2462,27 @@ class RuntimeSupervisor:
             stored["stored_at"] = time.time()
             if message["kind"] == "INFER_ERROR":
                 stored["error"] = message["error"]
+            task = str(message.get("task") or "")
+            if task:
+                if not hasattr(self, "last_inference_by_task"):
+                    self.last_inference_by_task = {}
+                self.last_inference_by_task[task] = {
+                    "request_id": request_id,
+                    "model_id": str(message.get("model_id") or ""),
+                    "task": task,
+                    "pipeline_role": message.get("pipeline_role"),
+                    "routing_generation": int(
+                        message.get("routing_generation") or 0
+                    ),
+                    "session_id": message.get("session_id"),
+                    "source_id": source_id,
+                    "stream_epoch": epoch,
+                    "frame_index": int(
+                        message.get("frame_index") or 0
+                    ),
+                    "kind": message["kind"],
+                    "stored_at": stored["stored_at"],
+                }
             self.inference_result_store[request_id] = stored
 
     def _increment_inference_result_metric(
@@ -1443,6 +2514,8 @@ class RuntimeSupervisor:
             if not process.is_alive():
                 self.job_repo.mark_job_stopped(JobType.CAMERA.value, source_id, status="EXITED")
                 self.camera_processes.pop(source_id, None)
+                self.active_source_sessions.pop(source_id, None)
+                self.active_source_pipelines.pop(source_id, None)
         for job_id, process in list(self.training_processes.items()):
             if not process.is_alive():
                 training_job = self.db.fetch_one(
@@ -1500,6 +2573,7 @@ class RuntimeSupervisor:
                 self.refresh_jobs()
                 for command in self.control_repo.list_pending_commands():
                     self.handle_command(command)
+                self.publish_runtime_model_state()
                 time.sleep(float(self.config.get("runtime", "poll_interval_seconds", default=1.0)))
         finally:
             self.shutdown()

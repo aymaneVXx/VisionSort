@@ -64,6 +64,31 @@ def release_model_memory() -> None:
         pass
 
 
+def cuda_memory_snapshot() -> dict[str, Any]:
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return {"available": False}
+        return {
+            "available": True,
+            "device": torch.cuda.current_device(),
+            "device_name": torch.cuda.get_device_name(
+                torch.cuda.current_device()
+            ),
+            "allocated_bytes": int(torch.cuda.memory_allocated()),
+            "reserved_bytes": int(torch.cuda.memory_reserved()),
+            "max_allocated_bytes": int(
+                torch.cuda.max_memory_allocated()
+            ),
+            "max_reserved_bytes": int(
+                torch.cuda.max_memory_reserved()
+            ),
+        }
+    except Exception as exc:
+        return {"available": False, "error": str(exc)}
+
+
 class DemoDetectionBackend:
     def __init__(self):
         self.sidecars: dict[str, dict[int, list[dict[str, Any]]]] = {}
@@ -265,6 +290,7 @@ def inference_worker_loop(
     engines: dict[str, SharedInferenceEngine] = {}
     load_counts: dict[str, int] = {}
     inference_metrics: dict[str, dict[str, float | int]] = {}
+    inflight_counts: dict[str, int] = {}
     source_map: dict[str, dict[str, Any]] = {}
     while not stop_event.is_set():
         try:
@@ -322,21 +348,96 @@ def inference_worker_loop(
                 )
         elif kind == "UNLOAD_MODEL":
             model_id = str(message["model_id"])
-            engines.pop(model_id, None)
+            operation_id = str(message.get("operation_id") or "")
+            inflight = int(inflight_counts.get(model_id, 0))
+            if inflight > 0:
+                result_queue.put(
+                    {
+                        "kind": "MODEL_UNLOAD_DEFERRED",
+                        "operation_id": operation_id,
+                        "model_id": model_id,
+                        "inflight_requests": inflight,
+                        "loaded_model_ids": sorted(engines),
+                    }
+                )
+                continue
+            removed = engines.pop(model_id, None)
+            inference_metrics.pop(model_id, None)
+            inflight_counts.pop(model_id, None)
+            if removed is not None:
+                del removed
             release_model_memory()
             result_queue.put(
                 {
                     "kind": "MODEL_UNLOADED",
+                    "operation_id": operation_id,
                     "model_id": model_id,
                     "loaded_model_ids": sorted(engines),
+                    "memory_cleanup_called": True,
                 }
             )
+        elif kind == "GET_RUNTIME_STATUS":
+            result_queue.put(
+                {
+                    "kind": "INFERENCE_RUNTIME_STATUS",
+                    "operation_id": str(
+                        message.get("operation_id") or ""
+                    ),
+                    "loaded_model_ids": sorted(engines),
+                    "inflight_by_model": {
+                        model_id: int(inflight_counts.get(model_id, 0))
+                        for model_id in sorted(engines)
+                    },
+                    "metrics_by_model": {
+                        model_id: dict(inference_metrics.get(model_id, {}))
+                        for model_id in sorted(engines)
+                    },
+                    "cuda_memory": cuda_memory_snapshot(),
+                }
+            )
+        elif kind == "VALIDATE_MODEL":
+            model_id = str(message["model_id"])
+            if model_id not in engines:
+                result_queue.put(
+                    {
+                        "kind": "MODEL_VALIDATION_FAILED",
+                        "operation_id": str(
+                            message.get("operation_id") or ""
+                        ),
+                        "model_id": model_id,
+                        "task": message.get("task"),
+                        "error": f"Modèle non chargé: {model_id}",
+                    }
+                )
+            else:
+                engine = engines[model_id]
+                result_queue.put(
+                    {
+                        "kind": "MODEL_VALIDATED",
+                        "operation_id": str(
+                            message.get("operation_id") or ""
+                        ),
+                        "model_id": model_id,
+                        "task": str(
+                            engine.backend_info.get("task")
+                            or message.get("task")
+                            or ""
+                        ),
+                        "routing_generation": int(
+                            message.get("routing_generation") or 0
+                        ),
+                        "loaded_model_ids": sorted(engines),
+                    }
+                )
         elif kind == "INFER":
             model_id = str(
                 message.get("model_id") or next(iter(engines), "")
             )
             task = str(message.get("task") or "")
             started = time.perf_counter()
+            inflight_counts[model_id] = (
+                int(inflight_counts.get(model_id, 0)) + 1
+            )
             try:
                 if model_id not in engines:
                     raise RuntimeError(
@@ -370,6 +471,9 @@ def inference_worker_loop(
                         "model_id": model_id,
                         "task": task,
                         "pipeline_role": message.get("pipeline_role"),
+                        "routing_generation": int(
+                            message.get("routing_generation") or 0
+                        ),
                         "session_id": message["session_id"],
                         "source_id": message["source_id"],
                         "camera_id": message["camera_id"],
@@ -404,6 +508,9 @@ def inference_worker_loop(
                         "model_id": model_id,
                         "task": task,
                         "pipeline_role": message.get("pipeline_role"),
+                        "routing_generation": int(
+                            message.get("routing_generation") or 0
+                        ),
                         "session_id": message.get("session_id"),
                         "source_id": message.get("source_id"),
                         "camera_id": message["camera_id"],
@@ -414,4 +521,8 @@ def inference_worker_loop(
                         "model_metrics": dict(metrics),
                         "error": str(exc),
                     }
+                )
+            finally:
+                inflight_counts[model_id] = max(
+                    0, int(inflight_counts.get(model_id, 1)) - 1
                 )

@@ -210,6 +210,24 @@ class VisionSortDB:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS model_activation_history (
+                    id TEXT PRIMARY KEY,
+                    task TEXT NOT NULL,
+                    previous_model_id TEXT,
+                    activated_model_id TEXT NOT NULL,
+                    routing_generation INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    runtime_applied INTEGER NOT NULL DEFAULT 0,
+                    actor TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    session_id TEXT,
+                    source_ids_json TEXT NOT NULL DEFAULT '[]',
+                    activated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    rolled_back_from_activation_id TEXT,
+                    error_text TEXT,
+                    metadata_json TEXT NOT NULL DEFAULT '{}'
+                );
                 CREATE TABLE IF NOT EXISTS tracker_registry (
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
@@ -448,6 +466,12 @@ class VisionSortDB:
                 CREATE INDEX IF NOT EXISTS idx_source_model_assignments_source ON source_model_assignments(source_id, enabled);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_model_active_task
                     ON model_registry(task) WHERE is_active = 1;
+                CREATE INDEX IF NOT EXISTS idx_model_activation_task_time
+                    ON model_activation_history(
+                        task, completed_at, activated_at
+                    );
+                CREATE INDEX IF NOT EXISTS idx_model_activation_status
+                    ON model_activation_history(status, runtime_applied);
                 """
             )
             self._migrate(conn)
@@ -472,6 +496,7 @@ class VisionSortDB:
                         now,
                     ),
                 )
+            self._seed_model_activation_history(conn)
             for tracker in DEFAULT_TRACKERS:
                 conn.execute(
                     """
@@ -807,6 +832,88 @@ class VisionSortDB:
                 """
             )
             conn.execute("PRAGMA user_version = 8")
+
+        if version < 9:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS model_activation_history (
+                    id TEXT PRIMARY KEY,
+                    task TEXT NOT NULL,
+                    previous_model_id TEXT,
+                    activated_model_id TEXT NOT NULL,
+                    routing_generation INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    runtime_applied INTEGER NOT NULL DEFAULT 0,
+                    actor TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    session_id TEXT,
+                    source_ids_json TEXT NOT NULL DEFAULT '[]',
+                    activated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    rolled_back_from_activation_id TEXT,
+                    error_text TEXT,
+                    metadata_json TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE INDEX IF NOT EXISTS idx_model_activation_task_time
+                    ON model_activation_history(
+                        task, completed_at, activated_at
+                    );
+                CREATE INDEX IF NOT EXISTS idx_model_activation_status
+                    ON model_activation_history(status, runtime_applied);
+                """
+            )
+            self._seed_model_activation_history(conn)
+            conn.execute("PRAGMA user_version = 9")
+
+    @staticmethod
+    def _seed_model_activation_history(
+        conn: sqlite3.Connection,
+    ) -> None:
+        now = utc_now()
+        active_rows = conn.execute(
+            """
+            SELECT id, task, updated_at FROM model_registry
+            WHERE is_active = 1
+            """
+        ).fetchall()
+        for row in active_rows:
+            already_recorded = conn.execute(
+                """
+                SELECT 1 FROM model_activation_history
+                WHERE task = ? AND activated_model_id = ?
+                  AND status IN ('ACTIVE', 'SUPERSEDED', 'ROLLED_BACK')
+                  AND runtime_applied = 1
+                LIMIT 1
+                """,
+                (str(row["task"]), str(row["id"])),
+            ).fetchone()
+            if already_recorded is not None:
+                continue
+            activation_id = (
+                f"seed-{str(row['task'])}-{str(row['id'])}"
+            )
+            activated_at = str(row["updated_at"] or now)
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO model_activation_history
+                (id, task, previous_model_id, activated_model_id,
+                 routing_generation, status, runtime_applied, actor,
+                 reason, session_id, source_ids_json, activated_at,
+                 completed_at, rolled_back_from_activation_id, error_text,
+                 metadata_json)
+                VALUES (?, ?, NULL, ?, 1, 'ACTIVE', 1, 'migration',
+                        'Initialisation depuis le registre actif', NULL, '[]',
+                        ?, ?, NULL, NULL, ?)
+                """,
+                (
+                    activation_id,
+                    str(row["task"]),
+                    str(row["id"]),
+                    activated_at,
+                    activated_at,
+                    json.dumps({"seeded": True}),
+                ),
+            )
 
     def fetch_all(self, query: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
         with self.connect() as conn:
