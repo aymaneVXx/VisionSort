@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from visionsort.core.config import load_config
 from visionsort.database.db import VisionSortDB
@@ -12,10 +13,16 @@ class UIContext:
     db: VisionSortDB
     repo: ControlRepository
     config_demo_mode: bool
+    config_values: dict[str, Any]
 
 
 def create_ui_context() -> UIContext:
     config = load_config()
     db = VisionSortDB()
     db.initialize()
-    return UIContext(db=db, repo=ControlRepository(db), config_demo_mode=config.demo_mode)
+    return UIContext(
+        db=db,
+        repo=ControlRepository(db),
+        config_demo_mode=config.demo_mode,
+        config_values=dict(config.values),
+    )

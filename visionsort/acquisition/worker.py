@@ -13,6 +13,8 @@ from typing import Any
 
 import cv2
 
+from visionsort.calibration.geometry import runtime_calibration_diagnostic
+from visionsort.calibration.models import CalibrationProfile
 from visionsort.core.config import AppConfig
 from visionsort.core.config import relative_to_root
 from visionsort.core.enums import SourceStatus
@@ -458,6 +460,20 @@ def camera_worker_loop(
         loop=bool(source_config.get("replay_loop", False)),
     )
     preview_path = PREVIEWS_DIR / f"{source_id}.jpg"
+    calibration_frame_path = PREVIEWS_DIR / f"{source_id}-calibration.jpg"
+    calibration_payload = source_config.get("calibration_profile_json") or {}
+    if isinstance(calibration_payload, str):
+        calibration_payload = json.loads(calibration_payload or "{}")
+    calibration_profile = (
+        CalibrationProfile.from_dict(calibration_payload)
+        if calibration_payload
+        else None
+    )
+    calibration_diagnostic: dict[str, Any] = {
+        "status": "NOT_CHECKED",
+        "applicable": False,
+    }
+    calibration_image_size: tuple[int, int] | None = None
     status = SourceStatus.CONNECTING.value
     frame_counter = 0
     fps_window_started = time.time()
@@ -471,7 +487,13 @@ def camera_worker_loop(
     try:
         acquisition.start()
         status = SourceStatus.REPLAY.value if source_config["source_type"] == "REPLAY" else SourceStatus.LIVE.value
-        repo.update_source_state(source_id, status=status, fps=0.0, preview_path=str(preview_path))
+        repo.update_source_state(
+            source_id,
+            status=status,
+            fps=0.0,
+            preview_path=str(preview_path),
+            calibration_frame_path=str(calibration_frame_path),
+        )
         while not stop_event.is_set():
             frame = acquisition.take_latest(timeout=0.5)
             if frame is None:
@@ -497,6 +519,45 @@ def camera_worker_loop(
                 time.sleep(0.01)
             if stop_event.is_set():
                 break
+            current_image_size = (
+                int(frame.image.shape[1]),
+                int(frame.image.shape[0]),
+            )
+            if current_image_size != calibration_image_size:
+                calibration_image_size = current_image_size
+                calibration_diagnostic = runtime_calibration_diagnostic(
+                    calibration_profile,
+                    current_image_size,
+                    source_id=source_id,
+                    optical_configuration={
+                        "source_id": source_id,
+                        "source_type": str(source_config.get("source_type") or ""),
+                        "source_uri": str(source_config.get("uri") or ""),
+                        "camera_role": str(
+                            source_config.get("role")
+                            or source_config.get("camera_role")
+                            or ""
+                        ),
+                        "optical_setup_id": str(
+                            source_config.get("optical_setup_id") or "default"
+                        ),
+                    },
+                )
+            if acquisition.frames_processed % 5 == 0:
+                cv2.imwrite(
+                    str(calibration_frame_path),
+                    frame.image,
+                    [
+                        int(cv2.IMWRITE_JPEG_QUALITY),
+                        int(
+                            config.get(
+                                "runtime",
+                                "preview_jpeg_quality",
+                                default=82,
+                            )
+                        ),
+                    ],
+                )
             optional_recording = bool(
                 control_flags.get(source_id, {}).get("recording")
             )
@@ -665,8 +726,14 @@ def camera_worker_loop(
                     fps=0.0,
                     last_error="; ".join(pipeline_errors),
                     preview_path=str(preview_path),
+                    calibration_frame_path=relative_to_root(
+                        calibration_frame_path
+                    ),
                     last_frame_ts=frame.timestamp_global,
-                    metrics=acquisition.metrics(),
+                    metrics={
+                        **acquisition.metrics(),
+                        "calibration": calibration_diagnostic,
+                    },
                 )
                 continue
             with observations_path.open("a", encoding="utf-8") as handle:
@@ -772,6 +839,9 @@ def camera_worker_loop(
                 ),
                 last_frame_ts=frame.timestamp_global,
                 preview_path=relative_to_root(preview_path),
+                calibration_frame_path=relative_to_root(
+                    calibration_frame_path
+                ),
                 details_path=relative_to_root(observations_path),
                 recording_enabled=archive_required
                 or bool(
@@ -792,14 +862,28 @@ def camera_worker_loop(
                         )
                         for item in frame_results
                     },
+                    "calibration": calibration_diagnostic,
                     "validated_on_site": False,
                 },
             )
         for tracklet in tracker.flush():
             runtime_queue.put({"kind": "TRACKLET", "tracklet": asdict(tracklet)})
-        repo.update_source_state(source_id, status=SourceStatus.OFFLINE.value, fps=0.0, preview_path=relative_to_root(preview_path))
+        repo.update_source_state(
+            source_id,
+            status=SourceStatus.OFFLINE.value,
+            fps=0.0,
+            preview_path=relative_to_root(preview_path),
+            calibration_frame_path=relative_to_root(calibration_frame_path),
+        )
     except Exception as exc:  # pragma: no cover - runtime
-        repo.update_source_state(source_id, status=SourceStatus.ERROR.value, fps=0.0, last_error=str(exc), preview_path=relative_to_root(preview_path))
+        repo.update_source_state(
+            source_id,
+            status=SourceStatus.ERROR.value,
+            fps=0.0,
+            last_error=str(exc),
+            preview_path=relative_to_root(preview_path),
+            calibration_frame_path=relative_to_root(calibration_frame_path),
+        )
     finally:
         finished = recorder.close()
         if finished:

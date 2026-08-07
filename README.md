@@ -27,6 +27,9 @@ VisionSort est une plateforme locale Python + Streamlit pour piloter un cycle co
   avant de router les frames suivantes, puis décharge l’ancienne version
   après drainage de ses requêtes.
 - Chaque caméra conserve son tracker local indépendant.
+- La géométrie caméra est isolée dans `visionsort/calibration`: un profil
+  immuable transforme obligatoirement `pixel brut -> pixel non distordu ->
+  XY monde en mètres`. Le tracking ne consomme pas encore ces coordonnées.
 - `bytetrack_cpu` et `botsort_cpu` utilisent les implémentations natives Ultralytics; `greedy_iou` reste une option de démonstration explicite.
 - L'acquisition utilise un buffer borné `latest frame wins` et ne bloque plus sur le temps d'inférence.
 - Le mode simulé est explicite: aucun résultat démo ne doit être utilisé silencieusement hors `DEMO_MODE=1`.
@@ -46,8 +49,12 @@ VisionSort est une plateforme locale Python + Streamlit pour piloter un cycle co
 - `handoff_hypotheses` conserve les ambiguïtés;
   `handoff_resolution_audit` journalise chaque résolution ou refus avec
   l’ancienne et la nouvelle chaîne.
+- `calibration_profiles` conserve les profils immuables et leur SHA-256;
+  `source_calibration_assignments` référence la version active par source;
+  `capture_session_sources` garde le profil complet réellement affecté à la
+  session.
 
-Les migrations incrémentales SQLite v6, v7, v8 et v9 ajoutent ces structures
+Les migrations incrémentales SQLite v6 à v11 ajoutent ces structures
 sans recréer les bases existantes.
 
 ## Modules Principaux
@@ -65,8 +72,11 @@ sans recréer les bases existantes.
 - `visionsort/datasets/pipeline.py` : création dataset, split stable, déduplication, provenance
 - `visionsort/training/pipeline.py` : training, évaluation, candidat, rapport
 - `visionsort/deployment/registry.py` : activation, promotion, rejet, archivage, rollback
+- `visionsort/calibration/service.py` : ChArUco, calibration intrinsèque et homographie robuste
+- `visionsort/calibration/geometry.py` : API stable image ↔ monde et diagnostics runtime
+- `visionsort/calibration/repository.py` : versions immuables, activation et snapshots
 - `visionsort/observations/export.py` : export `JSONL -> Parquet`
-- `visionsort/ui/pages/` : pages Dashboard, Cameras, Live Tracking, Recordings, Dataset Studio, Training, Models, Events, Settings
+- `visionsort/ui/pages/` : pages Dashboard, Cameras, Calibration, Live Tracking, Recordings, Dataset Studio, Training, Models, Events, Settings
 
 ## Pré-Requis
 
@@ -140,20 +150,21 @@ Si un worker caméra reste bloqué anormalement, relancer le supervisor puis arr
 4. Lancer Streamlit
 5. Aller dans `Cameras`
 6. Enregistrer ou bootstrapper les sources Replay
-7. Créer une `CaptureSession` avec C1/C2/C3 et offsets si nécessaire
-8. Démarrer la session
-9. Consulter `Dashboard`, `Live Tracking`, `Events`, `Recordings`
-10. Arrêter la session
-11. Aller dans `Dataset Studio`
-12. Lancer `SAMPLE`
-13. Lancer `AUTO_ANNOTATE`
-14. Revoir les items `NEEDS_REVIEW`
-15. Lancer `FINALIZE_DATASET`
-16. Optionnel: lancer `EXPORT_OBSERVATIONS_PARQUET`
-17. Aller dans `Training`
-18. Lancer un entraînement
-19. Aller dans `Models`
-20. Comparer, promouvoir, activer ou rollbacker le modèle
+7. Dans `Calibration`, calibrer et activer un profil par source si la géométrie monde est requise
+8. Créer une `CaptureSession` avec C1/C2/C3 et offsets si nécessaire
+9. Démarrer la session
+10. Consulter `Dashboard`, `Live Tracking`, `Events`, `Recordings`
+11. Arrêter la session
+12. Aller dans `Dataset Studio`
+13. Lancer `SAMPLE`
+14. Lancer `AUTO_ANNOTATE`
+15. Revoir les items `NEEDS_REVIEW`
+16. Lancer `FINALIZE_DATASET`
+17. Optionnel: lancer `EXPORT_OBSERVATIONS_PARQUET`
+18. Aller dans `Training`
+19. Lancer un entraînement
+20. Aller dans `Models`
+21. Comparer, promouvoir, activer ou rollbacker le modèle
 
 ## Pipeline Runtime
 
@@ -252,7 +263,7 @@ pas échouer la CI.
 - Un dataset mono-session appartient volontairement à un seul split; plusieurs sessions sont nécessaires pour un entraînement réel train/val/test sans fuite.
 - Le checkpoint produit par le scénario E2E démo est explicitement simulé; seul le chemin Ultralytics produit de vrais poids.
 - L’export Parquet dépend de `pandas` + `pyarrow`.
-- La validation RTSP réelle, la calibration géométrique et les réglages métier nécessitent encore les vraies caméras.
+- Les profils et algorithmes de calibration sont disponibles, mais leurs métriques, les optiques et les zones monde restent à valider avec les vraies caméras du site.
 
 ## Tests
 

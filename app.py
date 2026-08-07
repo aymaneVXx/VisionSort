@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import streamlit as st
 
-from visionsort.ui.pages import cameras, dashboard, dataset_studio, events, live_tracking, models, recordings, settings, training
+from visionsort.ui.pages import calibration, cameras, dashboard, dataset_studio, events, live_tracking, models, recordings, settings, training
 from visionsort.ui.state import create_ui_context
 
 
@@ -22,6 +22,7 @@ def main() -> None:
     pages = {
         "Dashboard": dashboard.render,
         "Cameras": cameras.render,
+        "Calibration": calibration.render,
         "Live Tracking": live_tracking.render,
         "Recordings": recordings.render,
         "Dataset Studio": dataset_studio.render,

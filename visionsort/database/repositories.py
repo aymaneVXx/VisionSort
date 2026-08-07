@@ -73,7 +73,9 @@ class ControlRepository:
     def list_sources(self) -> list[dict[str, Any]]:
         rows = self.db.fetch_all(
             """
-            SELECT s.*, ss.status, ss.fps, ss.last_error, ss.last_frame_ts, ss.preview_path, ss.recording_enabled, ss.metrics_json
+            SELECT s.*, ss.status, ss.fps, ss.last_error, ss.last_frame_ts,
+                   ss.preview_path, ss.calibration_frame_path,
+                   ss.recording_enabled, ss.metrics_json
             FROM sources s
             LEFT JOIN source_state ss ON ss.source_id = s.id
             ORDER BY s.role ASC, s.name ASC
@@ -111,7 +113,7 @@ class ControlRepository:
         with self.db.connect() as conn:
             for item in sources:
                 source = conn.execute(
-                    "SELECT role, source_type, uri FROM sources WHERE id = ?",
+                    "SELECT role, source_type, uri, optical_setup_id FROM sources WHERE id = ?",
                     (item["source_id"],),
                 ).fetchone()
                 if source is None:
@@ -146,6 +148,16 @@ class ControlRepository:
                         (str(item["source_id"]),),
                     ).fetchall()
                 ]
+                calibration = conn.execute(
+                    """
+                    SELECT cp.id, cp.fingerprint_sha256, cp.profile_json
+                    FROM source_calibration_assignments sca
+                    JOIN calibration_profiles cp
+                      ON cp.id = sca.calibration_profile_id
+                    WHERE sca.source_id = ?
+                    """,
+                    (str(item["source_id"]),),
+                ).fetchone()
                 rows.append(
                     (
                         f"sesssrc-{uuid.uuid4().hex[:10]}",
@@ -157,8 +169,16 @@ class ControlRepository:
                         source_type,
                         source_uri,
                         _source_file_sha256(source_uri),
+                        str(source["optical_setup_id"] or "default"),
                         int(archive_required),
                         json.dumps(model_pipeline),
+                        str(calibration["id"]) if calibration else None,
+                        (
+                            str(calibration["fingerprint_sha256"])
+                            if calibration
+                            else None
+                        ),
+                        str(calibration["profile_json"]) if calibration else "{}",
                         now,
                         now,
                     )
@@ -180,9 +200,12 @@ class ControlRepository:
                 INSERT INTO capture_session_sources
                 (id, session_id, source_id, camera_role, time_offset_ms,
                  replay_fps, source_type_snapshot, source_uri_snapshot,
-                 source_sha256, archive_required, model_pipeline_json,
+                 source_sha256, optical_setup_id_snapshot, archive_required,
+                 model_pipeline_json,
+                 calibration_profile_id, calibration_profile_hash,
+                 calibration_profile_json,
                  created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                     rows,
                 )
@@ -237,8 +260,10 @@ class ControlRepository:
         source_id = payload.get("id") or str(uuid.uuid4())
         self.db.execute(
             """
-            INSERT INTO sources (id, name, role, source_type, uri, model_id, tracker_id, enabled, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO sources
+            (id, name, role, source_type, uri, model_id, tracker_id,
+             optical_setup_id, enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 role = excluded.role,
@@ -246,6 +271,7 @@ class ControlRepository:
                 uri = excluded.uri,
                 model_id = excluded.model_id,
                 tracker_id = excluded.tracker_id,
+                optical_setup_id = excluded.optical_setup_id,
                 enabled = excluded.enabled,
                 updated_at = excluded.updated_at
             """,
@@ -257,6 +283,7 @@ class ControlRepository:
                 payload["uri"],
                 payload["model_id"],
                 payload["tracker_id"],
+                str(payload.get("optical_setup_id") or "default"),
                 int(payload.get("enabled", True)),
                 now,
                 now,
@@ -264,8 +291,11 @@ class ControlRepository:
         )
         self.db.execute(
             """
-            INSERT INTO source_state (source_id, status, fps, last_error, last_frame_ts, preview_path, details_path, recording_enabled, metrics_json, updated_at)
-            VALUES (?, ?, 0, NULL, NULL, NULL, NULL, 0, '{}', ?)
+            INSERT INTO source_state
+            (source_id, status, fps, last_error, last_frame_ts, preview_path,
+             calibration_frame_path, details_path, recording_enabled,
+             metrics_json, updated_at)
+            VALUES (?, ?, 0, NULL, NULL, NULL, NULL, NULL, 0, '{}', ?)
             ON CONFLICT(source_id) DO NOTHING
             """,
             (source_id, SourceStatus.OFFLINE.value, now),
@@ -401,6 +431,7 @@ class ControlRepository:
         last_error: str | None = None,
         last_frame_ts: float | None = None,
         preview_path: str | None = None,
+        calibration_frame_path: str | None = None,
         details_path: str | None = None,
         recording_enabled: bool | None = None,
         metrics: dict[str, Any] | None = None,
@@ -418,14 +449,20 @@ class ControlRepository:
         self.db.execute(
             """
             INSERT INTO source_state
-            (source_id, status, fps, last_error, last_frame_ts, preview_path, details_path, recording_enabled, metrics_json, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (source_id, status, fps, last_error, last_frame_ts, preview_path,
+             calibration_frame_path, details_path, recording_enabled,
+             metrics_json, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(source_id) DO UPDATE SET
                 status = excluded.status,
                 fps = excluded.fps,
                 last_error = excluded.last_error,
                 last_frame_ts = excluded.last_frame_ts,
                 preview_path = COALESCE(excluded.preview_path, source_state.preview_path),
+                calibration_frame_path = COALESCE(
+                    excluded.calibration_frame_path,
+                    source_state.calibration_frame_path
+                ),
                 details_path = COALESCE(excluded.details_path, source_state.details_path),
                 recording_enabled = COALESCE(excluded.recording_enabled, source_state.recording_enabled),
                 metrics_json = excluded.metrics_json,
@@ -438,6 +475,7 @@ class ControlRepository:
                 last_error,
                 last_frame_ts,
                 preview_path,
+                calibration_frame_path,
                 details_path,
                 recording_value,
                 metrics_json,
