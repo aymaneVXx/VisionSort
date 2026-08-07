@@ -123,6 +123,7 @@ class VisionSortDB:
                     uri TEXT NOT NULL,
                     model_id TEXT NOT NULL,
                     tracker_id TEXT NOT NULL,
+                    optical_setup_id TEXT NOT NULL DEFAULT 'default',
                     enabled INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -154,8 +155,12 @@ class VisionSortDB:
                     source_type_snapshot TEXT,
                     source_uri_snapshot TEXT,
                     source_sha256 TEXT,
+                    optical_setup_id_snapshot TEXT NOT NULL DEFAULT 'default',
                     archive_required INTEGER NOT NULL DEFAULT 0,
                     model_pipeline_json TEXT NOT NULL DEFAULT '[]',
+                    calibration_profile_id TEXT,
+                    calibration_profile_hash TEXT,
+                    calibration_profile_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -166,6 +171,7 @@ class VisionSortDB:
                     last_error TEXT,
                     last_frame_ts REAL,
                     preview_path TEXT,
+                    calibration_frame_path TEXT,
                     details_path TEXT,
                     recording_enabled INTEGER NOT NULL DEFAULT 0,
                     metrics_json TEXT NOT NULL DEFAULT '{}',
@@ -453,6 +459,29 @@ class VisionSortDB:
                     config_json TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS calibration_profiles (
+                    id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL,
+                    version INTEGER NOT NULL CHECK(version > 0),
+                    image_width INTEGER NOT NULL CHECK(image_width > 0),
+                    image_height INTEGER NOT NULL CHECK(image_height > 0),
+                    status TEXT NOT NULL CHECK(status IN ('VALID', 'WARNING', 'INVALID')),
+                    fingerprint_sha256 TEXT NOT NULL,
+                    profile_json TEXT NOT NULL,
+                    validated_on_site INTEGER NOT NULL DEFAULT 0
+                        CHECK(validated_on_site = 0),
+                    created_at TEXT NOT NULL,
+                    UNIQUE(source_id, version),
+                    FOREIGN KEY (source_id) REFERENCES sources(id)
+                );
+                CREATE TABLE IF NOT EXISTS source_calibration_assignments (
+                    source_id TEXT PRIMARY KEY,
+                    calibration_profile_id TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (source_id) REFERENCES sources(id),
+                    FOREIGN KEY (calibration_profile_id)
+                        REFERENCES calibration_profiles(id)
+                );
                 CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at);
                 CREATE INDEX IF NOT EXISTS idx_commands_status ON commands(status);
                 CREATE INDEX IF NOT EXISTS idx_tracklets_camera ON tracklets(camera_id, local_track_id);
@@ -472,6 +501,8 @@ class VisionSortDB:
                     );
                 CREATE INDEX IF NOT EXISTS idx_model_activation_status
                     ON model_activation_history(status, runtime_applied);
+                CREATE INDEX IF NOT EXISTS idx_calibration_profiles_source
+                    ON calibration_profiles(source_id, version DESC);
                 """
             )
             self._migrate(conn)
@@ -895,6 +926,67 @@ class VisionSortDB:
                 """
             )
             conn.execute("PRAGMA user_version = 10")
+
+        if version < 11:
+            add_column(
+                "sources",
+                "optical_setup_id TEXT NOT NULL DEFAULT 'default'",
+            )
+            add_column(
+                "capture_session_sources",
+                "optical_setup_id_snapshot TEXT NOT NULL DEFAULT 'default'",
+            )
+            add_column(
+                "capture_session_sources", "calibration_profile_id TEXT"
+            )
+            add_column(
+                "capture_session_sources", "calibration_profile_hash TEXT"
+            )
+            add_column(
+                "capture_session_sources",
+                "calibration_profile_json TEXT NOT NULL DEFAULT '{}'",
+            )
+            add_column("source_state", "calibration_frame_path TEXT")
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS calibration_profiles (
+                    id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL,
+                    version INTEGER NOT NULL CHECK(version > 0),
+                    image_width INTEGER NOT NULL CHECK(image_width > 0),
+                    image_height INTEGER NOT NULL CHECK(image_height > 0),
+                    status TEXT NOT NULL CHECK(status IN ('VALID', 'WARNING', 'INVALID')),
+                    fingerprint_sha256 TEXT NOT NULL,
+                    profile_json TEXT NOT NULL,
+                    validated_on_site INTEGER NOT NULL DEFAULT 0
+                        CHECK(validated_on_site = 0),
+                    created_at TEXT NOT NULL,
+                    UNIQUE(source_id, version),
+                    FOREIGN KEY (source_id) REFERENCES sources(id)
+                );
+                CREATE TABLE IF NOT EXISTS source_calibration_assignments (
+                    source_id TEXT PRIMARY KEY,
+                    calibration_profile_id TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (source_id) REFERENCES sources(id),
+                    FOREIGN KEY (calibration_profile_id)
+                        REFERENCES calibration_profiles(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_calibration_profiles_source
+                    ON calibration_profiles(source_id, version DESC);
+                CREATE TRIGGER IF NOT EXISTS calibration_profiles_immutable_update
+                BEFORE UPDATE ON calibration_profiles
+                BEGIN
+                    SELECT RAISE(ABORT, 'calibration profiles are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS calibration_profiles_immutable_delete
+                BEFORE DELETE ON calibration_profiles
+                BEGIN
+                    SELECT RAISE(ABORT, 'calibration profiles are immutable');
+                END;
+                """
+            )
+            conn.execute("PRAGMA user_version = 11")
 
     @staticmethod
     def _seed_model_activation_history(

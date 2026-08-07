@@ -86,6 +86,14 @@ def render(context: UIContext) -> None:
         role = st.selectbox("Rôle", ["C1", "C2", "C3"])
         source_type = st.selectbox("Type", ["REPLAY", "VIDEO_FILE", "RTSP"])
         uri = st.text_input("URI / chemin vidéo", value="")
+        optical_setup_id = st.text_input(
+            "Identifiant configuration optique",
+            value="default",
+            help=(
+                "Changez cet identifiant après toute modification de lentille, "
+                "zoom ou mise au point afin d'invalider explicitement l'ancienne calibration."
+            ),
+        )
         model_id = st.selectbox(
             "Modèle colis",
             [row["id"] for row in parcel_models],
@@ -144,6 +152,7 @@ def render(context: UIContext) -> None:
                     "model_id": model_id,
                     "model_assignments": assignments,
                     "tracker_id": tracker_id,
+                    "optical_setup_id": optical_setup_id,
                     "enabled": True,
                 },
             )

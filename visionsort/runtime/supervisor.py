@@ -16,6 +16,7 @@ if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from visionsort.acquisition.worker import camera_worker_loop
+from visionsort.calibration.repository import CalibrationRepository
 from visionsort.core.config import AppConfig, load_config
 from visionsort.core.enums import (
     CommandStatus,
@@ -93,6 +94,7 @@ class RuntimeSupervisor:
         self.db = VisionSortDB(self.db_path)
         self.db.initialize()
         self.control_repo = ControlRepository(self.db)
+        self.calibration_repo = CalibrationRepository(self.db)
         self.config = AppConfig(
             values=apply_site_config(
                 self.base_config_values,
@@ -1667,7 +1669,9 @@ class RuntimeSupervisor:
         archive_required: bool = False,
         source_type_snapshot: str | None = None,
         source_uri_snapshot: str | None = None,
+        optical_setup_id_snapshot: str | None = None,
         model_pipeline_snapshot: str | list[dict[str, Any]] | None = None,
+        calibration_profile_snapshot: str | dict[str, Any] | None = None,
         runtime_config_values: dict[str, Any] | None = None,
     ) -> None:
         existing_session = getattr(self, "active_source_sessions", {}).get(
@@ -1698,6 +1702,8 @@ class RuntimeSupervisor:
             cfg["source_type"] = source_type_snapshot
         if source_uri_snapshot:
             cfg["uri"] = source_uri_snapshot
+        if optical_setup_id_snapshot:
+            cfg["optical_setup_id"] = optical_setup_id_snapshot
         cfg["model_id"] = model_pipeline[0]["model_id"]
         cfg["model_task"] = model_pipeline[0]["task"]
         cfg["model_pipeline"] = model_pipeline
@@ -1707,6 +1713,7 @@ class RuntimeSupervisor:
         cfg["replay_offset_ms"] = float(replay_offset_ms)
         cfg["replay_loop"] = bool(replay_loop)
         cfg["archive_required"] = bool(archive_required)
+        cfg["calibration_profile_json"] = calibration_profile_snapshot or {}
         self.active_source_sessions[source_id] = session_id
         self.active_source_pipelines[source_id] = [
             dict(item) for item in model_pipeline
@@ -1782,8 +1789,14 @@ class RuntimeSupervisor:
                 source_uri_snapshot=sess_src.get(
                     "source_uri_snapshot"
                 ),
+                optical_setup_id_snapshot=sess_src.get(
+                    "optical_setup_id_snapshot"
+                ),
                 model_pipeline_snapshot=sess_src.get(
                     "model_pipeline_json"
+                ),
+                calibration_profile_snapshot=sess_src.get(
+                    "calibration_profile_json"
                 ),
             )
 
@@ -1825,6 +1838,16 @@ class RuntimeSupervisor:
         site_snapshot = validate_site_config(
             self.control_repo.get_site_config()
         )
+        session_calibration_refs = {
+            str(row["source_id"]): str(row["calibration_profile_id"])
+            for row in sources
+            if row.get("calibration_profile_id")
+        }
+        if "calibration_profiles" in site_snapshot or session_calibration_refs:
+            site_snapshot.setdefault("calibration_profiles", {})[
+                "active_by_source"
+            ] = session_calibration_refs
+            site_snapshot = validate_site_config(site_snapshot)
         effective_config = apply_site_config(
             getattr(self, "base_config_values", self.config.values),
             site_snapshot,
@@ -1854,7 +1877,13 @@ class RuntimeSupervisor:
                     archive_required=bool(sess_src.get("archive_required")),
                     source_type_snapshot=sess_src.get("source_type_snapshot"),
                     source_uri_snapshot=sess_src.get("source_uri_snapshot"),
+                    optical_setup_id_snapshot=sess_src.get(
+                        "optical_setup_id_snapshot"
+                    ),
                     model_pipeline_snapshot=sess_src.get("model_pipeline_json"),
+                    calibration_profile_snapshot=sess_src.get(
+                        "calibration_profile_json"
+                    ),
                     runtime_config_values=effective_config,
                 )
                 started_sources.append(str(sess_src["source_id"]))
@@ -2636,6 +2665,33 @@ class RuntimeSupervisor:
                     "updated": True,
                     "effective_for": "new_sessions",
                     "config": validated,
+                }
+            elif command_type == CommandType.SAVE_CALIBRATION_PROFILE.value:
+                profile_id = self.calibration_repo.save_profile(
+                    payload["profile"]
+                )
+                result_payload = {
+                    "profile_id": profile_id,
+                    "saved": True,
+                    "validated_on_site": False,
+                }
+            elif command_type == CommandType.ACTIVATE_CALIBRATION_PROFILE.value:
+                profile = self.calibration_repo.activate_profile(
+                    str(payload["source_id"]),
+                    str(payload["profile_id"]),
+                )
+                current_site_config = self.control_repo.get_site_config()
+                self.config = AppConfig(
+                    values=apply_site_config(
+                        self.base_config_values, current_site_config
+                    )
+                )
+                result_payload = {
+                    "profile_id": profile.profile_id,
+                    "source_id": profile.source_id,
+                    "fingerprint_sha256": profile.fingerprint_sha256,
+                    "effective_for": "new_sessions",
+                    "validated_on_site": False,
                 }
             else:
                 raise RuntimeError(f"Commande non supportée: {command_type}")
