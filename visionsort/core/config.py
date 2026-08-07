@@ -51,6 +51,13 @@ DEFAULT_CONFIG = {
         "handoff_buffer_max_items": 1000,
         "handoff_expiry_seconds": 30.0,
         "hypothesis_expiry_seconds": 120.0,
+        "event_confirmation_seconds": {
+            "pickup_candidate": 0.05,
+            "picked": 0.15,
+            "carried": 0.25,
+            "drop_candidate": 0.05,
+            "dropped": 0.20,
+        },
         "site_topology": {
             "edges": [
                 {"from_role": "C1", "to_role": "C2", "min_transit_s": 0.5, "max_transit_s": 10.0},

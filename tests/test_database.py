@@ -70,7 +70,7 @@ def test_v9_migration_seeds_existing_active_models(tmp_path):
         WHERE activated_model_id = 'demo_synth_det'
         """
     )
-    assert version is not None and version[0] == 9
+    assert version is not None and version[0] == 10
     assert model is not None and model["status"] == "CANDIDATE"
     assert history is not None
     assert history["status"] == "ACTIVE"

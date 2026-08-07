@@ -15,6 +15,7 @@ import lap
 from visionsort.core.config import relative_to_root
 from visionsort.core.enums import MatchResult, ParcelState
 from visionsort.core.paths import DETAILS_DIR, ROOT_DIR
+from visionsort.core.site_config import zone_kind
 from visionsort.core.types import GlobalParcel, HandoffCandidate, Observation, TrackObservation, Tracklet
 
 
@@ -533,11 +534,13 @@ class GlobalParcelTracker:
         topology_edges: list[dict[str, Any]],
         source_roles: dict[str, str],
         *,
+        zones_by_role: dict[str, list[dict[str, Any]]] | None = None,
         minimum_score: float = 0.48,
         ambiguity_margin: float = 0.08,
     ):
         self.topology_edges = topology_edges
         self.source_roles = source_roles
+        self.zones_by_role = zones_by_role or {}
         self.minimum_score = minimum_score
         self.ambiguity_margin = ambiguity_margin
         self.parcels: dict[str, GlobalParcel] = {}
@@ -813,10 +816,16 @@ class GlobalParcelTracker:
         outgoing_zone = self._summary(outgoing).get("last_zone_id") or outgoing.last_zone_id
         incoming_zone = self._summary(incoming).get("first_zone_id")
         zone_score = 0.5
-        if outgoing_zone:
-            zone_score += 0.25 if "exit" in str(outgoing_zone).lower() else -0.15
-        if incoming_zone:
-            zone_score += 0.25 if "entry" in str(incoming_zone).lower() else -0.15
+        outgoing_kind = zone_kind(
+            self.zones_by_role.get(previous_role, []), outgoing_zone
+        )
+        incoming_kind = zone_kind(
+            self.zones_by_role.get(incoming_role, []), incoming_zone
+        )
+        if outgoing_kind is not None:
+            zone_score += 0.25 if outgoing_kind == "exit" else -0.15
+        if incoming_kind is not None:
+            zone_score += 0.25 if incoming_kind == "entry" else -0.15
         zone_score = min(1.0, max(0.0, zone_score))
 
         outgoing_velocity = self._velocity(outgoing)
@@ -869,6 +878,7 @@ class GlobalParcelTracker:
             f"transit={dt:.3f}s",
             f"dimensions={dimension_score:.3f}",
             f"zones={zone_score:.3f}",
+            f"zone_kinds={outgoing_kind or 'unknown'}->{incoming_kind or 'unknown'}",
             f"speed={speed_score:.3f}",
             f"trajectory={trajectory_score:.3f}",
         ]

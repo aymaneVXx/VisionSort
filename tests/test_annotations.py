@@ -212,7 +212,10 @@ def test_quality_gate_uses_temporal_merge_size_and_mask_signals():
                 "class_name": "parcel",
                 "confidence": 0.95,
                 "bbox": [20, 20, 60, 60],
-                "attributes": {"tracker_consistent": True},
+                "attributes": {
+                    "tracker_consistent": True,
+                    "model_agreement": 1.0,
+                },
             }
         ],
         image_shape=(100, 100),
@@ -220,6 +223,23 @@ def test_quality_gate_uses_temporal_merge_size_and_mask_signals():
     )
     assert accepted == "AUTO_ACCEPTED"
     assert stats["temporal_stability"] == 1.0
+
+    unavailable, unavailable_stats = gate.assess(
+        source_id="src-unknown",
+        detections=[
+            {
+                "class_name": "parcel",
+                "confidence": 0.95,
+                "bbox": [20, 20, 60, 60],
+                "attributes": {},
+            }
+        ],
+        image_shape=(100, 100),
+        task="detection",
+    )
+    assert unavailable == "NEEDS_REVIEW"
+    assert unavailable_stats["tracker_consistency"] is None
+    assert unavailable_stats["model_agreement"] is None
 
     needs_review, stats2 = gate.assess(
         source_id="src",

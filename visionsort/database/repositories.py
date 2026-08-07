@@ -16,6 +16,7 @@ from visionsort.core.enums import (
     SourceStatus,
 )
 from visionsort.core.types import GlobalParcel, Tracklet
+from visionsort.core.site_config import validate_site_config
 from visionsort.database.db import VisionSortDB, utc_now
 
 
@@ -98,57 +99,83 @@ class ControlRepository:
     def create_capture_session(self, *, name: str, demo_mode: bool, sources: list[dict[str, Any]], config: dict[str, Any]) -> str:
         session_id = f"session-{uuid.uuid4().hex[:10]}"
         now = utc_now()
-        self.db.execute(
-            """
-            INSERT INTO capture_sessions (id, name, pipeline_state, demo_mode, site_validated, config_json, report_path, started_at, ended_at, created_at, updated_at)
-            VALUES (?, ?, 'CAPTURED', ?, 0, ?, NULL, NULL, NULL, ?, ?)
-            """,
-            (session_id, name, int(demo_mode), json.dumps(config), now, now),
-        )
+        source_ids = [str(item.get("source_id") or "") for item in sources]
+        if any(not source_id for source_id in source_ids):
+            raise RuntimeError("Chaque camera de la session doit referencer une source.")
+        if len(source_ids) != len(set(source_ids)):
+            raise RuntimeError("Une meme source ne peut pas etre assignee plusieurs fois a une session.")
+        camera_roles = [str(item.get("camera_role") or "") for item in sources]
+        if any(not role for role in camera_roles) or len(camera_roles) != len(set(camera_roles)):
+            raise RuntimeError("Les roles camera de la session doivent etre presents et uniques.")
         rows: list[tuple[Any, ...]] = []
-        for item in sources:
-            source = self.db.fetch_one(
-                "SELECT source_type, uri FROM sources WHERE id = ?",
-                (item["source_id"],),
-            )
-            if source is None:
-                raise RuntimeError(
-                    f"Source introuvable pour la session: {item['source_id']}"
+        with self.db.connect() as conn:
+            for item in sources:
+                source = conn.execute(
+                    "SELECT role, source_type, uri FROM sources WHERE id = ?",
+                    (item["source_id"],),
+                ).fetchone()
+                if source is None:
+                    raise RuntimeError(
+                        f"Source introuvable pour la session: {item['source_id']}"
+                    )
+                if str(source["role"]) != str(item["camera_role"]):
+                    raise RuntimeError(
+                        f"Role incoherent pour {item['source_id']}: "
+                        f"source={source['role']} session={item['camera_role']}."
+                    )
+                source_type = str(source["source_type"]).upper()
+                source_uri = str(source["uri"])
+                archive_required = bool(
+                    item.get(
+                        "archive_required",
+                        source_type in {"RTSP", "VIDEO_FILE"}
+                        or (
+                            not demo_mode
+                            and bool(config.get("archive_media", True))
+                        ),
+                    )
                 )
-            source_type = str(source["source_type"]).upper()
-            source_uri = str(source["uri"])
-            archive_required = bool(
-                item.get(
-                    "archive_required",
-                    source_type in {"RTSP", "VIDEO_FILE"}
-                    or (
-                        not demo_mode
-                        and bool(config.get("archive_media", True))
-                    ),
+                model_pipeline = [
+                    dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT * FROM source_model_assignments
+                        WHERE source_id = ? AND enabled = 1
+                        ORDER BY pipeline_role
+                        """,
+                        (str(item["source_id"]),),
+                    ).fetchall()
+                ]
+                rows.append(
+                    (
+                        f"sesssrc-{uuid.uuid4().hex[:10]}",
+                        session_id,
+                        item["source_id"],
+                        item["camera_role"],
+                        float(item.get("time_offset_ms", 0.0)),
+                        item.get("replay_fps"),
+                        source_type,
+                        source_uri,
+                        _source_file_sha256(source_uri),
+                        int(archive_required),
+                        json.dumps(model_pipeline),
+                        now,
+                        now,
+                    )
                 )
+            conn.execute(
+                """
+                INSERT INTO capture_sessions
+                (id, name, pipeline_state, demo_mode, site_validated,
+                 config_json, report_path, started_at, ended_at,
+                 runtime_status, created_at, updated_at)
+                VALUES (?, ?, 'CAPTURED', ?, 0, ?, NULL, NULL, NULL,
+                        'CREATED', ?, ?)
+                """,
+                (session_id, name, int(demo_mode), json.dumps(config), now, now),
             )
-            model_pipeline = self.list_source_model_assignments(
-                str(item["source_id"])
-            )
-            rows.append(
-                (
-                    f"sesssrc-{uuid.uuid4().hex[:10]}",
-                    session_id,
-                    item["source_id"],
-                    item["camera_role"],
-                    float(item.get("time_offset_ms", 0.0)),
-                    item.get("replay_fps"),
-                    source_type,
-                    source_uri,
-                    _source_file_sha256(source_uri),
-                    int(archive_required),
-                    json.dumps(model_pipeline),
-                    now,
-                    now,
-                )
-            )
-        if rows:
-            self.db.execute_many(
+            if rows:
+                conn.executemany(
                 """
                 INSERT INTO capture_session_sources
                 (id, session_id, source_id, camera_role, time_offset_ms,
@@ -157,8 +184,8 @@ class ControlRepository:
                  created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                rows,
-            )
+                    rows,
+                )
         return session_id
 
     def update_capture_session(
@@ -170,6 +197,9 @@ class ControlRepository:
         ended_at: float | None = None,
         report_path: str | None = None,
         media_report: dict[str, Any] | None = None,
+        runtime_status: str | None = None,
+        start_error: str | None = None,
+        site_config_snapshot: dict[str, Any] | None = None,
     ) -> None:
         fields: list[str] = []
         params: list[Any] = []
@@ -188,6 +218,15 @@ class ControlRepository:
         if media_report is not None:
             fields.append("media_report_json = ?")
             params.append(json.dumps(media_report))
+        if runtime_status is not None:
+            fields.append("runtime_status = ?")
+            params.append(str(runtime_status))
+        if start_error is not None:
+            fields.append("start_error = ?")
+            params.append(str(start_error))
+        if site_config_snapshot is not None:
+            fields.append("site_config_snapshot_json = ?")
+            params.append(json.dumps(site_config_snapshot, sort_keys=True))
         fields.append("updated_at = ?")
         params.append(utc_now())
         params.append(session_id)
@@ -482,13 +521,14 @@ class ControlRepository:
             )
 
     def upsert_site_config(self, config_json: dict[str, Any]) -> None:
+        validated = validate_site_config(config_json)
         self.db.execute(
             """
             INSERT INTO site_config (id, config_json, updated_at)
             VALUES ('default', ?, ?)
             ON CONFLICT(id) DO UPDATE SET config_json = excluded.config_json, updated_at = excluded.updated_at
             """,
-            (json.dumps(config_json), utc_now()),
+            (json.dumps(validated, sort_keys=True), utc_now()),
         )
 
     def get_site_config(self) -> dict[str, Any]:
@@ -550,14 +590,46 @@ class ControlRepository:
             )
         ]
 
-    def list_dataset_items(self, dataset_id: str, limit: int = 500) -> list[dict[str, Any]]:
+    def list_dataset_items(
+        self,
+        dataset_id: str,
+        limit: int = 500,
+        *,
+        annotation_status: str | None = None,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        where = "dataset_id = ?"
+        params: list[Any] = [dataset_id]
+        if annotation_status:
+            where += " AND annotation_status = ?"
+            params.append(str(annotation_status))
+        params.extend((max(1, int(limit)), max(0, int(offset))))
         return [
             dict(row)
             for row in self.db.fetch_all(
-                "SELECT * FROM dataset_items WHERE dataset_id = ? ORDER BY created_at DESC LIMIT ?",
-                (dataset_id, limit),
+                f"SELECT * FROM dataset_items WHERE {where} "
+                "ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                tuple(params),
             )
         ]
+
+    def count_dataset_items(
+        self, dataset_id: str, *, annotation_status: str | None = None
+    ) -> int:
+        if annotation_status:
+            row = self.db.fetch_one(
+                """
+                SELECT COUNT(*) AS count FROM dataset_items
+                WHERE dataset_id = ? AND annotation_status = ?
+                """,
+                (dataset_id, str(annotation_status)),
+            )
+        else:
+            row = self.db.fetch_one(
+                "SELECT COUNT(*) AS count FROM dataset_items WHERE dataset_id = ?",
+                (dataset_id,),
+            )
+        return int((row["count"] if row else 0) or 0)
 
     def list_pipeline_steps(self, session_id: str, limit: int = 200) -> list[dict[str, Any]]:
         return [
@@ -624,13 +696,16 @@ class EventRepository:
         timestamp_global: float | None = None,
         model_id: str | None = None,
         tracker_id: str | None = None,
+        local_parcel_key: str | None = None,
     ) -> str:
         event_id = str(uuid.uuid4())
         self.db.execute(
             """
             INSERT INTO events
-            (id, event_type, parcel_id, camera_id, severity, payload_json, session_id, source_id, frame_index, timestamp_global, model_id, tracker_id, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, event_type, parcel_id, camera_id, severity, payload_json,
+             session_id, source_id, frame_index, timestamp_global, model_id,
+             tracker_id, local_parcel_key, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event_id,
@@ -645,10 +720,47 @@ class EventRepository:
                 timestamp_global,
                 model_id,
                 tracker_id,
+                local_parcel_key,
                 utc_now(),
             ),
         )
         return event_id
+
+    def bind_local_parcel_events(
+        self,
+        *,
+        session_id: str,
+        source_id: str,
+        local_parcel_key: str,
+        parcel_id: str,
+    ) -> list[dict[str, Any]]:
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM events
+                WHERE session_id = ? AND source_id = ?
+                  AND local_parcel_key = ?
+                ORDER BY timestamp_global, created_at, id
+                """,
+                (session_id, source_id, local_parcel_key),
+            ).fetchall()
+            updates: list[tuple[str, str, str]] = []
+            for row in rows:
+                payload = json.loads(row["payload_json"] or "{}")
+                payload["global_parcel_id"] = parcel_id
+                payload["local_parcel_key"] = local_parcel_key
+                updates.append(
+                    (parcel_id, json.dumps(payload), str(row["id"]))
+                )
+            if updates:
+                conn.executemany(
+                    """
+                    UPDATE events SET parcel_id = ?, payload_json = ?
+                    WHERE id = ?
+                    """,
+                    updates,
+                )
+        return [dict(row) for row in rows]
 
 
 class TrackingRepository:
@@ -717,7 +829,11 @@ class TrackingRepository:
             """,
             (
                 payload["parcel_id"],
-                str(payload["state"]),
+                (
+                    payload["state"].value
+                    if hasattr(payload["state"], "value")
+                    else str(payload["state"]).split(".")[-1]
+                ),
                 payload["last_camera_id"],
                 payload["first_seen_at"],
                 payload["last_seen_at"],

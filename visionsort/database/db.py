@@ -865,6 +865,37 @@ class VisionSortDB:
             self._seed_model_activation_history(conn)
             conn.execute("PRAGMA user_version = 9")
 
+        if version < 10:
+            add_column(
+                "capture_sessions",
+                "site_config_snapshot_json TEXT NOT NULL DEFAULT '{}'",
+            )
+            add_column(
+                "capture_sessions",
+                "runtime_status TEXT NOT NULL DEFAULT 'CREATED'",
+            )
+            add_column("capture_sessions", "start_error TEXT")
+            add_column("events", "local_parcel_key TEXT")
+            conn.executescript(
+                """
+                CREATE INDEX IF NOT EXISTS idx_events_local_parcel
+                    ON events(session_id, source_id, local_parcel_key);
+                CREATE INDEX IF NOT EXISTS idx_capture_session_runtime
+                    ON capture_sessions(runtime_status, started_at, ended_at);
+                """
+            )
+            conn.execute(
+                """
+                UPDATE capture_sessions
+                SET runtime_status = CASE
+                    WHEN ended_at IS NOT NULL THEN 'STOPPED'
+                    WHEN started_at IS NOT NULL THEN 'RUNNING'
+                    ELSE 'CREATED'
+                END
+                """
+            )
+            conn.execute("PRAGMA user_version = 10")
+
     @staticmethod
     def _seed_model_activation_history(
         conn: sqlite3.Connection,

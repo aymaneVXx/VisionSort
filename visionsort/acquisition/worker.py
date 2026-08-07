@@ -420,7 +420,13 @@ def camera_worker_loop(
         camera_role=camera_role,
         zones=zones_by_role.get(camera_role, []),
     )
-    event_engine = ParcelEventEngine(zones_by_role=zones_by_role, source_roles={camera_id: camera_role})
+    event_engine = ParcelEventEngine(
+        zones_by_role=zones_by_role,
+        source_roles={camera_id: camera_role},
+        confirmation_seconds=config.get(
+            "tracking", "event_confirmation_seconds", default={}
+        ),
+    )
     recorder = _SegmentRecorder(
         source_id=source_id,
         session_id=session_id,
@@ -734,7 +740,17 @@ def camera_worker_loop(
             parcel_tracks = [item for item in track_obs if item.class_name == "parcel"]
             context_tracks = [item for item in track_obs if item.class_name != "parcel"]
             for event in event_engine.update(camera_id, parcel_tracks, context_tracks):
-                runtime_queue.put({"kind": "EVENT", "session_id": session_id, "source_id": source_id, **event})
+                local_parcel_key = str(event.pop("parcel_id"))
+                runtime_queue.put(
+                    {
+                        "kind": "EVENT",
+                        "session_id": session_id,
+                        "source_id": source_id,
+                        "parcel_id": None,
+                        "local_parcel_key": local_parcel_key,
+                        **event,
+                    }
+                )
             for tracklet in finalized:
                 runtime_queue.put({"kind": "TRACKLET", "tracklet": asdict(tracklet)})
 

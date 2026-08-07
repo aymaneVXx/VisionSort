@@ -170,17 +170,22 @@ def test_promote_and_rollback_model_registry(tmp_path):
     assert session["pipeline_state"] == PipelineState.DEPLOYED.value
     assert session["last_candidate_model_id"] == "candidate-a"
 
-    set_model_status(db, "candidate-a", ModelStatus.REJECTED.value)
-    rejected = db.fetch_one("SELECT status, is_active FROM model_registry WHERE id = ?", ("candidate-a",))
-    assert rejected is not None
-    assert rejected["status"] == ModelStatus.REJECTED.value
-    assert rejected["is_active"] == 0
+    with pytest.raises(RuntimeError, match="modele actif"):
+        set_model_status(db, "candidate-a", ModelStatus.REJECTED.value)
 
     rolled_back = rollback_to_previous_active(db)
     archived = db.fetch_one("SELECT is_active FROM model_registry WHERE id = ?", ("archived-base",))
     assert rolled_back == "archived-base"
     assert archived is not None
     assert archived["is_active"] == 1
+    set_model_status(db, "candidate-a", ModelStatus.REJECTED.value)
+    rejected = db.fetch_one(
+        "SELECT status, is_active FROM model_registry WHERE id = ?",
+        ("candidate-a",),
+    )
+    assert rejected is not None
+    assert rejected["status"] == ModelStatus.REJECTED.value
+    assert rejected["is_active"] == 0
 
 
 def test_rollback_ignores_candidates_and_never_deployed_archives(tmp_path):

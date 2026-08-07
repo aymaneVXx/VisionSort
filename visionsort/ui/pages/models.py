@@ -58,6 +58,25 @@ def _history_frame(rows: list[dict]) -> pd.DataFrame:
 def render(context: UIContext) -> None:
     page_header("Models", "Registre local, comparaison, promotion et rollback")
     demo_warning(context)
+    with st.expander("Importer un modele baseline Ultralytics"):
+        baseline_path = st.text_input(
+            "Fichier de poids local (.pt)",
+            help="Le fichier est copie dans une version immuable du registre VisionSort.",
+        )
+        baseline_name = st.text_input("Nom du baseline")
+        baseline_task = st.selectbox(
+            "Tache du baseline", ["detection", "segmentation", "pose"]
+        )
+        if st.button("Importer le baseline", disabled=not baseline_path.strip()):
+            context.repo.enqueue_command(
+                CommandType.IMPORT_BASELINE_MODEL,
+                {
+                    "source_path": baseline_path.strip(),
+                    "name": baseline_name.strip() or None,
+                    "task": baseline_task,
+                },
+            )
+            st.info("Import baseline envoye au supervisor.")
     models = context.repo.list_models()
     if not models:
         st.info("Aucun modèle en base.")
@@ -198,8 +217,13 @@ def render(context: UIContext) -> None:
         is_active = int(row.get("is_active") or 0) == 1
         is_candidate = row["status"] == ModelStatus.CANDIDATE.value
         can_promote = is_candidate and not is_active
-        can_reject = row["status"] not in {ModelStatus.CHAMPION.value, ModelStatus.REJECTED.value}
-        can_archive = row["status"] not in {ModelStatus.ARCHIVED.value}
+        can_reject = not is_active and row["status"] not in {
+            ModelStatus.CHAMPION.value,
+            ModelStatus.REJECTED.value,
+        }
+        can_archive = not is_active and row["status"] not in {
+            ModelStatus.ARCHIVED.value
+        }
         with st.container(border=True):
             st.write(
                 f"**{row['id']}** - {row['name']} - backend `{row['backend']}` - "
@@ -243,7 +267,15 @@ def render(context: UIContext) -> None:
                     with st.expander(f"Rapport {row['id']}"):
                         st.code(report_abs.read_text(encoding="utf-8"), language="json")
             cols = st.columns(5)
-            can_activate = row["status"] in {ModelStatus.CHAMPION.value, ModelStatus.ARCHIVED.value}
+            can_activate = row["status"] in {
+                ModelStatus.BASELINE.value,
+                ModelStatus.CHAMPION.value,
+                ModelStatus.ARCHIVED.value,
+            } and not (
+                row["status"] == ModelStatus.ARCHIVED.value
+                and notes.get("archived_from_status")
+                == ModelStatus.CANDIDATE.value
+            )
             if cols[0].button("Activer", key=f"activate-{row['id']}", disabled=is_active or not can_activate):
                 context.repo.enqueue_command(CommandType.ACTIVATE_MODEL, {"model_id": row["id"]})
             if cols[1].button("Promouvoir", key=f"promote-{row['id']}", disabled=not can_promote):

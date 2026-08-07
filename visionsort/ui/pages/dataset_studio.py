@@ -12,7 +12,7 @@ from visionsort.annotations import (
     render_review_overlay,
 )
 from visionsort.annotations.validators import PoseLabelValidator
-from visionsort.core.enums import AnnotationStatus, CommandType
+from visionsort.core.enums import AnnotationStatus, CommandType, ModelStatus
 from visionsort.core.paths import ROOT_DIR
 from visionsort.database.repositories import ArtifactRepository
 from visionsort.ui.components.common import demo_warning, page_header
@@ -86,7 +86,10 @@ def render(context: UIContext) -> None:
             else "detection"
         )
         model_ids = [
-            row["id"] for row in models if row.get("task") == pseudo_label_task
+            row["id"]
+            for row in models
+            if row.get("task") == pseudo_label_task
+            and row.get("status") != ModelStatus.CHAMPION.value
         ]
         pseudo_label_model_id = col4.selectbox("Modèle pseudo-label", model_ids, index=0 if model_ids else None)
         automatic_splits = st.checkbox(
@@ -161,10 +164,43 @@ def render(context: UIContext) -> None:
     ds_options = {f"{row['name']} ({row['id']})": row for row in datasets}
     ds_sel = st.selectbox("Dataset", list(ds_options), index=0)
     ds = ds_options[ds_sel]
-    items = context.repo.list_dataset_items(ds["id"])
+    review_status = st.selectbox(
+        "Statut des items",
+        [
+            AnnotationStatus.NEEDS_REVIEW.value,
+            AnnotationStatus.AUTO_ACCEPTED.value,
+            AnnotationStatus.HUMAN_VALIDATED.value,
+            AnnotationStatus.REJECTED.value,
+        ],
+    )
+    page_size = int(
+        st.selectbox("Items par page", [20, 50, 100], index=1)
+    )
+    item_count = context.repo.count_dataset_items(
+        ds["id"], annotation_status=review_status
+    )
+    page_count = max(1, (item_count + page_size - 1) // page_size)
+    page = int(
+        st.number_input(
+            "Page",
+            min_value=1,
+            max_value=page_count,
+            value=1,
+            step=1,
+        )
+    )
+    items = context.repo.list_dataset_items(
+        ds["id"],
+        limit=page_size,
+        offset=(page - 1) * page_size,
+        annotation_status=review_status,
+    )
     if not items:
-        st.info("Aucun item dans ce dataset.")
+        st.info(f"Aucun item avec le statut {review_status}.")
         return
+    st.caption(
+        f"{item_count} item(s) {review_status} - page {page}/{page_count}."
+    )
 
     summary = json.loads(ds.get("summary_json") or "{}")
     review_counts = summary.get("review_counts") or {}
@@ -197,8 +233,13 @@ def render(context: UIContext) -> None:
                         f"Rapport: `{integrity['report_path']}`"
                     )
 
-    needs_review = [it for it in items if it.get("annotation_status") == AnnotationStatus.NEEDS_REVIEW.value]
-    st.subheader(f"Review ({len(needs_review)} NEEDS_REVIEW)")
+    if review_status != AnnotationStatus.NEEDS_REVIEW.value:
+        st.dataframe(pd.DataFrame(items), use_container_width=True)
+        return
+    needs_review = items
+    st.subheader(
+        f"Review ({item_count} NEEDS_REVIEW, page {page}/{page_count})"
+    )
     if needs_review:
         st.caption("Chaque action de review relance un recalcul de FINALIZE_DATASET pour mettre à jour automatiquement l'état REVIEW_PENDING/DATASET_READY.")
     if not needs_review:
