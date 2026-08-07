@@ -66,15 +66,7 @@ def _build_comparison(
             "status": "no_active_baseline",
         }
     baseline = _json_dict(active["metrics_json"])
-    keys = (
-        "precision",
-        "recall",
-        "mAP50",
-        "mAP50_95",
-        "count_accuracy",
-        "merge_rate",
-        "fps",
-    )
+    keys = _comparison_metric_keys(task)
     deltas: dict[str, float] = {}
     unavailable: list[str] = []
     for key in keys:
@@ -142,18 +134,69 @@ def _stage_immutable_artifact(
     return str(destination.relative_to(ROOT_DIR)), _sha256(destination)
 
 
-def _metrics_from_results(results: Any) -> dict[str, float | None]:
+def _comparison_metric_keys(task: str) -> tuple[str, ...]:
+    if task == "segmentation":
+        return (
+            "mask_precision",
+            "mask_recall",
+            "mask_mAP50",
+            "mask_mAP50_95",
+            "fps",
+        )
+    if task == "pose":
+        return (
+            "pose_precision",
+            "pose_recall",
+            "pose_mAP50",
+            "pose_mAP50_95",
+            "fps",
+        )
+    return (
+        "precision",
+        "recall",
+        "mAP50",
+        "mAP50_95",
+        "count_accuracy",
+        "merge_rate",
+        "fps",
+    )
+
+
+def _metrics_from_results(
+    results: Any, *, task: str = "detection"
+) -> dict[str, float | None]:
     values = getattr(results, "results_dict", {}) or {}
-    keys = {
+    box_keys = {
         "precision": "metrics/precision(B)",
         "recall": "metrics/recall(B)",
         "mAP50": "metrics/mAP50(B)",
         "mAP50_95": "metrics/mAP50-95(B)",
     }
-    return {
+    output = {
         name: float(values[key]) if values.get(key) is not None else None
-        for name, key in keys.items()
+        for name, key in box_keys.items()
     }
+    if task == "segmentation":
+        for name, key in {
+            "mask_precision": "metrics/precision(M)",
+            "mask_recall": "metrics/recall(M)",
+            "mask_mAP50": "metrics/mAP50(M)",
+            "mask_mAP50_95": "metrics/mAP50-95(M)",
+        }.items():
+            output[name] = (
+                float(values[key]) if values.get(key) is not None else None
+            )
+    elif task == "pose":
+        for name, key in {
+            "pose_precision": "metrics/precision(P)",
+            "pose_recall": "metrics/recall(P)",
+            "pose_mAP50": "metrics/mAP50(P)",
+            "pose_mAP50_95": "metrics/mAP50-95(P)",
+        }.items():
+            output[name] = (
+                float(values[key]) if values.get(key) is not None else None
+            )
+    return output
 
 
 def _cleanup_cuda() -> None:
@@ -293,34 +336,131 @@ def _benchmark_replays(
     }
 
 
+def _resolved_artifact_path(path_text: str) -> Path:
+    path = Path(path_text)
+    return path if path.is_absolute() else ROOT_DIR / path
+
+
+def _benchmark_frozen_dataset(
+    db: VisionSortDB,
+    dataset_id: str,
+    model: Any,
+    *,
+    task: str,
+) -> dict[str, Any]:
+    rows = db.fetch_all(
+        """
+        SELECT image_path, label_path, annotation_status
+        FROM dataset_items
+        WHERE dataset_id = ? AND split = 'test'
+        ORDER BY id
+        """,
+        (dataset_id,),
+    )
+    fingerprint = hashlib.sha256()
+    evaluated = 0
+    exact_counts = 0
+    merge_frames = 0
+    human_validated = True
+    started = time.perf_counter()
+    for row in rows:
+        image_path = _resolved_artifact_path(str(row["image_path"]))
+        label_path = _resolved_artifact_path(str(row["label_path"] or ""))
+        human_validated = human_validated and (
+            str(row["annotation_status"]) == "HUMAN_VALIDATED"
+        )
+        if not image_path.is_file() or not label_path.is_file():
+            continue
+        fingerprint.update(image_path.read_bytes())
+        fingerprint.update(label_path.read_bytes())
+        image = cv2.imread(str(image_path))
+        if image is None:
+            continue
+        predictions = model.predict(image, verbose=False)
+        prediction = predictions[0] if predictions else None
+        boxes = getattr(prediction, "boxes", None)
+        predicted_count = len(boxes) if boxes is not None else 0
+        expected_count = sum(
+            1
+            for line in label_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+        if task == "detection":
+            exact_counts += int(predicted_count == expected_count)
+            merge_frames += int(predicted_count < expected_count)
+        evaluated += 1
+    duration = max(time.perf_counter() - started, 1e-9)
+    return {
+        "status": "COMPLETED" if evaluated else "UNAVAILABLE",
+        "reason": None if evaluated else "Split test fige inexploitable.",
+        "frames": evaluated,
+        "fps": evaluated / duration if evaluated else None,
+        "count_accuracy": (
+            exact_counts / evaluated
+            if evaluated and task == "detection"
+            else None
+        ),
+        "merge_rate": (
+            merge_frames / evaluated
+            if evaluated and task == "detection"
+            else None
+        ),
+        "count_metrics_status": (
+            "MEASURED" if evaluated and task == "detection" else "NOT_APPLICABLE"
+        ),
+        "frozen": bool(evaluated),
+        "fixture_sha256": fingerprint.hexdigest() if evaluated else None,
+        "ground_truth_status": (
+            "HUMAN_VALIDATED" if evaluated and human_validated else "INVALID"
+        ),
+        "validated_on_site": False,
+        "source": "immutable_dataset_test_split",
+    }
+
+
 def _promotion_eligible(
     metrics: dict[str, Any],
     *,
     criteria: dict[str, float],
     frozen_test: bool,
+    task: str = "detection",
+    human_validated_test: bool = True,
 ) -> tuple[bool, list[str]]:
     failures: list[str] = []
     if not frozen_test:
         failures.append("frozen_test_required")
+    if not human_validated_test:
+        failures.append("human_validated_test_required")
+    metric_names = {
+        "detection": ("precision", "recall", "mAP50"),
+        "segmentation": (
+            "mask_precision",
+            "mask_recall",
+            "mask_mAP50",
+        ),
+        "pose": ("pose_precision", "pose_recall", "pose_mAP50"),
+    }.get(task, ("precision", "recall", "mAP50"))
     checks = {
-        "precision_min": metrics.get("precision"),
-        "recall_min": metrics.get("recall"),
-        "map50_min": metrics.get("mAP50"),
-        "count_accuracy_min": metrics.get("count_accuracy"),
+        "precision_min": metrics.get(metric_names[0]),
+        "recall_min": metrics.get(metric_names[1]),
+        "map50_min": metrics.get(metric_names[2]),
         "fps_min": metrics.get("fps"),
     }
+    if task == "detection":
+        checks["count_accuracy_min"] = metrics.get("count_accuracy")
     for criterion, actual in checks.items():
         if actual is None:
             failures.append(f"{criterion}:UNAVAILABLE")
         elif float(actual) < float(criteria[criterion]):
             failures.append(f"{criterion}:{actual:.6f}<{criteria[criterion]:.6f}")
-    merge_rate = metrics.get("merge_rate")
-    if merge_rate is None:
-        failures.append("merge_rate_max:UNAVAILABLE")
-    elif float(merge_rate) > float(criteria["merge_rate_max"]):
-        failures.append(
-            f"merge_rate_max:{float(merge_rate):.6f}>{criteria['merge_rate_max']:.6f}"
-        )
+    if task == "detection":
+        merge_rate = metrics.get("merge_rate")
+        if merge_rate is None:
+            failures.append("merge_rate_max:UNAVAILABLE")
+        elif float(merge_rate) > float(criteria["merge_rate_max"]):
+            failures.append(
+                f"merge_rate_max:{float(merge_rate):.6f}>{criteria['merge_rate_max']:.6f}"
+            )
     return not failures, failures
 
 
@@ -470,6 +610,24 @@ def training_worker_loop(
                 "mAP50": 0.89,
                 "mAP50_95": 0.61,
             }
+            if dataset_task == "segmentation":
+                validation_metrics.update(
+                    {
+                        "mask_precision": 0.88,
+                        "mask_recall": 0.84,
+                        "mask_mAP50": 0.89,
+                        "mask_mAP50_95": 0.61,
+                    }
+                )
+            elif dataset_task == "pose":
+                validation_metrics.update(
+                    {
+                        "pose_precision": 0.88,
+                        "pose_recall": 0.84,
+                        "pose_mAP50": 0.89,
+                        "pose_mAP50_95": 0.61,
+                    }
+                )
             test_metrics = {
                 **validation_metrics,
                 "status": "COMPLETED",
@@ -565,25 +723,32 @@ def training_worker_loop(
             test_results = evaluation_model.val(
                 data=str(data_yaml), split="test", verbose=False
             )
-            validation_metrics = _metrics_from_results(validation_results)
+            validation_metrics = _metrics_from_results(
+                validation_results, task=dataset_task
+            )
             test_metrics = {
-                **_metrics_from_results(test_results),
+                **_metrics_from_results(test_results, task=dataset_task),
                 "status": "COMPLETED",
                 "frozen": True,
                 "type": "dataset_test_split",
                 "fixture_sha256": integrity.get("frozen_test_sha256"),
                 "simulated_backend": False,
             }
-            benchmark = _benchmark_replays(
+            benchmark = _benchmark_frozen_dataset(
+                db,
+                str(row["dataset_id"]),
                 evaluation_model,
-                list(
-                    effective_recipe.get("benchmark_replays")
-                    or _session_replay_paths(db, session_id)
-                ),
+                task=dataset_task,
             )
 
+        task_metrics = {
+            key: test_metrics.get(key)
+            for key in _comparison_metric_keys(dataset_task)
+            if key != "fps"
+        }
         metrics = {
             **test_metrics,
+            **task_metrics,
             "count_accuracy": benchmark.get("count_accuracy"),
             "merge_rate": benchmark.get("merge_rate"),
             "fps": benchmark.get("fps"),
@@ -594,10 +759,10 @@ def training_worker_loop(
                     else "UNAVAILABLE"
                 )
                 for key, value in {
-                    "precision": test_metrics.get("precision"),
-                    "recall": test_metrics.get("recall"),
-                    "mAP50": test_metrics.get("mAP50"),
-                    "mAP50_95": test_metrics.get("mAP50_95"),
+                    **{
+                        key: metrics_value
+                        for key, metrics_value in task_metrics.items()
+                    },
                     "count_accuracy": benchmark.get("count_accuracy"),
                     "merge_rate": benchmark.get("merge_rate"),
                     "fps": benchmark.get("fps"),
@@ -618,6 +783,12 @@ def training_worker_loop(
             metrics,
             criteria=criteria,
             frozen_test=bool(test_metrics.get("frozen")),
+            task=dataset_task,
+            human_validated_test=(
+                simulated
+                or benchmark.get("ground_truth_status")
+                == "HUMAN_VALIDATED"
+            ),
         )
         evaluation_metrics = {
             **metrics,

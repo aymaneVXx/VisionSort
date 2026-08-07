@@ -27,6 +27,7 @@ from visionsort.core.enums import (
     SourceStatus,
 )
 from visionsort.core.paths import DB_PATH, ROOT_DIR, ensure_project_dirs
+from visionsort.core.site_config import apply_site_config, validate_site_config
 from visionsort.core.types import GlobalParcel, Tracklet
 from visionsort.database.db import VisionSortDB, utc_now
 from visionsort.database.repositories import (
@@ -46,6 +47,9 @@ from visionsort.deployment.registry import (
     promote_model,
     rollback_to_previous_active,
     set_model_status,
+    import_baseline_model,
+    validate_activation_candidate,
+    validate_promotion_candidate,
 )
 from visionsort.inference.engine import inference_worker_loop
 from visionsort.media.archive import build_session_media_report
@@ -83,11 +87,18 @@ class RuntimeSupervisor:
         config: AppConfig | None = None,
     ):
         ensure_project_dirs()
-        self.config = config or load_config()
+        configured = config or load_config()
+        self.base_config_values = dict(configured.values)
         self.db_path = Path(db_path or DB_PATH)
         self.db = VisionSortDB(self.db_path)
         self.db.initialize()
         self.control_repo = ControlRepository(self.db)
+        self.config = AppConfig(
+            values=apply_site_config(
+                self.base_config_values,
+                self.control_repo.get_site_config(),
+            )
+        )
         self.event_repo = EventRepository(self.db)
         self.tracking_repo = TrackingRepository(self.db)
         self.hypothesis_repo = HandoffHypothesisRepository(self.db)
@@ -103,6 +114,7 @@ class RuntimeSupervisor:
         self.control_flags = self.manager.dict()
         self.active_runtime_models_by_task = self.manager.dict()
         self.active_source_sessions: dict[str, str] = {}
+        self.session_site_configs: dict[str, dict[str, Any]] = {}
         self.active_source_pipelines: dict[str, list[dict[str, Any]]] = {}
         self.latest_stream_epoch_by_source: dict[str, int] = {}
         self.camera_processes: dict[str, tuple[mp.Process, Any]] = {}
@@ -125,10 +137,23 @@ class RuntimeSupervisor:
         }
         activated_at = time.time()
         for task, model_id in self.active_model_ids_by_task.items():
+            generation_row = self.db.fetch_one(
+                """
+                SELECT MAX(routing_generation) AS generation
+                FROM model_activation_history WHERE task = ?
+                """,
+                (task,),
+            )
             self.active_runtime_models_by_task[task] = {
                 "task": task,
                 "model_id": model_id,
-                "generation": 1,
+                "generation": max(
+                    1,
+                    int(
+                        (generation_row["generation"] if generation_row else 0)
+                        or 0
+                    ),
+                ),
                 "activated_at": activated_at,
             }
         self.active_model_id = self.active_model_ids_by_task.get(
@@ -140,7 +165,11 @@ class RuntimeSupervisor:
             max_concurrent_live_sources=int(self.config.get("gpu", "max_concurrent_live_sources", default=3)),
         )
         topology_edges = self.config.get("tracking", "site_topology", "edges", default=[])
-        self.global_tracker = GlobalParcelTracker(topology_edges=topology_edges, source_roles=self._source_roles())
+        self.global_tracker = GlobalParcelTracker(
+            topology_edges=topology_edges,
+            source_roles=self._source_roles(),
+            zones_by_role=self.config.get("tracking", "zones", default={}),
+        )
         self.pending_handoff_buffer = PendingHandoffBuffer(
             self.db,
             topology_edges,
@@ -361,6 +390,30 @@ class RuntimeSupervisor:
             "activated_at": None,
         }
 
+    def last_routing_generation(self, task: str) -> int:
+        row = self.db.fetch_one(
+            """
+            SELECT MAX(routing_generation) AS generation
+            FROM model_activation_history WHERE task = ?
+            """,
+            (str(task),),
+        )
+        historical = int((row["generation"] if row else 0) or 0)
+        current = int(self.runtime_route(task).get("generation") or 0)
+        return max(historical, current)
+
+    def remove_runtime_route(self, task: str) -> None:
+        task = str(task)
+        routes = getattr(self, "active_runtime_models_by_task", None)
+        if routes is not None:
+            routes.pop(task, None)
+        getattr(self, "active_model_ids_by_task", {}).pop(task, None)
+        if task in {"detection", "segmentation"}:
+            remaining = getattr(self, "active_model_ids_by_task", {})
+            self.active_model_id = remaining.get("detection") or remaining.get(
+                "segmentation"
+            )
+
     def refresh_runtime_routes_from_registry(self) -> None:
         with self.db.connect() as conn:
             self.db._seed_model_activation_history(conn)
@@ -379,7 +432,7 @@ class RuntimeSupervisor:
             self.apply_runtime_route(
                 task,
                 model_id,
-                generation=max(1, int(current.get("generation") or 0)),
+                generation=max(1, self.last_routing_generation(task)),
             )
 
     def apply_runtime_route(
@@ -1051,10 +1104,13 @@ class RuntimeSupervisor:
             raise RuntimeError("Modèle introuvable.")
         model = dict(model)
         task = str(model["task"])
+        if promote:
+            validate_promotion_candidate(self.db, str(model_id))
         allowed_statuses = (
             {ModelStatus.CANDIDATE.value}
             if promote
             else {
+                ModelStatus.BASELINE.value,
                 ModelStatus.CHAMPION.value,
                 ModelStatus.ARCHIVED.value,
             }
@@ -1067,7 +1123,7 @@ class RuntimeSupervisor:
         previous_model_id = str(
             previous_route.get("model_id") or ""
         ) or None
-        next_generation = int(previous_route.get("generation") or 0) + 1
+        next_generation = self.last_routing_generation(task) + 1
         source_ids = self.active_dynamic_sources_for_task(task)
         session_ids = sorted(
             {
@@ -1137,6 +1193,8 @@ class RuntimeSupervisor:
             self.rollback_model_holds.add(previous_model_id)
         self.rollback_model_holds.add(str(model_id))
         try:
+            if not promote:
+                validate_activation_candidate(self.db, str(model_id))
             self.ensure_model_loaded(str(model_id))
             steps["loading"] = "COMPLETED"
             route = self.apply_runtime_route(
@@ -1262,6 +1320,8 @@ class RuntimeSupervisor:
                             restored["generation"]
                         ),
                     )
+                elif route_applied:
+                    self.remove_runtime_route(task)
                 if registry_persisted:
                     self._restore_registry_task_snapshot(
                         task, registry_snapshot
@@ -1558,6 +1618,43 @@ class RuntimeSupervisor:
             return True
         return False
 
+    def apply_site_configuration(
+        self, site_config: dict[str, Any]
+    ) -> dict[str, Any]:
+        validated = validate_site_config(site_config)
+        self.control_repo.upsert_site_config(validated)
+        effective = apply_site_config(
+            getattr(self, "base_config_values", self.config.values),
+            validated,
+        )
+        self.config = AppConfig(values=effective)
+        return validated
+
+    def session_runtime_config(
+        self, session_id: str
+    ) -> dict[str, Any]:
+        cached = getattr(self, "session_site_configs", {}).get(
+            str(session_id)
+        )
+        if cached is not None:
+            return dict(cached)
+        if not hasattr(self, "control_repo"):
+            return dict(self.config.values)
+        session = self.control_repo.get_capture_session(str(session_id))
+        snapshot: dict[str, Any] = {}
+        if session is not None:
+            snapshot = json.loads(
+                session.get("site_config_snapshot_json") or "{}"
+            )
+        effective = apply_site_config(
+            getattr(self, "base_config_values", self.config.values),
+            snapshot,
+        )
+        if not hasattr(self, "session_site_configs"):
+            self.session_site_configs = {}
+        self.session_site_configs[str(session_id)] = dict(effective)
+        return effective
+
     def start_source(
         self,
         source_id: str,
@@ -1571,7 +1668,15 @@ class RuntimeSupervisor:
         source_type_snapshot: str | None = None,
         source_uri_snapshot: str | None = None,
         model_pipeline_snapshot: str | list[dict[str, Any]] | None = None,
+        runtime_config_values: dict[str, Any] | None = None,
     ) -> None:
+        existing_session = getattr(self, "active_source_sessions", {}).get(
+            source_id
+        )
+        if source_id in getattr(self, "camera_processes", {}) or existing_session:
+            raise RuntimeError(
+                f"Source deja active dans la session {existing_session or 'inconnue'}: {source_id}"
+            )
         row = self.db.fetch_one("SELECT * FROM sources WHERE id = ?", (source_id,))
         if row is None:
             raise RuntimeError("Source introuvable.")
@@ -1613,7 +1718,7 @@ class RuntimeSupervisor:
             args=(
                 cfg,
                 str(self.db_path),
-                self.config.values,
+                runtime_config_values or self.config.values,
                 self.inference_request_queue,
                 self.inference_result_store,
                 self.runtime_queue,
@@ -1624,7 +1729,14 @@ class RuntimeSupervisor:
             daemon=True,
             name=f"visionsort-camera-{row['role']}",
         )
-        process.start()
+        try:
+            process.start()
+        except Exception:
+            self.active_source_sessions.pop(source_id, None)
+            self.active_source_pipelines.pop(source_id, None)
+            self.latest_stream_epoch_by_source.pop(source_id, None)
+            self.control_flags.pop(source_id, None)
+            raise
         self.camera_processes[source_id] = (process, stop_event)
         self.job_repo.upsert_job_run(
             JobType.CAMERA.value,
@@ -1642,7 +1754,7 @@ class RuntimeSupervisor:
         )
         self.control_repo.update_source_state(source_id, status=SourceStatus.CONNECTING.value, fps=0.0)
 
-    def start_session(self, session_id: str) -> None:
+    def _start_session_legacy(self, session_id: str) -> None:
         session = self.control_repo.get_capture_session(session_id)
         if session is None:
             raise RuntimeError("Session introuvable.")
@@ -1675,7 +1787,117 @@ class RuntimeSupervisor:
                 ),
             )
 
+    def start_session(self, session_id: str) -> None:
+        session = self.control_repo.get_capture_session(session_id)
+        if session is None:
+            raise RuntimeError("Session introuvable.")
+        sources = self.control_repo.list_capture_session_sources(session_id)
+        if not sources:
+            raise RuntimeError("Session sans cameras assignees.")
+        runtime_status = str(session.get("runtime_status") or "CREATED")
+        if runtime_status in {"STARTING", "RUNNING", "STOPPING"} or session.get(
+            "started_at"
+        ) is not None:
+            raise RuntimeError("Session deja demarree.")
+        if runtime_status in {"STOPPED", "FAILED"} or session.get(
+            "ended_at"
+        ) is not None:
+            raise RuntimeError("Une session terminee ne peut pas etre redemarree.")
+        source_ids = [str(row["source_id"]) for row in sources]
+        if len(source_ids) != len(set(source_ids)):
+            raise RuntimeError("Session invalide: une source est assignee plusieurs fois.")
+        for row in sources:
+            source = self.db.fetch_one(
+                "SELECT role FROM sources WHERE id = ?",
+                (str(row["source_id"]),),
+            )
+            if source is None or str(source["role"]) != str(row["camera_role"]):
+                raise RuntimeError(
+                    f"Session invalide: role incoherent pour {row['source_id']}."
+                )
+            owner = getattr(self, "active_source_sessions", {}).get(
+                str(row["source_id"])
+            )
+            if owner and owner != session_id:
+                raise RuntimeError(
+                    f"Source {row['source_id']} deja utilisee par la session {owner}."
+                )
+        site_snapshot = validate_site_config(
+            self.control_repo.get_site_config()
+        )
+        effective_config = apply_site_config(
+            getattr(self, "base_config_values", self.config.values),
+            site_snapshot,
+        )
+        if not hasattr(self, "session_site_configs"):
+            self.session_site_configs = {}
+        self.session_site_configs[session_id] = dict(effective_config)
+        self.control_repo.update_capture_session(
+            session_id,
+            runtime_status="STARTING",
+            start_error="",
+            site_config_snapshot=site_snapshot,
+        )
+        start_global = float(time.time())
+        session_config = json.loads(session.get("config_json") or "{}")
+        replay_loop = bool(session_config.get("replay_loop", False))
+        started_sources: list[str] = []
+        try:
+            for sess_src in sources:
+                self.start_source(
+                    sess_src["source_id"],
+                    session_id=session_id,
+                    session_start_global=start_global,
+                    replay_offset_ms=float(sess_src.get("time_offset_ms") or 0.0),
+                    replay_fps=float(sess_src.get("replay_fps") or 8.0),
+                    replay_loop=replay_loop,
+                    archive_required=bool(sess_src.get("archive_required")),
+                    source_type_snapshot=sess_src.get("source_type_snapshot"),
+                    source_uri_snapshot=sess_src.get("source_uri_snapshot"),
+                    model_pipeline_snapshot=sess_src.get("model_pipeline_json"),
+                    runtime_config_values=effective_config,
+                )
+                started_sources.append(str(sess_src["source_id"]))
+        except Exception as exc:
+            active_for_session = [
+                source_id
+                for source_id, owner in getattr(
+                    self, "active_source_sessions", {}
+                ).items()
+                if owner == session_id
+            ]
+            for started_source in reversed(
+                list(dict.fromkeys(started_sources + active_for_session))
+            ):
+                try:
+                    self.stop_source(started_source)
+                except Exception:
+                    pass
+            self.control_repo.update_capture_session(
+                session_id,
+                ended_at=float(time.time()),
+                runtime_status="FAILED",
+                start_error=str(exc),
+            )
+            raise RuntimeError(
+                f"Echec atomique du demarrage de la session: {exc}"
+            ) from exc
+        self.control_repo.update_capture_session(
+            session_id,
+            started_at=start_global,
+            runtime_status="RUNNING",
+            start_error="",
+        )
+
     def stop_session(self, session_id: str) -> None:
+        session = self.control_repo.get_capture_session(session_id)
+        if session is None:
+            raise RuntimeError("Session introuvable.")
+        if str(session.get("runtime_status") or "") != "RUNNING":
+            raise RuntimeError("Seule une session RUNNING peut etre arretee.")
+        self.control_repo.update_capture_session(
+            session_id, runtime_status="STOPPING"
+        )
         sources = self.control_repo.list_capture_session_sources(session_id)
         for sess_src in sources:
             self.stop_source(sess_src["source_id"])
@@ -1702,7 +1924,9 @@ class RuntimeSupervisor:
             session_id,
             ended_at=float(time.time()),
             media_report=report,
+            runtime_status="STOPPED",
         )
+        getattr(self, "session_site_configs", {}).pop(session_id, None)
 
     def stop_source(self, source_id: str) -> None:
         if hasattr(self, "active_source_sessions"):
@@ -1845,11 +2069,83 @@ class RuntimeSupervisor:
             return
         raise RuntimeError(f"Type de job non annulable: {job_type}")
 
+    def _apply_global_parcel_events(
+        self,
+        parcel: GlobalParcel,
+        events: list[dict[str, Any]],
+        *,
+        tracklet: Tracklet,
+    ) -> None:
+        state_rank = {
+            ParcelState.ON_CONVEYOR: 0,
+            ParcelState.PICK_CANDIDATE: 1,
+            ParcelState.PICKED: 2,
+            ParcelState.CARRIED: 3,
+            ParcelState.DROP_CANDIDATE: 4,
+            ParcelState.DROPPED: 5,
+        }
+        transitions = {
+            "pickup_candidate": ParcelState.PICK_CANDIDATE,
+            "parcel_picked": ParcelState.PICKED,
+            "parcel_carried": ParcelState.CARRIED,
+            "drop_candidate": ParcelState.DROP_CANDIDATE,
+            "parcel_dropped": ParcelState.DROPPED,
+        }
+        for event in events:
+            event_type = str(event.get("event_type") or "")
+            target = transitions.get(event_type)
+            if event_type == "destination_observed" and state_rank[parcel.state] >= state_rank[ParcelState.CARRIED]:
+                target = ParcelState.DROP_CANDIDATE
+            if event_type == "destination_confirmed" and state_rank[parcel.state] >= state_rank[ParcelState.CARRIED]:
+                target = ParcelState.DROPPED
+            if target is None or state_rank[target] < state_rank[parcel.state]:
+                continue
+            previous_state = parcel.state
+            parcel.state = target
+            try:
+                payload = json.loads(event.get("payload_json") or "{}")
+            except json.JSONDecodeError:
+                payload = {}
+            destination = payload.get("destination_zone")
+            if target in {ParcelState.DROP_CANDIDATE, ParcelState.DROPPED} and destination:
+                parcel.assigned_destination = str(destination)
+            if (
+                target == ParcelState.DROPPED
+                and previous_state != ParcelState.DROPPED
+                and event_type != "parcel_dropped"
+            ):
+                self.event_repo.add_event(
+                    "parcel_dropped",
+                    {
+                        "global_parcel_id": parcel.parcel_id,
+                        "local_parcel_key": event.get("local_parcel_key"),
+                        "state": ParcelState.DROPPED.value,
+                        "destination_zone": parcel.assigned_destination,
+                        "derived_from": event_type,
+                        "validated_on_site": False,
+                    },
+                    parcel_id=parcel.parcel_id,
+                    camera_id=tracklet.camera_id,
+                    session_id=tracklet.session_id,
+                    source_id=tracklet.source_id,
+                    timestamp_global=event.get("timestamp_global"),
+                    model_id=tracklet.model_id,
+                    tracker_id=tracklet.tracker_id,
+                    local_parcel_key=event.get("local_parcel_key"),
+                )
+
     def handle_tracklet(self, payload: dict[str, Any]) -> None:
         self.handle_tracklets([payload])
 
-    def _topology_rank(self, role: str) -> int:
-        edges = self.config.get(
+    def _topology_rank(
+        self, role: str, session_id: str | None = None
+    ) -> int:
+        runtime_config = (
+            AppConfig(values=self.session_runtime_config(session_id))
+            if session_id
+            else self.config
+        )
+        edges = runtime_config.get(
             "tracking", "site_topology", "edges", default=[]
         )
         ranks: dict[str, int] = {}
@@ -1880,18 +2176,36 @@ class RuntimeSupervisor:
                 if tracklet.class_name == "parcel"
             ),
             key=lambda tracklet: (
-                self._topology_rank(tracklet.camera_role),
+                tracklet.session_id,
+                self._topology_rank(
+                    tracklet.camera_role, tracklet.session_id
+                ),
                 tracklet.ended_at_global,
                 tracklet.tracklet_id,
             ),
         )
-        by_rank: dict[int, list[Tracklet]] = {}
+        by_rank: dict[tuple[str, int], list[Tracklet]] = {}
         for tracklet in parcel_tracklets:
             by_rank.setdefault(
-                self._topology_rank(tracklet.camera_role), []
+                (
+                    tracklet.session_id,
+                    self._topology_rank(
+                        tracklet.camera_role, tracklet.session_id
+                    ),
+                ),
+                [],
             ).append(tracklet)
-        for rank in sorted(by_rank):
-            wave = by_rank[rank]
+        for session_rank in sorted(by_rank):
+            wave = by_rank[session_rank]
+            runtime_config = AppConfig(
+                values=self.session_runtime_config(session_rank[0])
+            )
+            self.global_tracker.topology_edges = runtime_config.get(
+                "tracking", "site_topology", "edges", default=[]
+            )
+            self.global_tracker.zones_by_role = runtime_config.get(
+                "tracking", "zones", default={}
+            )
             for tracklet in wave:
                 self._try_resolve_hypotheses_with_later_evidence(tracklet)
             wave_outcomes = self.global_tracker.process_tracklets(wave)
@@ -1938,6 +2252,18 @@ class RuntimeSupervisor:
             )
             if parcel_id:
                 parcel = self.global_tracker.parcels[parcel_id]
+                local_parcel_key = (
+                    f"{tracklet.source_id}:{tracklet.local_track_id}"
+                )
+                local_events = self.event_repo.bind_local_parcel_events(
+                    session_id=tracklet.session_id,
+                    source_id=tracklet.source_id,
+                    local_parcel_key=local_parcel_key,
+                    parcel_id=parcel_id,
+                )
+                self._apply_global_parcel_events(
+                    parcel, local_events, tracklet=tracklet
+                )
                 self.tracking_repo.upsert_global_parcel(parcel)
             event_type = (
                 "handoff_ambiguous"
@@ -1970,7 +2296,10 @@ class RuntimeSupervisor:
         self, later: Tracklet
     ) -> None:
         proposals: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
-        edges = self.config.get(
+        runtime_config = AppConfig(
+            values=self.session_runtime_config(later.session_id)
+        )
+        edges = runtime_config.get(
             "tracking", "site_topology", "edges", default=[]
         )
         for hypothesis in self.hypothesis_repo.pending(later.session_id):
@@ -2074,6 +2403,18 @@ class RuntimeSupervisor:
                 self.global_tracker._appearance(incoming)
                 or parcel.appearance_signature
             )
+            local_events = self.event_repo.bind_local_parcel_events(
+                session_id=incoming.session_id,
+                source_id=incoming.source_id,
+                local_parcel_key=(
+                    f"{incoming.source_id}:{incoming.local_track_id}"
+                ),
+                parcel_id=parcel_id,
+            )
+            self._apply_global_parcel_events(
+                parcel, local_events, tracklet=incoming
+            )
+            self.tracking_repo.upsert_global_parcel(parcel)
 
     def resolve_handoff_hypothesis(
         self,
@@ -2082,7 +2423,15 @@ class RuntimeSupervisor:
         *,
         actor: str = "human",
     ) -> str:
-        edges = self.config.get(
+        hypothesis = self.hypothesis_repo.get(hypothesis_id)
+        runtime_config = AppConfig(
+            values=self.session_runtime_config(
+                str(hypothesis.get("session_id") or "")
+                if hypothesis
+                else ""
+            )
+        )
+        edges = runtime_config.get(
             "tracking", "site_topology", "edges", default=[]
         )
         resolved = self.hypothesis_repo.resolve_transactional(
@@ -2274,9 +2623,20 @@ class RuntimeSupervisor:
             elif command_type == CommandType.BOOTSTRAP_DEMO.value:
                 self.bootstrap_demo_sources()
                 result_payload = {"demo_mode": self.config.demo_mode}
+            elif command_type == CommandType.IMPORT_BASELINE_MODEL.value:
+                result_payload = import_baseline_model(
+                    self.db,
+                    source_path=str(payload["source_path"]),
+                    task=str(payload["task"]),
+                    name=payload.get("name"),
+                )
             elif command_type == CommandType.UPSERT_SITE_CONFIG.value:
-                self.control_repo.upsert_site_config(payload)
-                result_payload = {"updated": True}
+                validated = self.apply_site_configuration(payload)
+                result_payload = {
+                    "updated": True,
+                    "effective_for": "new_sessions",
+                    "config": validated,
+                }
             else:
                 raise RuntimeError(f"Commande non supportée: {command_type}")
             self.control_repo.mark_command(command_id, CommandStatus.COMPLETED)
@@ -2309,10 +2669,65 @@ class RuntimeSupervisor:
                     timestamp_global=message.get("timestamp_global"),
                     model_id=message.get("model_id"),
                     tracker_id=message.get("tracker_id"),
+                    local_parcel_key=message.get("local_parcel_key"),
                 )
+                local_parcel_key = message.get("local_parcel_key")
+                if local_parcel_key:
+                    known = self.db.fetch_one(
+                        """
+                        SELECT * FROM tracklets
+                        WHERE session_id = ? AND source_id = ?
+                          AND local_track_id = ? AND parcel_id IS NOT NULL
+                        ORDER BY ended_at_global DESC LIMIT 1
+                        """,
+                        (
+                            message.get("session_id"),
+                            message.get("source_id"),
+                            int(str(local_parcel_key).rsplit(":", 1)[-1]),
+                        ),
+                    )
+                    if known is not None:
+                        parcel_id = str(known["parcel_id"])
+                        parcel = self.global_tracker.parcels.get(parcel_id)
+                        if parcel is not None:
+                            tracklet = self._tracklet_from_row(dict(known))
+                            local_events = self.event_repo.bind_local_parcel_events(
+                                session_id=tracklet.session_id,
+                                source_id=tracklet.source_id,
+                                local_parcel_key=str(local_parcel_key),
+                                parcel_id=parcel_id,
+                            )
+                            self._apply_global_parcel_events(
+                                parcel, local_events, tracklet=tracklet
+                            )
+                            self.tracking_repo.upsert_global_parcel(parcel)
             elif message["kind"] == "TRACKLET":
                 payload = message["tracklet"]
                 if payload.get("class_name") == "parcel":
+                    runtime_config = AppConfig(
+                        values=self.session_runtime_config(
+                            str(payload.get("session_id") or "")
+                        )
+                    )
+                    self.pending_handoff_buffer.configure(
+                        runtime_config.get(
+                            "tracking", "site_topology", "edges", default=[]
+                        ),
+                        window_seconds=float(
+                            runtime_config.get(
+                                "tracking",
+                                "handoff_window_seconds",
+                                default=0.75,
+                            )
+                        ),
+                        expiry_seconds=float(
+                            runtime_config.get(
+                                "tracking",
+                                "handoff_expiry_seconds",
+                                default=30.0,
+                            )
+                        ),
+                    )
                     immediate_tracklet_payloads.extend(
                         self.pending_handoff_buffer.add(payload)
                     )

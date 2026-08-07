@@ -68,16 +68,28 @@ class QualityGate:
             if previous
             else 1.0
         )
-        tracker_consistency = sum(
-            1.0
-            for item in detections
-            if item.get("local_track_id") is not None
-            or item.get("attributes", {}).get("tracker_consistent", True)
-        ) / max(len(detections), 1)
-        model_agreement = sum(
-            float(item.get("attributes", {}).get("model_agreement", 1.0))
-            for item in detections
-        ) / max(len(detections), 1)
+        tracker_values: list[float] = []
+        agreement_values: list[float] = []
+        for item in detections:
+            attributes = item.get("attributes", {})
+            if item.get("local_track_id") is not None:
+                tracker_values.append(1.0)
+            elif "tracker_consistent" in attributes:
+                tracker_values.append(
+                    1.0 if attributes["tracker_consistent"] else 0.0
+                )
+            if "model_agreement" in attributes:
+                agreement_values.append(float(attributes["model_agreement"]))
+        tracker_consistency = (
+            sum(tracker_values) / len(tracker_values)
+            if tracker_values
+            else None
+        )
+        model_agreement = (
+            sum(agreement_values) / len(agreement_values)
+            if agreement_values
+            else None
+        )
         mask_scores: list[float] = []
         if task == "segmentation":
             for item in detections:
@@ -142,11 +154,13 @@ class QualityGate:
             stats["avg_conf"] < 0.65,
             stats["min_conf"] < 0.35,
             stats["temporal_stability"] < 0.55,
-            stats["tracker_consistency"] < 0.75,
+            stats["tracker_consistency"] is None
+            or stats["tracker_consistency"] < 0.75,
             stats["probable_merge_or_split"],
             stats["plausible_size_ratio"] < 0.85,
             stats["truncated_ratio"] > 0.5,
-            stats["model_agreement"] < 0.75,
+            stats["model_agreement"] is None
+            or stats["model_agreement"] < 0.75,
             stats["mask_quality"] < 0.75,
         ]
         if any(review_reasons):

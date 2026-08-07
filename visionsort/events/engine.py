@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from visionsort.core.enums import ParcelState
+from visionsort.core.site_config import zone_kind
 from visionsort.core.types import TrackObservation
 from visionsort.tracking.engine import bbox_center, bbox_iou, box_area, zone_for_bbox
 
@@ -23,15 +24,39 @@ class ParcelEvidence:
     destination_zone: str | None = None
     last_timestamp: float = 0.0
     last_bbox: tuple[float, float, float, float] | None = None
+    pickup_since: float | None = None
+    carry_since: float | None = None
+    drop_since: float | None = None
     validated_on_site: bool = False
     emitted: set[str] = field(default_factory=set)
 
 
 class ParcelEventEngine:
-    def __init__(self, zones_by_role: dict[str, list[dict[str, Any]]], source_roles: dict[str, str]):
+    def __init__(
+        self,
+        zones_by_role: dict[str, list[dict[str, Any]]],
+        source_roles: dict[str, str],
+        confirmation_seconds: dict[str, float] | None = None,
+    ):
         self.zones_by_role = zones_by_role
         self.source_roles = source_roles
         self.parcels: dict[str, ParcelEvidence] = {}
+        self.confirmation_seconds = {
+            "pickup_candidate": 0.05,
+            "picked": 0.15,
+            "carried": 0.25,
+            "drop_candidate": 0.05,
+            "dropped": 0.20,
+            **(confirmation_seconds or {}),
+        }
+
+    @staticmethod
+    def _sustained_since(
+        current: float | None, active: bool, timestamp: float
+    ) -> float | None:
+        if not active:
+            return None
+        return timestamp if current is None else current
 
     def update(self, camera_id: str, parcel_tracks: list[TrackObservation], context_tracks: list[TrackObservation]) -> list[dict[str, Any]]:
         role = self.source_roles.get(camera_id, camera_id)
@@ -42,7 +67,8 @@ class ParcelEventEngine:
         for parcel_track in parcel_tracks:
             parcel_key = f"{camera_id}:{parcel_track.local_track_id}"
             evidence = self.parcels.setdefault(parcel_key, ParcelEvidence(parcel_key=parcel_key))
-            evidence.last_timestamp = parcel_track.timestamp_global
+            timestamp = float(parcel_track.timestamp_global)
+            evidence.last_timestamp = timestamp
             evidence.last_bbox = parcel_track.bbox
 
             iw = float(parcel_track.extra.get("_image_w") or 1.0)
@@ -77,49 +103,112 @@ class ParcelEventEngine:
                 zones,
                 image_size=(int(iw), int(ih)),
             )
-            exit_signal = 1.0 if current_zone and "exit" in current_zone else 0.0
-            destination_signal = 1.0 if current_zone and current_zone.startswith("zone_") else 0.0
+            current_kind = zone_kind(zones, current_zone)
+            exit_signal = 1.0 if current_kind == "exit" else 0.0
+            pick_zone_signal = 1.0 if current_kind == "pick" else 0.0
+            destination_signal = 1.0 if current_kind == "destination" else 0.0
             stillness = max(0.0, 1.0 - min(speed / 0.25, 1.0))
             proximity_signal = max(0.0, 1.0 - min(closest_wrist / 0.18, 1.0))
 
-            evidence.pickup_score = max(
-                0.0,
-                evidence.pickup_score * 0.80
-                + 0.35 * proximity_signal
+            evidence.pickup_score = min(
+                1.5,
+                0.35 * proximity_signal
                 + 0.30 * min(hand_overlap * 4.0, 1.0)
                 + 0.20 * min(person_overlap * 3.0, 1.0)
-                + 0.15 * exit_signal,
+                + 0.10 * pick_zone_signal
+                + 0.05 * exit_signal,
             )
-            evidence.carry_score = max(
-                0.0,
-                evidence.carry_score * 0.82
-                + 0.40 * min(person_overlap * 3.0, 1.0)
+            evidence.carry_score = min(
+                1.5,
+                0.40 * min(person_overlap * 3.0, 1.0)
                 + 0.30 * min(speed / 0.4, 1.0)
                 + 0.30 * proximity_signal,
             )
-            evidence.drop_score = max(
-                0.0,
-                evidence.drop_score * 0.82
-                + 0.35 * destination_signal
+            evidence.drop_score = min(
+                1.5,
+                0.35 * destination_signal
                 + 0.25 * stillness
                 + 0.20 * max(0.0, 1.0 - proximity_signal)
                 + 0.20 * max(0.0, 1.0 - min(person_overlap * 3.0, 1.0)),
             )
+            pickup_active = evidence.pickup_score >= 0.30
+            carry_active = evidence.carry_score >= 0.30
+            drop_active = destination_signal > 0 and evidence.drop_score >= 0.55
+            evidence.pickup_since = self._sustained_since(
+                evidence.pickup_since, pickup_active, timestamp
+            )
+            evidence.carry_since = self._sustained_since(
+                evidence.carry_since, carry_active, timestamp
+            )
+            evidence.drop_since = self._sustained_since(
+                evidence.drop_since, drop_active, timestamp
+            )
+            pickup_duration = (
+                timestamp - evidence.pickup_since
+                if evidence.pickup_since is not None
+                else 0.0
+            )
+            carry_duration = (
+                timestamp - evidence.carry_since
+                if evidence.carry_since is not None
+                else 0.0
+            )
+            drop_duration = (
+                timestamp - evidence.drop_since
+                if evidence.drop_since is not None
+                else 0.0
+            )
 
-            if evidence.state == ParcelState.ON_CONVEYOR and evidence.pickup_score > 0.85:
+            if (
+                evidence.state == ParcelState.ON_CONVEYOR
+                and pickup_duration >= self.confirmation_seconds["pickup_candidate"]
+            ):
                 evidence.state = ParcelState.PICK_CANDIDATE
-                events.append(self._event("pickup_candidate", parcel_key, camera_id, parcel_track, evidence))
-            if evidence.state in {ParcelState.ON_CONVEYOR, ParcelState.PICK_CANDIDATE} and evidence.pickup_score > 1.18:
+                events.extend(self._once("pickup_candidate", evidence, parcel_key, camera_id, parcel_track))
+            if (
+                evidence.state in {ParcelState.ON_CONVEYOR, ParcelState.PICK_CANDIDATE}
+                and pickup_duration >= self.confirmation_seconds["picked"]
+            ):
                 evidence.state = ParcelState.PICKED
                 events.extend(self._once("parcel_picked", evidence, parcel_key, camera_id, parcel_track))
-            if evidence.state in {ParcelState.PICKED, ParcelState.PICK_CANDIDATE} and evidence.carry_score > 0.95:
+            if (
+                evidence.state in {ParcelState.PICKED, ParcelState.PICK_CANDIDATE}
+                and carry_duration >= self.confirmation_seconds["carried"]
+            ):
                 evidence.state = ParcelState.CARRIED
                 events.extend(self._once("parcel_carried", evidence, parcel_key, camera_id, parcel_track))
-            if evidence.state == ParcelState.CARRIED and evidence.drop_score > 0.82:
+            if drop_active:
+                evidence.destination_zone = current_zone
+                events.extend(
+                    self._once(
+                        "destination_observed",
+                        evidence,
+                        parcel_key,
+                        camera_id,
+                        parcel_track,
+                    )
+                )
+            if (
+                evidence.state == ParcelState.CARRIED
+                and drop_duration >= self.confirmation_seconds["drop_candidate"]
+            ):
                 evidence.state = ParcelState.DROP_CANDIDATE
                 evidence.destination_zone = current_zone
-                events.append(self._event("drop_candidate", parcel_key, camera_id, parcel_track, evidence))
-            if evidence.state in {ParcelState.DROP_CANDIDATE, ParcelState.CARRIED} and evidence.drop_score > 1.10 and destination_signal > 0:
+                events.extend(self._once("drop_candidate", evidence, parcel_key, camera_id, parcel_track))
+            if drop_duration >= self.confirmation_seconds["dropped"]:
+                events.extend(
+                    self._once(
+                        "destination_confirmed",
+                        evidence,
+                        parcel_key,
+                        camera_id,
+                        parcel_track,
+                    )
+                )
+            if (
+                evidence.state in {ParcelState.DROP_CANDIDATE, ParcelState.CARRIED}
+                and drop_duration >= self.confirmation_seconds["dropped"]
+            ):
                 evidence.state = ParcelState.DROPPED
                 evidence.destination_zone = current_zone
                 events.extend(self._once("parcel_dropped", evidence, parcel_key, camera_id, parcel_track))
@@ -153,6 +242,13 @@ class ParcelEventEngine:
                 "carry_score": evidence.carry_score,
                 "drop_score": evidence.drop_score,
                 "destination_zone": evidence.destination_zone,
+                "zone_kind": zone_kind(
+                    self.zones_by_role.get(
+                        self.source_roles.get(camera_id, camera_id), []
+                    ),
+                    evidence.destination_zone,
+                ),
+                "confirmation_seconds": dict(self.confirmation_seconds),
                 "validated_on_site": False,
                 "site_validation_status": "NON_VALIDÉ_SUR_SITE",
                 "coordinates_normalized": True,

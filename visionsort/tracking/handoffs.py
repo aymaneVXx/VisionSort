@@ -27,6 +27,22 @@ class PendingHandoffBuffer:
         self.expiry_seconds = max(self.window_seconds, float(expiry_seconds))
         self._component_by_role = self._build_components(topology_edges)
 
+    def configure(
+        self,
+        topology_edges: list[dict[str, Any]],
+        *,
+        window_seconds: float | None = None,
+        expiry_seconds: float | None = None,
+    ) -> None:
+        self.topology_edges = list(topology_edges)
+        self._component_by_role = self._build_components(topology_edges)
+        if window_seconds is not None:
+            self.window_seconds = max(0.0, float(window_seconds))
+        if expiry_seconds is not None:
+            self.expiry_seconds = max(
+                self.window_seconds, float(expiry_seconds)
+            )
+
     @staticmethod
     def _build_components(
         topology_edges: list[dict[str, Any]],
