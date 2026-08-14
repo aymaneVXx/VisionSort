@@ -137,6 +137,21 @@ def _covers_anchor(
     )
 
 
+def _is_merge_member_evidence(
+    candidate_box: tuple[float, float, float, float],
+    state: CanonicalTrackState,
+) -> bool:
+    """Require substantial, anchor-consistent coverage for a merge member.
+
+    A mere bbox intersection is normal when two parcels pass close to each
+    other and must never start a merge group on its own.
+    """
+    if not state.anchors or not _covers_anchor(candidate_box, state.anchors[-1].pixel):
+        return False
+    overlap = _bbox_intersection_area(candidate_box, state.last_bbox)
+    return overlap / _bbox_area(state.last_bbox) >= 0.35
+
+
 def solve_integrity_assignment(
     score_matrix: np.ndarray, *, minimum_score: float
 ) -> dict[int, int]:
@@ -875,13 +890,12 @@ class TrackIntegrityManager:
             members = [
                 state
                 for state in available_states
-                if _bbox_intersection_area(candidate.observation.bbox, state.last_bbox) > 0
-                or _covers_anchor(candidate.observation.bbox, state.anchors[-1].pixel)
+                if _is_merge_member_evidence(candidate.observation.bbox, state)
             ]
             if len(members) < 2:
                 continue
             member_area = sum(_bbox_area(state.last_bbox) for state in members)
-            if _bbox_area(candidate.observation.bbox) < 0.45 * member_area:
+            if _bbox_area(candidate.observation.bbox) < 0.65 * member_area:
                 continue
             related_candidates = [
                 item

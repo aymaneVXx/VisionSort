@@ -306,6 +306,15 @@ class UltralyticsLocalTracker(GreedyIOUTracker):
     tracker_class_name = ""
     persist_backend_tracklets = True
 
+    def _should_persist_backend_tracklet(self, live: _LiveTrack) -> bool:
+        """Return whether a native-backend history owns its persisted identity.
+
+        Subclasses with a canonical identity layer can selectively suppress the
+        duplicate backend history for classes handled by that layer.
+        """
+        _ = live
+        return self.persist_backend_tracklets
+
     def __init__(
         self,
         *,
@@ -451,7 +460,7 @@ class UltralyticsLocalTracker(GreedyIOUTracker):
                 continue
             self.live_tracks[track_id].misses += 1
             if self.live_tracks[track_id].misses >= self.max_misses:
-                if self.persist_backend_tracklets:
+                if self._should_persist_backend_tracklet(self.live_tracks[track_id]):
                     finalized.append(self._finalize(track_id))
                 else:
                     self.live_tracks.pop(track_id)
@@ -462,6 +471,11 @@ class ByteTrackTracker(UltralyticsLocalTracker):
     tracker_config_name = "bytetrack.yaml"
     tracker_class_name = "BYTETracker"
     persist_backend_tracklets = False
+
+    def _should_persist_backend_tracklet(self, live: _LiveTrack) -> bool:
+        # TrackIntegrityManager owns parcel identity only. Person and context
+        # histories remain native ByteTrack tracklets and must not be discarded.
+        return live.class_name != "parcel"
 
     def __init__(
         self,
@@ -479,6 +493,7 @@ class ByteTrackTracker(UltralyticsLocalTracker):
             config=integrity_config,
         )
         self._backend_stream_epoch: int | None = None
+        self.last_backend_observations: tuple[TrackObservation, ...] = ()
 
     def update(
         self,
@@ -492,13 +507,19 @@ class ByteTrackTracker(UltralyticsLocalTracker):
         stream_epoch: int = 0,
         world_geometry: "WorldGeometry | None" = None,
     ) -> tuple[list[TrackObservation], list[Tracklet]]:
+        epoch_finalized: list[Tracklet] = []
         if self._backend_stream_epoch is None:
             self._backend_stream_epoch = int(stream_epoch)
         elif int(stream_epoch) != self._backend_stream_epoch:
             reset_backend = getattr(self.native_tracker, "reset", None)
             if callable(reset_backend):
                 reset_backend()
-            self.live_tracks.clear()
+            for track_id in list(self.live_tracks):
+                live = self.live_tracks[track_id]
+                if self._should_persist_backend_tracklet(live):
+                    epoch_finalized.append(self._finalize(track_id))
+                else:
+                    self.live_tracks.pop(track_id)
             self._backend_stream_epoch = int(stream_epoch)
         backend_observations, backend_finalized = super().update(
             frame_index=frame_index,
@@ -509,6 +530,7 @@ class ByteTrackTracker(UltralyticsLocalTracker):
             image=image,
             stream_epoch=stream_epoch,
         )
+        self.last_backend_observations = tuple(backend_observations)
         effective_size = image_size or (
             (int(image.shape[1]), int(image.shape[0]))
             if image is not None
@@ -522,13 +544,19 @@ class ByteTrackTracker(UltralyticsLocalTracker):
             stream_epoch=stream_epoch,
             world_geometry=world_geometry,
         )
-        return canonical, [
+        return canonical, epoch_finalized + [
             item for item in backend_finalized if item.class_name != "parcel"
         ] + canonical_finalized
 
     def flush(self) -> list[Tracklet]:
-        self.live_tracks.clear()
-        return self.integrity.flush()
+        backend_finalized: list[Tracklet] = []
+        for track_id in list(self.live_tracks):
+            live = self.live_tracks[track_id]
+            if self._should_persist_backend_tracklet(live):
+                backend_finalized.append(self._finalize(track_id))
+            else:
+                self.live_tracks.pop(track_id)
+        return backend_finalized + self.integrity.flush()
 
     def pop_integrity_events(self) -> list[dict[str, Any]]:
         return self.integrity.pop_events()

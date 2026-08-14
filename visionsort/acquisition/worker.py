@@ -831,7 +831,12 @@ def camera_worker_loop(
                     )
             parcel_tracks = [item for item in track_obs if item.class_name == "parcel"]
             context_tracks = [item for item in track_obs if item.class_name != "parcel"]
-            for event in event_engine.update(camera_id, parcel_tracks, context_tracks):
+            for event in event_engine.update(
+                camera_id,
+                parcel_tracks,
+                context_tracks,
+                timestamp_global=frame.timestamp_global,
+            ):
                 local_parcel_key = str(event.pop("parcel_id"))
                 runtime_queue.put(
                     {

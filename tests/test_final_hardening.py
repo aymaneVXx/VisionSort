@@ -457,11 +457,17 @@ def test_global_parcel_keeps_carry_state_and_drops_in_semantic_destination(
 
     assert supervisor.global_tracker.tracklet_to_parcel["track-c3"] == parcel_id
     parcel = db.fetch_one(
-        "SELECT state, assigned_destination FROM global_parcels WHERE parcel_id = ?",
+        """
+        SELECT state, expected_destination, observed_destination,
+               destination_result
+        FROM global_parcels WHERE parcel_id = ?
+        """,
         (parcel_id,),
     )
     assert parcel["state"] == "DROPPED"
-    assert parcel["assigned_destination"] == "dock-renamed"
+    assert parcel["expected_destination"] is None
+    assert parcel["observed_destination"] == "dock-renamed"
+    assert parcel["destination_result"] == "DESTINATION_UNVERIFIED"
     bound = db.fetch_all(
         """
         SELECT event_type, parcel_id FROM events

@@ -81,12 +81,16 @@ def _write_multimodel_asset(
         raise RuntimeError(f"Impossible de créer {video_path}.")
     annotations: list[dict[str, Any]] = []
     for frame_index in range(max_frames):
+        # The interaction contract requires parcel dynamics, not a static hand
+        # overlap. Move the complete synthetic scene coherently while keeping
+        # the parcel inside the configured C2 pick zone.
+        motion_offset = min(frame_index, 24)
         image = np.full(
             (height, width, 3),
             20 + frame_index % 20,
             dtype=np.uint8,
         )
-        parcel_bbox = [90, 88, 130, 116]
+        parcel_bbox = [100 + motion_offset, 88, 140 + motion_offset, 116]
         cv2.rectangle(
             image,
             tuple(parcel_bbox[:2]),
@@ -104,7 +108,7 @@ def _write_multimodel_asset(
             }
         )
         if include_pose:
-            person_bbox = [60, 40, 170, 190]
+            person_bbox = [70 + motion_offset, 40, 180 + motion_offset, 190]
             cv2.rectangle(
                 image,
                 tuple(person_bbox[:2]),
@@ -112,9 +116,11 @@ def _write_multimodel_asset(
                 (220, 140, 20),
                 2,
             )
-            keypoints = [[80.0, 60.0, 2.0] for _ in range(17)]
-            keypoints[9] = [105.0, 100.0, 2.0]
-            keypoints[10] = [115.0, 100.0, 2.0]
+            keypoints = [
+                [90.0 + motion_offset, 60.0, 2.0] for _ in range(17)
+            ]
+            keypoints[9] = [115.0 + motion_offset, 100.0, 2.0]
+            keypoints[10] = [125.0 + motion_offset, 100.0, 2.0]
             annotations.append(
                 {
                     "frame_index": frame_index,

@@ -31,9 +31,11 @@ VisionSort est une plateforme locale Python + Streamlit pour piloter un cycle co
   immuable transforme obligatoirement `pixel brut -> pixel non distordu ->
   XY monde en mètres`. Le tracking local consomme cette API lorsque le profil
   de la session est applicable et reste fonctionnel sans calibration.
-- Pour `bytetrack_cpu`, ByteTrack reste le tracker nominal. Son
+- Pour les colis de `bytetrack_cpu`, ByteTrack reste le tracker nominal. Son
   `backend_track_id` passe ensuite dans `TrackIntegrityManager`, qui produit
   un `local_track_id` VisionSort monotone et non recyclé.
+  Les personnes et les classes de contexte conservent et persistent leur
+  tracklet ByteTrack natif; seule l'identité des colis est remplacée.
 - `bytetrack_cpu` et `botsort_cpu` utilisent les implémentations natives Ultralytics; `greedy_iou` reste une option de démonstration explicite.
 - L'acquisition utilise un buffer borné `latest frame wins` et ne bloque plus sur le temps d'inférence.
 - Le mode simulé est explicite: aucun résultat démo ne doit être utilisé silencieusement hors `DEMO_MODE=1`.
@@ -58,7 +60,11 @@ VisionSort est une plateforme locale Python + Streamlit pour piloter un cycle co
   `capture_session_sources` garde le profil complet réellement affecté à la
   session.
 
-Les migrations incrémentales SQLite v6 à v11 ajoutent ces structures
+La migration v12 sépare `expected_destination`, `observed_destination` et
+`destination_result`. Une destination historique reste non vérifiée faute de
+consigne externe.
+
+Les migrations incrémentales SQLite v6 à v12 ajoutent ces structures
 sans recréer les bases existantes.
 
 ## Modules Principaux
@@ -74,7 +80,9 @@ sans recréer les bases existantes.
 - `visionsort/tracking/engine.py` : trackers locaux, tracklets, matching multicaméra
 - `visionsort/tracking/integrity.py` : identité locale canonique, relink conservateur, occlusions et merge/split
 - `visionsort/tracking/geometry.py` : ground anchor masque/bbox et accès à la géométrie monde
+- `visionsort/tracking/person.py` : personnes ByteTrack et poignets liés à leur origine
 - `visionsort/tracking/replay_benchmark.py` : comparaison ByteTrack brut / identité canonique
+- `visionsort/events/interactions.py` : association opérateur-colis, LAPJV et hystérésis
 - `visionsort/events/engine.py` : événements métier prise/transport/dépôt
 - `visionsort/datasets/pipeline.py` : création dataset, split stable, déduplication, provenance
 - `visionsort/training/pipeline.py` : training, évaluation, candidat, rapport
@@ -117,6 +125,27 @@ python -m visionsort.tracking.replay_benchmark replay.jsonl `
 
 Le rapport compare fragmentations, ID switches, nombre de tracks, relinks,
 refus ambigus et coût moyen/maximal de la couche d'intégrité.
+
+## Interaction opérateur-colis figée
+
+La pose reste attachée à la personne ByteTrack qui l'a produite : aucun
+algorithme ne choisit le poignet le plus proche parmi tous les opérateurs.
+`InteractionMatcher` ne lance LAPJV que sur les couples plausibles de la frame
+et combine distance main-masque/bbox, persistance du contact, mouvement
+relatif, zone de prise, association précédente et intégrité du colis. Une
+identité `AMBIGUOUS` interdit automatiquement prise et dépose.
+
+La machine d'états reste
+`ON_CONVEYOR -> PICK_CANDIDATE -> PICKED -> CARRIED -> DROP_CANDIDATE -> DROPPED`.
+Un colis momentanément invisible en transport devient un `CarriedShadow`
+d'identité seule, sans bbox ni coordonnées inventées. Une dépose requiert une
+réapparition cohérente, la même association opérateur, la séparation des mains,
+une courte stabilité et une zone destination.
+
+Le résultat destination suit une règle fermée : attendu = observé donne
+`SORT_OK`, une différence donne `WRONG_DESTINATION`, et l'absence d'attendu ou
+d'observation donne `DESTINATION_UNVERIFIED`. Aucun `SORT_OK` n'est produit sans
+destination attendue.
 
 ## Pré-Requis
 

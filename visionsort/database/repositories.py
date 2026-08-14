@@ -853,14 +853,18 @@ class TrackingRepository:
         self.db.execute(
             """
             INSERT INTO global_parcels
-            (parcel_id, state, last_camera_id, first_seen_at, last_seen_at, current_tracklet_id, assigned_destination, operator_id, appearance_json, site_validated)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (parcel_id, state, last_camera_id, first_seen_at, last_seen_at,
+             current_tracklet_id, expected_destination, observed_destination,
+             destination_result, operator_id, appearance_json, site_validated)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(parcel_id) DO UPDATE SET
                 state = excluded.state,
                 last_camera_id = excluded.last_camera_id,
                 last_seen_at = excluded.last_seen_at,
                 current_tracklet_id = excluded.current_tracklet_id,
-                assigned_destination = excluded.assigned_destination,
+                expected_destination = excluded.expected_destination,
+                observed_destination = excluded.observed_destination,
+                destination_result = excluded.destination_result,
                 operator_id = excluded.operator_id,
                 appearance_json = excluded.appearance_json,
                 site_validated = excluded.site_validated
@@ -876,7 +880,13 @@ class TrackingRepository:
                 payload["first_seen_at"],
                 payload["last_seen_at"],
                 payload["current_tracklet_id"],
-                payload["assigned_destination"],
+                payload["expected_destination"],
+                payload["observed_destination"],
+                (
+                    payload["destination_result"].value
+                    if hasattr(payload["destination_result"], "value")
+                    else str(payload["destination_result"]).split(".")[-1]
+                ),
                 payload["operator_id"],
                 json.dumps(payload["appearance_signature"] or []),
                 0,
