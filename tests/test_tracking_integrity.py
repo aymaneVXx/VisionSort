@@ -4,11 +4,17 @@ from dataclasses import dataclass
 
 import pytest
 
-from visionsort.core.types import TrackObservation
+from visionsort.core.types import Observation, TrackObservation
 from visionsort.core.site_config import validate_site_config
 from visionsort.tracking.geometry import GroundAnchorEstimator
 from visionsort.tracking.integrity import TrackIntegrityManager
-from visionsort.tracking.replay_benchmark import ReplayFrame, benchmark_replay
+from visionsort.tracking.engine import ByteTrackTracker
+from visionsort.tracking.replay_benchmark import (
+    DetectionReplayFrame,
+    ReplayFrame,
+    benchmark_detection_replay,
+    benchmark_replay,
+)
 
 
 def _backend_track(
@@ -274,6 +280,147 @@ def test_three_parcel_merge_does_not_assign_arbitrarily(manager):
     assert merged == []
     assert len(manager.occlusion_groups) == 1
     assert len(next(iter(manager.occlusion_groups.values())).member_local_track_ids) == 3
+
+
+def test_close_distinct_parcels_with_slight_overlap_do_not_start_merge(manager):
+    first, _ = _update(
+        manager,
+        [
+            _backend_track(1, x=100, timestamp=0.0, frame_index=0, width=40),
+            _backend_track(2, x=135, timestamp=0.0, frame_index=0, width=40),
+        ],
+        0.0,
+        0,
+    )
+    second, _ = _update(
+        manager,
+        [
+            _backend_track(1, x=105, timestamp=0.1, frame_index=1, width=40),
+            _backend_track(2, x=140, timestamp=0.1, frame_index=1, width=40),
+        ],
+        0.1,
+        1,
+    )
+
+    assert len(second) == 2
+    assert {item.local_track_id for item in second} == {
+        item.local_track_id for item in first
+    }
+    assert manager.occlusion_groups == {}
+    assert not any(
+        event["event_type"] == "MERGE_STARTED" for event in manager.pop_events()
+    )
+
+
+def test_missed_detection_near_another_parcel_is_not_a_false_merge(manager):
+    first, _ = _update(
+        manager,
+        [
+            _backend_track(1, x=100, timestamp=0.0, frame_index=0, width=35),
+            _backend_track(2, x=142, timestamp=0.0, frame_index=0, width=35),
+        ],
+        0.0,
+        0,
+    )
+    output, _ = _update(
+        manager,
+        [_backend_track(1, x=110, timestamp=0.1, frame_index=1, width=35)],
+        0.1,
+        1,
+    )
+
+    assert len(output) == 1
+    assert output[0].local_track_id == first[0].local_track_id
+    assert manager.occlusion_groups == {}
+
+
+def test_bytetrack_flush_persists_person_but_canonicalizes_only_parcel(
+    monkeypatch, tmp_path
+):
+    import visionsort.tracking.engine as engine_module
+    import visionsort.tracking.integrity as integrity_module
+
+    monkeypatch.setattr(engine_module, "DETAILS_DIR", tmp_path / "backend-details")
+    monkeypatch.setattr(integrity_module, "DETAILS_DIR", tmp_path / "canonical-details")
+    tracker = ByteTrackTracker(
+        session_id="session-byte",
+        source_id="cam-byte",
+        camera_id="cam-byte",
+        camera_role="C1",
+        tracker_id="bytetrack_cpu",
+        zones=[],
+    )
+    tracker.update(
+        frame_index=0,
+        timestamp_local=0.0,
+        timestamp_global=0.0,
+        image_size=(640, 360),
+        observations=[
+            Observation("parcel", 0.95, (100, 100, 150, 150)),
+            Observation("person", 0.95, (300, 50, 450, 330)),
+        ],
+    )
+
+    finalized = tracker.flush()
+
+    assert [item.class_name for item in finalized].count("person") == 1
+    assert [item.class_name for item in finalized].count("parcel") == 1
+    parcel = next(item for item in finalized if item.class_name == "parcel")
+    assert parcel.summary_json["integrity_status"] == "STABLE"
+
+
+def test_real_bytetrack_detection_replay_reduces_fragmentation():
+    frames = [
+        DetectionReplayFrame(
+            frame_index=0,
+            timestamp_global=0.0,
+            detections=(
+                {
+                    "bbox": [100, 100, 150, 150],
+                    "ground_truth_id": "parcel-A",
+                },
+            ),
+        )
+    ]
+    frames.extend(
+        DetectionReplayFrame(
+            frame_index=index,
+            timestamp_global=index * 0.01,
+            detections=(),
+        )
+        for index in range(1, 36)
+    )
+    frames.extend(
+        [
+            DetectionReplayFrame(
+                frame_index=36,
+                timestamp_global=0.36,
+                detections=(
+                    {
+                        "bbox": [104, 100, 154, 150],
+                        "ground_truth_id": "parcel-A",
+                    },
+                ),
+            ),
+            DetectionReplayFrame(
+                frame_index=37,
+                timestamp_global=0.37,
+                detections=(
+                    {
+                        "bbox": [105, 100, 155, 150],
+                        "ground_truth_id": "parcel-A",
+                    },
+                ),
+            ),
+        ]
+    )
+
+    report = benchmark_detection_replay(frames, image_size=(640, 360))
+
+    assert report["actual_bytetrack_backend"] is True
+    assert report["raw_bytetrack"]["fragmentations"] >= 1
+    assert report["bytetrack_plus_integrity"]["fragmentations"] == 0
+    assert report["bytetrack_plus_integrity"]["relinks"] >= 1
 
 
 def test_segmentation_absent_falls_back_to_bbox_bottom_center():

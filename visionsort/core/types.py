@@ -5,7 +5,7 @@ from typing import Any, Protocol
 
 import numpy as np
 
-from visionsort.core.enums import MatchResult, ParcelState
+from visionsort.core.enums import DestinationResult, MatchResult, ParcelState
 
 
 class FrameSource(Protocol):
@@ -101,6 +101,61 @@ class Tracklet:
     integrity_status: str = "STABLE"
 
 
+@dataclass(frozen=True, slots=True)
+class WristPoint:
+    x: float
+    y: float
+    confidence: float
+    side: str
+    source: str
+
+
+@dataclass(frozen=True, slots=True)
+class PersonTrackSample:
+    timestamp_global: float
+    bbox: tuple[float, float, float, float]
+    left_wrist: WristPoint | None
+    right_wrist: WristPoint | None
+
+
+@dataclass(frozen=True, slots=True)
+class PersonTrack:
+    person_track_id: int
+    bbox: tuple[float, float, float, float]
+    left_wrist: WristPoint | None
+    right_wrist: WristPoint | None
+    confidence: float
+    timestamp_global: float
+    history: tuple[PersonTrackSample, ...] = ()
+    source_operator_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class InteractionMatch:
+    parcel_key: str
+    person_track_id: int
+    score: float
+    reliable: bool
+    ambiguous: bool
+    hand_distance: float
+    hand_overlap: float
+    contact: bool
+    contact_duration: float
+    separation_duration: float
+    relative_motion: float
+    reasons: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class CarriedShadow:
+    parcel_key: str
+    local_track_id: int
+    global_parcel_id: str | None
+    operator_id: str
+    last_reliable_timestamp: float
+    state: ParcelState = ParcelState.CARRIED
+
+
 @dataclass(slots=True)
 class GlobalParcel:
     parcel_id: str
@@ -109,9 +164,23 @@ class GlobalParcel:
     first_seen_at: float
     last_seen_at: float
     current_tracklet_id: str
-    assigned_destination: str | None = None
+    expected_destination: str | None = None
+    observed_destination: str | None = None
+    destination_result: DestinationResult = DestinationResult.DESTINATION_UNVERIFIED
     operator_id: str | None = None
     appearance_signature: list[float] | None = None
+
+
+def evaluate_destination(
+    expected_destination: str | None,
+    observed_destination: str | None,
+) -> DestinationResult:
+    """Apply the explicit routing contract without inventing an expectation."""
+    if expected_destination is None or observed_destination is None:
+        return DestinationResult.DESTINATION_UNVERIFIED
+    if observed_destination == expected_destination:
+        return DestinationResult.SORT_OK
+    return DestinationResult.WRONG_DESTINATION
 
 
 @dataclass(slots=True)

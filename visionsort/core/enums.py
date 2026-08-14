@@ -77,6 +77,12 @@ class ParcelState(str, Enum):
     DROPPED = "DROPPED"
 
 
+class DestinationResult(str, Enum):
+    SORT_OK = "SORT_OK"
+    WRONG_DESTINATION = "WRONG_DESTINATION"
+    DESTINATION_UNVERIFIED = "DESTINATION_UNVERIFIED"
+
+
 class MatchResult(str, Enum):
     MATCHED = "MATCHED"
     AMBIGUOUS = "AMBIGUOUS"

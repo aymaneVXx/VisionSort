@@ -7,7 +7,8 @@ from pathlib import Path
 import time
 from typing import Any, Iterable
 
-from visionsort.core.types import TrackObservation
+from visionsort.core.types import Observation, TrackObservation
+from visionsort.tracking.engine import ByteTrackTracker
 from visionsort.tracking.integrity import TrackIntegrityManager
 
 
@@ -17,6 +18,14 @@ class ReplayFrame:
     timestamp_global: float
     stream_epoch: int
     tracks: tuple[dict[str, Any], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DetectionReplayFrame:
+    frame_index: int
+    timestamp_global: float
+    detections: tuple[dict[str, Any], ...]
+    stream_epoch: int = 0
 
 
 def load_replay(path: str | Path) -> list[ReplayFrame]:
@@ -150,6 +159,104 @@ def benchmark_replay(
         },
         "events": event_counts,
         "ground_truth_available": bool(raw_truth_records),
+        "validated_on_site": False,
+    }
+
+
+def benchmark_detection_replay(
+    frames: Iterable[DetectionReplayFrame],
+    *,
+    image_size: tuple[int, int],
+    integrity_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run detections through the real Ultralytics ByteTrack and integrity layer."""
+    tracker = ByteTrackTracker(
+        session_id="detection-replay",
+        source_id="benchmark-camera",
+        camera_id="benchmark-camera",
+        camera_role="C1",
+        tracker_id="bytetrack_cpu",
+        zones=[],
+        integrity_config=integrity_config,
+    )
+    raw_truth_records: list[tuple[str, str]] = []
+    canonical_truth_records: list[tuple[str, str]] = []
+    raw_identities: set[str] = set()
+    canonical_identities: set[int] = set()
+    event_counts: dict[str, int] = {}
+    started = time.perf_counter()
+    frame_count = 0
+    for frame in frames:
+        frame_count += 1
+        detections = [
+            Observation(
+                class_name=str(payload.get("class_name") or "parcel"),
+                confidence=float(payload.get("confidence", 0.95)),
+                bbox=tuple(float(value) for value in payload["bbox"]),
+                model_id=str(payload.get("model_id") or "replay-detections"),
+                mask=payload.get("mask"),
+                attributes={
+                    "ground_truth_id": str(payload["ground_truth_id"])
+                }
+                if payload.get("ground_truth_id") is not None
+                else {},
+            )
+            for payload in frame.detections
+        ]
+        canonical, _ = tracker.update(
+            frame_index=frame.frame_index,
+            timestamp_local=frame.timestamp_global,
+            timestamp_global=frame.timestamp_global,
+            image_size=image_size,
+            observations=detections,
+            stream_epoch=frame.stream_epoch,
+        )
+        canonical_by_backend = {
+            int(item.backend_track_id): item.local_track_id
+            for item in canonical
+            if item.backend_track_id is not None
+        }
+        for backend in tracker.last_backend_observations:
+            if backend.backend_track_id is None:
+                continue
+            raw_identity = f"{frame.stream_epoch}:{backend.backend_track_id}"
+            raw_identities.add(raw_identity)
+            canonical_id = canonical_by_backend.get(int(backend.backend_track_id))
+            if canonical_id is not None:
+                canonical_identities.add(canonical_id)
+            truth_id = backend.extra.get("ground_truth_id")
+            if truth_id is not None:
+                raw_truth_records.append((str(truth_id), raw_identity))
+                if canonical_id is not None:
+                    canonical_truth_records.append(
+                        (str(truth_id), str(canonical_id))
+                    )
+        for event in tracker.pop_integrity_events():
+            event_type = str(event["event_type"])
+            event_counts[event_type] = event_counts.get(event_type, 0) + 1
+    wall_seconds = time.perf_counter() - started
+    runtime = tracker.integrity_metrics()
+    return {
+        "raw_bytetrack": {
+            "tracks_created": len(raw_identities),
+            **_identity_metrics(raw_truth_records),
+        },
+        "bytetrack_plus_integrity": {
+            "canonical_tracks_created": len(canonical_identities),
+            **_identity_metrics(canonical_truth_records),
+            "relinks": int(runtime["relinks"]),
+            "ambiguous_or_refused": int(runtime["ambiguous_refusals"]),
+        },
+        "integrity_runtime": {
+            "average_ms_per_frame": float(runtime["runtime_avg_ms"]),
+            "maximum_ms_per_frame": float(runtime["runtime_max_ms"]),
+            "lapjv_subproblems": int(runtime["lapjv_subproblems"]),
+            "benchmark_wall_seconds": wall_seconds,
+            "frames": frame_count,
+        },
+        "events": event_counts,
+        "ground_truth_available": bool(raw_truth_records),
+        "actual_bytetrack_backend": True,
         "validated_on_site": False,
     }
 

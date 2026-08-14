@@ -21,6 +21,7 @@ from visionsort.core.config import AppConfig, load_config
 from visionsort.core.enums import (
     CommandStatus,
     CommandType,
+    DestinationResult,
     JobType,
     MatchResult,
     ModelStatus,
@@ -29,7 +30,7 @@ from visionsort.core.enums import (
 )
 from visionsort.core.paths import DB_PATH, ROOT_DIR, ensure_project_dirs
 from visionsort.core.site_config import apply_site_config, validate_site_config
-from visionsort.core.types import GlobalParcel, Tracklet
+from visionsort.core.types import GlobalParcel, Tracklet, evaluate_destination
 from visionsort.database.db import VisionSortDB, utc_now
 from visionsort.database.repositories import (
     ArtifactRepository,
@@ -258,6 +259,9 @@ class RuntimeSupervisor:
                     row["parcel_id"]
                 )
         valid_states = {state.value: state for state in ParcelState}
+        valid_destination_results = {
+            result.value: result for result in DestinationResult
+        }
         for raw_row in self.db.fetch_all("SELECT * FROM global_parcels"):
             row = dict(raw_row)
             raw_state = str(row["state"])
@@ -270,7 +274,15 @@ class RuntimeSupervisor:
                 first_seen_at=float(row["first_seen_at"]),
                 last_seen_at=float(row["last_seen_at"]),
                 current_tracklet_id=str(row["current_tracklet_id"]),
-                assigned_destination=row.get("assigned_destination"),
+                expected_destination=row.get("expected_destination"),
+                observed_destination=row.get("observed_destination"),
+                destination_result=valid_destination_results.get(
+                    str(
+                        row.get("destination_result")
+                        or DestinationResult.DESTINATION_UNVERIFIED.value
+                    ).split(".")[-1],
+                    DestinationResult.DESTINATION_UNVERIFIED,
+                ),
                 operator_id=row.get("operator_id"),
                 appearance_signature=json.loads(row.get("appearance_json") or "[]"),
             )
@@ -2139,9 +2151,15 @@ class RuntimeSupervisor:
                 payload = json.loads(event.get("payload_json") or "{}")
             except json.JSONDecodeError:
                 payload = {}
-            destination = payload.get("destination_zone")
+            destination = payload.get("observed_destination") or payload.get(
+                "destination_zone"
+            )
             if target in {ParcelState.DROP_CANDIDATE, ParcelState.DROPPED} and destination:
-                parcel.assigned_destination = str(destination)
+                parcel.observed_destination = str(destination)
+                parcel.destination_result = evaluate_destination(
+                    parcel.expected_destination,
+                    parcel.observed_destination,
+                )
             if (
                 target == ParcelState.DROPPED
                 and previous_state != ParcelState.DROPPED
@@ -2153,7 +2171,9 @@ class RuntimeSupervisor:
                         "global_parcel_id": parcel.parcel_id,
                         "local_parcel_key": event.get("local_parcel_key"),
                         "state": ParcelState.DROPPED.value,
-                        "destination_zone": parcel.assigned_destination,
+                        "expected_destination": parcel.expected_destination,
+                        "observed_destination": parcel.observed_destination,
+                        "destination_result": parcel.destination_result.value,
                         "derived_from": event_type,
                         "validated_on_site": False,
                     },

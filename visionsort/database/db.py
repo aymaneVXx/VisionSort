@@ -287,6 +287,13 @@ class VisionSortDB:
                     last_seen_at REAL NOT NULL,
                     current_tracklet_id TEXT NOT NULL,
                     assigned_destination TEXT,
+                    expected_destination TEXT,
+                    observed_destination TEXT,
+                    destination_result TEXT NOT NULL DEFAULT 'DESTINATION_UNVERIFIED'
+                        CHECK(destination_result IN (
+                            'SORT_OK', 'WRONG_DESTINATION',
+                            'DESTINATION_UNVERIFIED'
+                        )),
                     operator_id TEXT,
                     appearance_json TEXT NOT NULL DEFAULT '[]',
                     site_validated INTEGER NOT NULL DEFAULT 0
@@ -987,6 +994,31 @@ class VisionSortDB:
                 """
             )
             conn.execute("PRAGMA user_version = 11")
+
+        if version < 12:
+            add_column("global_parcels", "expected_destination TEXT")
+            add_column("global_parcels", "observed_destination TEXT")
+            add_column(
+                "global_parcels",
+                """destination_result TEXT NOT NULL
+                   DEFAULT 'DESTINATION_UNVERIFIED'
+                   CHECK(destination_result IN (
+                       'SORT_OK', 'WRONG_DESTINATION',
+                       'DESTINATION_UNVERIFIED'
+                   ))""",
+            )
+            # The legacy field represented an observation, never a verified
+            # routing expectation. Preserve it accordingly without claiming OK.
+            conn.execute(
+                """
+                UPDATE global_parcels
+                SET observed_destination = COALESCE(
+                        observed_destination, assigned_destination
+                    ),
+                    destination_result = 'DESTINATION_UNVERIFIED'
+                """
+            )
+            conn.execute("PRAGMA user_version = 12")
 
     @staticmethod
     def _seed_model_activation_history(

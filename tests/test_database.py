@@ -70,8 +70,42 @@ def test_v9_migration_seeds_existing_active_models(tmp_path):
         WHERE activated_model_id = 'demo_synth_det'
         """
     )
-    assert version is not None and version[0] == 11
+    assert version is not None and version[0] == 12
     assert model is not None and model["status"] == "CANDIDATE"
     assert history is not None
     assert history["status"] == "ACTIVE"
     assert history["runtime_applied"] == 1
+
+
+def test_v12_migration_preserves_legacy_destination_as_unverified_observation(
+    tmp_path,
+):
+    db = VisionSortDB(tmp_path / "legacy-v11.db")
+    db.initialize()
+    with db.connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO global_parcels
+            (parcel_id, state, last_camera_id, first_seen_at, last_seen_at,
+             current_tracklet_id, assigned_destination, appearance_json)
+            VALUES ('parcel-legacy', 'DROPPED', 'cam-1', 0, 1,
+                    'tracklet-1', 'destination-A', '[]')
+            """
+        )
+        conn.execute(
+            "UPDATE global_parcels SET observed_destination = NULL WHERE parcel_id = 'parcel-legacy'"
+        )
+        conn.execute("PRAGMA user_version = 11")
+
+    db.initialize()
+
+    row = db.fetch_one(
+        """
+        SELECT expected_destination, observed_destination, destination_result
+        FROM global_parcels WHERE parcel_id = 'parcel-legacy'
+        """
+    )
+    assert db.fetch_one("PRAGMA user_version")[0] == 12
+    assert row["expected_destination"] is None
+    assert row["observed_destination"] == "destination-A"
+    assert row["destination_result"] == "DESTINATION_UNVERIFIED"
