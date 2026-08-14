@@ -7,7 +7,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import lap
@@ -17,6 +17,10 @@ from visionsort.core.enums import MatchResult, ParcelState
 from visionsort.core.paths import DETAILS_DIR, ROOT_DIR
 from visionsort.core.site_config import zone_kind
 from visionsort.core.types import GlobalParcel, HandoffCandidate, Observation, TrackObservation, Tracklet
+from visionsort.tracking.integrity import TrackIntegrityConfig, TrackIntegrityManager
+
+if TYPE_CHECKING:
+    from visionsort.calibration.geometry import WorldGeometry
 
 
 def bbox_iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
@@ -117,8 +121,10 @@ class GreedyIOUTracker:
         image_size: tuple[int, int] | None = None,
         observations: list[Observation],
         image: np.ndarray | None = None,
+        stream_epoch: int = 0,
+        world_geometry: "WorldGeometry | None" = None,
     ) -> tuple[list[TrackObservation], list[Tracklet]]:
-        _ = image
+        _ = image, stream_epoch, world_geometry
         produced: list[TrackObservation] = []
         finalized: list[Tracklet] = []
         unmatched_track_ids = set(self.live_tracks)
@@ -156,6 +162,7 @@ class GreedyIOUTracker:
                 appearance_hint=obs.embedding,
                 model_id=obs.model_id,
                 tracker_id=self.tracker_id,
+                backend_track_id=track_id,
                 extra=_observation_extra(obs, image_size),
             )
             live.last_bbox = obs.bbox
@@ -189,6 +196,7 @@ class GreedyIOUTracker:
                 appearance_hint=obs.embedding,
                 model_id=obs.model_id,
                 tracker_id=self.tracker_id,
+                backend_track_id=track_id,
                 extra=_observation_extra(obs, image_size),
             )
             self.live_tracks[track_id] = _LiveTrack(
@@ -276,10 +284,14 @@ class GreedyIOUTracker:
                 "ground_truth": {"parcel_hint": ground_truth_hint} if ground_truth_hint else {},
                 "model_id": live.history[-1].model_id,
                 "tracker_id": self.tracker_id,
+                "backend_track_ids": [track_id],
+                "integrity_status": "STABLE",
                 "validated_on_site": False,
             },
             model_id=live.history[-1].model_id,
             tracker_id=self.tracker_id,
+            backend_track_ids=[track_id],
+            integrity_status="STABLE",
         )
 
 
@@ -292,6 +304,7 @@ class UltralyticsLocalTracker(GreedyIOUTracker):
 
     tracker_config_name = ""
     tracker_class_name = ""
+    persist_backend_tracklets = True
 
     def __init__(
         self,
@@ -345,7 +358,10 @@ class UltralyticsLocalTracker(GreedyIOUTracker):
         image_size: tuple[int, int] | None = None,
         observations: list[Observation],
         image: np.ndarray | None = None,
+        stream_epoch: int = 0,
+        world_geometry: "WorldGeometry | None" = None,
     ) -> tuple[list[TrackObservation], list[Tracklet]]:
+        _ = world_geometry
         produced: list[TrackObservation] = []
         finalized: list[Tracklet] = []
         width, height = image_size or (
@@ -404,10 +420,13 @@ class UltralyticsLocalTracker(GreedyIOUTracker):
                 appearance_hint=obs.embedding,
                 model_id=obs.model_id,
                 tracker_id=self.tracker_id,
+                backend_track_id=track_id,
                 extra={
                     **_observation_extra(obs, image_size),
                     "track_identity": [self.camera_id, track_id],
                     "tracker_backend": type(self.native_tracker).__name__,
+                    "backend_track_id": track_id,
+                    "stream_epoch": int(stream_epoch),
                 },
             )
             if live is None:
@@ -432,13 +451,90 @@ class UltralyticsLocalTracker(GreedyIOUTracker):
                 continue
             self.live_tracks[track_id].misses += 1
             if self.live_tracks[track_id].misses >= self.max_misses:
-                finalized.append(self._finalize(track_id))
+                if self.persist_backend_tracklets:
+                    finalized.append(self._finalize(track_id))
+                else:
+                    self.live_tracks.pop(track_id)
         return produced, finalized
 
 
 class ByteTrackTracker(UltralyticsLocalTracker):
     tracker_config_name = "bytetrack.yaml"
     tracker_class_name = "BYTETracker"
+    persist_backend_tracklets = False
+
+    def __init__(
+        self,
+        *,
+        integrity_config: TrackIntegrityConfig | dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.integrity = TrackIntegrityManager(
+            session_id=self.session_id,
+            source_id=self.source_id,
+            camera_id=self.camera_id,
+            camera_role=self.camera_role,
+            tracker_id=self.tracker_id,
+            config=integrity_config,
+        )
+        self._backend_stream_epoch: int | None = None
+
+    def update(
+        self,
+        *,
+        frame_index: int,
+        timestamp_local: float,
+        timestamp_global: float,
+        image_size: tuple[int, int] | None = None,
+        observations: list[Observation],
+        image: np.ndarray | None = None,
+        stream_epoch: int = 0,
+        world_geometry: "WorldGeometry | None" = None,
+    ) -> tuple[list[TrackObservation], list[Tracklet]]:
+        if self._backend_stream_epoch is None:
+            self._backend_stream_epoch = int(stream_epoch)
+        elif int(stream_epoch) != self._backend_stream_epoch:
+            reset_backend = getattr(self.native_tracker, "reset", None)
+            if callable(reset_backend):
+                reset_backend()
+            self.live_tracks.clear()
+            self._backend_stream_epoch = int(stream_epoch)
+        backend_observations, backend_finalized = super().update(
+            frame_index=frame_index,
+            timestamp_local=timestamp_local,
+            timestamp_global=timestamp_global,
+            image_size=image_size,
+            observations=observations,
+            image=image,
+            stream_epoch=stream_epoch,
+        )
+        effective_size = image_size or (
+            (int(image.shape[1]), int(image.shape[0]))
+            if image is not None
+            else (1, 1)
+        )
+        canonical, canonical_finalized = self.integrity.update(
+            backend_observations,
+            frame_index=frame_index,
+            timestamp_global=timestamp_global,
+            image_size=effective_size,
+            stream_epoch=stream_epoch,
+            world_geometry=world_geometry,
+        )
+        return canonical, [
+            item for item in backend_finalized if item.class_name != "parcel"
+        ] + canonical_finalized
+
+    def flush(self) -> list[Tracklet]:
+        self.live_tracks.clear()
+        return self.integrity.flush()
+
+    def pop_integrity_events(self) -> list[dict[str, Any]]:
+        return self.integrity.pop_events()
+
+    def integrity_metrics(self) -> dict[str, int | float]:
+        return self.integrity.metrics()
 
 
 class BoTSORTTracker(UltralyticsLocalTracker):
@@ -454,6 +550,7 @@ def build_tracker(
     camera_id: str,
     camera_role: str,
     zones: list[dict[str, Any]] | None,
+    integrity_config: TrackIntegrityConfig | dict[str, Any] | None = None,
 ) -> GreedyIOUTracker | UltralyticsLocalTracker:
     if tracker_id == "greedy_iou":
         return GreedyIOUTracker(
@@ -472,6 +569,7 @@ def build_tracker(
             camera_role=camera_role,
             tracker_id=tracker_id,
             zones=zones,
+            integrity_config=integrity_config,
         )
     if tracker_id == "botsort_cpu":
         return BoTSORTTracker(

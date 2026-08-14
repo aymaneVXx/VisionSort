@@ -13,7 +13,7 @@ from typing import Any
 
 import cv2
 
-from visionsort.calibration.geometry import runtime_calibration_diagnostic
+from visionsort.calibration.geometry import WorldGeometry, runtime_calibration_diagnostic
 from visionsort.calibration.models import CalibrationProfile
 from visionsort.core.config import AppConfig
 from visionsort.core.config import relative_to_root
@@ -421,6 +421,7 @@ def camera_worker_loop(
         camera_id=camera_id,
         camera_role=camera_role,
         zones=zones_by_role.get(camera_role, []),
+        integrity_config=config.get("tracking", "integrity", default={}),
     )
     event_engine = ParcelEventEngine(
         zones_by_role=zones_by_role,
@@ -469,11 +470,13 @@ def camera_worker_loop(
         if calibration_payload
         else None
     )
+    world_geometry: WorldGeometry | None = None
     calibration_diagnostic: dict[str, Any] = {
         "status": "NOT_CHECKED",
         "applicable": False,
     }
     calibration_image_size: tuple[int, int] | None = None
+    last_tracking_model_id: str | None = None
     status = SourceStatus.CONNECTING.value
     frame_counter = 0
     fps_window_started = time.time()
@@ -542,6 +545,12 @@ def camera_worker_loop(
                             source_config.get("optical_setup_id") or "default"
                         ),
                     },
+                )
+                world_geometry = (
+                    WorldGeometry(calibration_profile)
+                    if calibration_profile is not None
+                    and bool(calibration_diagnostic.get("applicable"))
+                    else None
                 )
             if acquisition.frames_processed % 5 == 0:
                 cv2.imwrite(
@@ -803,7 +812,23 @@ def camera_worker_loop(
                 image_size=(int(frame.image.shape[1]), int(frame.image.shape[0])),
                 observations=observations,
                 image=frame.image,
+                stream_epoch=int(frame.stream_epoch),
+                world_geometry=world_geometry,
             )
+            last_tracking_model_id = observations[0].model_id if observations else None
+            pop_integrity_events = getattr(tracker, "pop_integrity_events", None)
+            if callable(pop_integrity_events):
+                for integrity_event in pop_integrity_events():
+                    runtime_queue.put(
+                        {
+                            "kind": "EVENT",
+                            "session_id": session_id,
+                            "source_id": source_id,
+                            "model_id": last_tracking_model_id,
+                            "tracker_id": tracker_id,
+                            **integrity_event,
+                        }
+                    )
             parcel_tracks = [item for item in track_obs if item.class_name == "parcel"]
             context_tracks = [item for item in track_obs if item.class_name != "parcel"]
             for event in event_engine.update(camera_id, parcel_tracks, context_tracks):
@@ -863,11 +888,29 @@ def camera_worker_loop(
                         for item in frame_results
                     },
                     "calibration": calibration_diagnostic,
+                    "tracking_integrity": (
+                        tracker.integrity_metrics()
+                        if callable(getattr(tracker, "integrity_metrics", None))
+                        else {}
+                    ),
                     "validated_on_site": False,
                 },
             )
         for tracklet in tracker.flush():
             runtime_queue.put({"kind": "TRACKLET", "tracklet": asdict(tracklet)})
+        pop_integrity_events = getattr(tracker, "pop_integrity_events", None)
+        if callable(pop_integrity_events):
+            for integrity_event in pop_integrity_events():
+                runtime_queue.put(
+                    {
+                        "kind": "EVENT",
+                        "session_id": session_id,
+                        "source_id": source_id,
+                        "model_id": last_tracking_model_id,
+                        "tracker_id": tracker_id,
+                        **integrity_event,
+                    }
+                )
         repo.update_source_state(
             source_id,
             status=SourceStatus.OFFLINE.value,

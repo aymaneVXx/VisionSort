@@ -84,6 +84,19 @@ def test_selected_tracker_instantiates_real_ultralytics_backend():
     assert type(byte.native_tracker).__name__ == "BYTETracker"
     assert type(bot.native_tracker).__name__ == "BOTSORT"
 
+    canonical, _ = byte.update(
+        frame_index=0,
+        timestamp_local=0.0,
+        timestamp_global=0.0,
+        image_size=(640, 360),
+        observations=[Observation("parcel", 0.95, (100, 100, 150, 150))],
+        stream_epoch=0,
+    )
+    assert len(canonical) == 1
+    assert canonical[0].backend_track_id is not None
+    assert canonical[0].anchor_px == (125.0, 150.0)
+    assert canonical[0].extra["track_identity"] == ["cam", canonical[0].local_track_id]
+
 
 def test_tracker_and_events_generate_pick_signal_without_runtime_parcel_hint():
     tracker = GreedyIOUTracker(

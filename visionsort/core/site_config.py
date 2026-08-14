@@ -7,6 +7,7 @@ from typing import Any
 
 ZONE_KINDS = {"entry", "exit", "pick", "destination"}
 SITE_TRACKING_KEYS = {
+    "integrity",
     "zones",
     "site_topology",
     "handoff_window_seconds",
@@ -14,6 +15,12 @@ SITE_TRACKING_KEYS = {
     "handoff_expiry_seconds",
     "hypothesis_expiry_seconds",
     "event_confirmation_seconds",
+}
+TRACK_INTEGRITY_KEYS = {
+    "max_occlusion_seconds",
+    "max_speed_m_s",
+    "min_relink_score",
+    "ambiguity_margin",
 }
 SITE_CALIBRATION_KEYS = {
     "schema_version",
@@ -151,6 +158,32 @@ def validate_site_config(config: dict[str, Any]) -> dict[str, Any]:
             f"Configuration site invalide: schema_version {schema_version} non supporte."
         )
     tracking = _tracking_payload(config)
+    integrity = tracking.get("integrity", {})
+    if not isinstance(integrity, dict):
+        raise RuntimeError(
+            "Configuration site invalide: tracking.integrity doit etre un objet."
+        )
+    unknown_integrity = set(integrity) - TRACK_INTEGRITY_KEYS
+    if unknown_integrity:
+        raise RuntimeError(
+            "Parametres d'integrite inconnus: "
+            + ", ".join(sorted(str(value) for value in unknown_integrity))
+        )
+    for key, value in integrity.items():
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Parametre d'integrite invalide: {key} doit etre numerique."
+            ) from exc
+        if not math.isfinite(number) or number <= 0:
+            raise RuntimeError(
+                f"Parametre d'integrite invalide: {key} doit etre strictement positif."
+            )
+        if key in {"min_relink_score", "ambiguity_margin"} and number > 1:
+            raise RuntimeError(
+                f"Parametre d'integrite invalide: {key} doit etre dans ]0, 1]."
+            )
     zones_by_role = tracking.get("zones", {})
     if not isinstance(zones_by_role, dict):
         raise RuntimeError("Configuration site invalide: tracking.zones doit etre un objet.")
