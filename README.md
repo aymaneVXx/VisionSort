@@ -29,7 +29,11 @@ VisionSort est une plateforme locale Python + Streamlit pour piloter un cycle co
 - Chaque caméra conserve son tracker local indépendant.
 - La géométrie caméra est isolée dans `visionsort/calibration`: un profil
   immuable transforme obligatoirement `pixel brut -> pixel non distordu ->
-  XY monde en mètres`. Le tracking ne consomme pas encore ces coordonnées.
+  XY monde en mètres`. Le tracking local consomme cette API lorsque le profil
+  de la session est applicable et reste fonctionnel sans calibration.
+- Pour `bytetrack_cpu`, ByteTrack reste le tracker nominal. Son
+  `backend_track_id` passe ensuite dans `TrackIntegrityManager`, qui produit
+  un `local_track_id` VisionSort monotone et non recyclé.
 - `bytetrack_cpu` et `botsort_cpu` utilisent les implémentations natives Ultralytics; `greedy_iou` reste une option de démonstration explicite.
 - L'acquisition utilise un buffer borné `latest frame wins` et ne bloque plus sur le temps d'inférence.
 - Le mode simulé est explicite: aucun résultat démo ne doit être utilisé silencieusement hors `DEMO_MODE=1`.
@@ -68,6 +72,9 @@ sans recréer les bases existantes.
 - `visionsort/acquisition/worker.py` : boucle caméra/source, previews, enregistrement, observations JSONL
 - `visionsort/inference/engine.py` : backends de modèles et provenance modèle/version
 - `visionsort/tracking/engine.py` : trackers locaux, tracklets, matching multicaméra
+- `visionsort/tracking/integrity.py` : identité locale canonique, relink conservateur, occlusions et merge/split
+- `visionsort/tracking/geometry.py` : ground anchor masque/bbox et accès à la géométrie monde
+- `visionsort/tracking/replay_benchmark.py` : comparaison ByteTrack brut / identité canonique
 - `visionsort/events/engine.py` : événements métier prise/transport/dépôt
 - `visionsort/datasets/pipeline.py` : création dataset, split stable, déduplication, provenance
 - `visionsort/training/pipeline.py` : training, évaluation, candidat, rapport
@@ -77,6 +84,39 @@ sans recréer les bases existantes.
 - `visionsort/calibration/repository.py` : versions immuables, activation et snapshots
 - `visionsort/observations/export.py` : export `JSONL -> Parquet`
 - `visionsort/ui/pages/` : pages Dashboard, Cameras, Calibration, Live Tracking, Recordings, Dataset Studio, Training, Models, Events, Settings
+
+## Tracking local canonique
+
+Le chemin nominal est volontairement court :
+
+```text
+YOLO -> ByteTrack -> TrackIntegrityManager -> local_track_id -> TrackObservation/Tracklet
+```
+
+Un backend ID connu est traduit directement, sans association supplémentaire.
+Le manager n'utilise LAPJV que pour les petits sous-problèmes de relink ou de
+split. Il prédit localement le mouvement depuis les timestamps réels, utilise
+le ground anchor monde lorsque la calibration est valide, puis retombe sur les
+coordonnées image normalisées. Une décision trop proche de son alternative est
+marquée `AMBIGUOUS`; aucune identité n'est forcée.
+
+Les tracklets conservent les `backend_track_ids`, relinks, périodes
+d'occlusion, merges/splits, `stream_epoch`, statut final et raisons de
+décision. Les événements d'intégrité sont enregistrés dans la table `events`
+existante. Les quatre paramètres publics sont sous `tracking.integrity` et les
+limites physiques restent à ajuster sur site.
+
+Le benchmark attend un JSONL de frames contenant `timestamp_global`,
+`stream_epoch` et une liste `tracks` avec `backend_track_id`, `bbox` et,
+facultativement, `ground_truth_id` :
+
+```powershell
+python -m visionsort.tracking.replay_benchmark replay.jsonl `
+  --image-width 1920 --image-height 1080 --output integrity-report.json
+```
+
+Le rapport compare fragmentations, ID switches, nombre de tracks, relinks,
+refus ambigus et coût moyen/maximal de la couche d'intégrité.
 
 ## Pré-Requis
 

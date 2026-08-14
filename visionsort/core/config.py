@@ -79,6 +79,12 @@ DEFAULT_CONFIG = {
         "ransac_max_iterations": 10000,
     },
     "tracking": {
+        "integrity": {
+            "max_occlusion_seconds": 0.75,
+            "max_speed_m_s": 3.0,
+            "min_relink_score": 0.55,
+            "ambiguity_margin": 0.10,
+        },
         "handoff_window_seconds": 0.75,
         "handoff_buffer_max_items": 1000,
         "handoff_expiry_seconds": 30.0,

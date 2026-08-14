@@ -240,6 +240,10 @@ class RuntimeSupervisor:
             summary_json=summary,
             model_id=row.get("model_id"),
             tracker_id=row.get("tracker_id"),
+            backend_track_ids=[
+                int(value) for value in summary.get("backend_track_ids", [])
+            ],
+            integrity_status=str(summary.get("integrity_status") or "STABLE"),
         )
 
     def _restore_global_tracker_state(self) -> None:
@@ -2718,7 +2722,11 @@ class RuntimeSupervisor:
                     message["payload"],
                     parcel_id=message.get("parcel_id"),
                     camera_id=message.get("camera_id"),
-                    severity="warning" if "ambiguous" in message["event_type"] else "info",
+                    severity=(
+                        "warning"
+                        if "ambiguous" in str(message["event_type"]).lower()
+                        else "info"
+                    ),
                     session_id=message.get("session_id"),
                     source_id=message.get("source_id"),
                     frame_index=message.get("frame_index"),

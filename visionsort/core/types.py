@@ -63,6 +63,12 @@ class TrackObservation:
     appearance_hint: list[float] | None = None
     model_id: str | None = None
     tracker_id: str | None = None
+    backend_track_id: int | None = None
+    anchor_px: tuple[float, float] | None = None
+    anchor_world_m: tuple[float, float] | None = None
+    anchor_method: str | None = None
+    world_valid: bool = False
+    identity_status: str = "STABLE"
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> dict[str, Any]:
@@ -91,6 +97,8 @@ class Tracklet:
     summary_json: dict[str, Any]
     model_id: str | None = None
     tracker_id: str | None = None
+    backend_track_ids: list[int] = field(default_factory=list)
+    integrity_status: str = "STABLE"
 
 
 @dataclass(slots=True)
