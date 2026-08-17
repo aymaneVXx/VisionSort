@@ -11,7 +11,7 @@ from visionsort.core.types import (
     Tracklet,
     TrackletAppearanceDescriptor,
 )
-from visionsort.reid.encoder import ParcelReIDEncoder, l2_normalize
+from visionsort.reid.encoder import ParcelReIDBackbone, l2_normalize
 
 
 @dataclass(slots=True)
@@ -27,7 +27,7 @@ class HandoffKeyframeSelector:
 
     def __init__(
         self,
-        encoder: ParcelReIDEncoder,
+        encoder: ParcelReIDBackbone,
         *,
         max_views: int = 5,
         min_views: int = 3,
@@ -103,6 +103,8 @@ class HandoffKeyframeSelector:
         if embeddings.size == 0:
             return tracklet
         aggregate = l2_normalize(np.median(embeddings, axis=0)).reshape(-1)
+        average_quality = float(np.mean([item.quality for item in selected]))
+        reliable = len(selected) >= self.min_views
         descriptor = TrackletAppearanceDescriptor(
             embeddings=embeddings.astype(float).tolist(),
             aggregate_embedding=aggregate.astype(float).tolist(),
@@ -110,6 +112,9 @@ class HandoffKeyframeSelector:
             view_qualities=[round(item.quality, 6) for item in selected],
             model_version=self.encoder.model_version,
             used_mask=[item.used_mask for item in selected],
+            min_views=self.min_views,
+            average_view_quality=round(average_quality, 6),
+            descriptor_quality="RELIABLE" if reliable else "LOW",
         )
         tracklet.summary_json["appearance_descriptor"] = descriptor.to_json()
         tracklet.summary_json["reid_keyframe_policy"] = {

@@ -74,6 +74,7 @@ class CharucoBoardConfig:
 
 
 DEFAULT_WORLD_CONVENTION = {
+    "frame_id": "site_world",
     "unit": "m",
     "x_axis": "conveyor_longitudinal",
     "y_axis": "conveyor_transverse",

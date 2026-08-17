@@ -7,7 +7,11 @@ from typing import Any
 from visionsort.core.enums import MatchResult
 from visionsort.core.site_config import zone_kind
 from visionsort.core.types import HandoffCandidate, Tracklet
-from visionsort.reid.encoder import ProjectionHead, descriptor_similarity
+from visionsort.reid.encoder import (
+    ProjectionHead,
+    descriptor_is_reliable,
+    descriptor_similarity,
+)
 
 
 @dataclass(slots=True)
@@ -105,11 +109,34 @@ class HandoffCandidateGenerator:
             return GateDecision(False, ["zone entrante non entry"], evidence, edge)
         left_world = outgoing_summary.get("last_anchor_world_m")
         right_world = incoming_summary.get("first_anchor_world_m")
-        if left_world and right_world and len(left_world) >= 2 and len(right_world) >= 2:
-            distance = math.dist(
-                (float(left_world[0]), float(left_world[1])),
-                (float(right_world[0]), float(right_world[1])),
-            )
+        left_frame = outgoing_summary.get("world_frame_id")
+        right_frame = incoming_summary.get("world_frame_id")
+        same_world_frame = bool(left_frame) and left_frame == right_frame
+        evidence.update(
+            {
+                "outgoing_world_frame_id": left_frame,
+                "incoming_world_frame_id": right_frame,
+                "same_world_frame": same_world_frame,
+            }
+        )
+        valid_world = False
+        left_point: tuple[float, float] | None = None
+        right_point: tuple[float, float] | None = None
+        if (
+            same_world_frame
+            and left_world
+            and right_world
+            and len(left_world) >= 2
+            and len(right_world) >= 2
+        ):
+            try:
+                left_point = (float(left_world[0]), float(left_world[1]))
+                right_point = (float(right_world[0]), float(right_world[1]))
+                valid_world = all(math.isfinite(value) for value in (*left_point, *right_point))
+            except (TypeError, ValueError):
+                valid_world = False
+        if valid_world and left_point is not None and right_point is not None:
+            distance = math.dist(left_point, right_point)
             physical_limit = float(edge.get("max_speed_m_s", self.max_speed_m_s)) * transit + 0.35
             evidence.update(
                 {
@@ -122,6 +149,11 @@ class HandoffCandidateGenerator:
                 return GateDecision(False, ["mouvement monde impossible"], evidence, edge)
         else:
             evidence["world_available"] = False
+            evidence["world_unavailable_reason"] = (
+                "different_or_unknown_world_frames"
+                if not same_world_frame
+                else "missing_or_invalid_world_coordinates"
+            )
         return GateDecision(
             True,
             ["hard gates validés"],
@@ -177,13 +209,17 @@ class HandoffScorer:
             distance = float(gates.evidence["world_distance_m"])
             limit = max(float(gates.evidence["world_distance_limit_m"]), 1.0e-6)
             world = max(0.0, 1.0 - distance / limit)
+        outgoing_summary = _summary(outgoing)
+        incoming_summary = _summary(incoming)
+        outgoing_reliable = descriptor_is_reliable(outgoing_summary)
+        incoming_reliable = descriptor_is_reliable(incoming_summary)
         reid: float | None = None
-        if self.reid_enabled:
+        if self.reid_enabled and outgoing_reliable and incoming_reliable:
             reid = descriptor_similarity(
-                _summary(outgoing), _summary(incoming), self.projection
+                outgoing_summary, incoming_summary, self.projection
             )
-        outgoing_descriptor = _summary(outgoing).get("appearance_descriptor") or {}
-        incoming_descriptor = _summary(incoming).get("appearance_descriptor") or {}
+        outgoing_descriptor = outgoing_summary.get("appearance_descriptor") or {}
+        incoming_descriptor = incoming_summary.get("appearance_descriptor") or {}
         backbone_versions = sorted(
             {
                 str(value)
@@ -201,7 +237,7 @@ class HandoffScorer:
             "speed": speed,
             "integrity": integrity,
         }
-        weights = {
+        physical_weights = {
             "temporal": 0.24,
             "dimensions": 0.20,
             "zone": 0.16,
@@ -210,7 +246,11 @@ class HandoffScorer:
         }
         if world is not None:
             components["world"] = world
-            weights["world"] = 0.08
+            physical_weights["world"] = 0.08
+        physical_score = sum(
+            components[name] * physical_weights[name] for name in physical_weights
+        ) / sum(physical_weights.values())
+        weights = dict(physical_weights)
         if reid is not None:
             components["reid"] = reid
             weights["reid"] = 0.32
@@ -220,7 +260,12 @@ class HandoffScorer:
             **components,
             "transit_s": transit,
             "topology": str(gates.evidence["topology"]),
+            "physical_score": float(physical_score),
+            "non_visual_score": float(physical_score),
             "reid_available": reid is not None,
+            "reid_used": reid is not None,
+            "outgoing_descriptor_reliable": outgoing_reliable,
+            "incoming_descriptor_reliable": incoming_reliable,
             "reid_backbone_versions": ",".join(backbone_versions) or None,
         }
         reasons = [

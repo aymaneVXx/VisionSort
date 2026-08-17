@@ -205,6 +205,9 @@ class TrackletAppearanceDescriptor:
     view_qualities: list[float]
     model_version: str
     used_mask: list[bool] = field(default_factory=list)
+    min_views: int = 3
+    average_view_quality: float = 0.0
+    descriptor_quality: str = "LOW"
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)

@@ -178,6 +178,12 @@ class WorldGeometry:
 
     profile: CalibrationProfile
 
+    @property
+    def world_frame_id(self) -> str | None:
+        value = self.profile.world_coordinate_convention.get("frame_id")
+        normalized = str(value).strip() if value is not None else ""
+        return normalized or None
+
     def undistort_point(
         self, point: Sequence[float], *, image_size: tuple[int, int]
     ) -> tuple[float, float]:

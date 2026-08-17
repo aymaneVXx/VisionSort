@@ -128,6 +128,8 @@ def _validate_world_convention(value: Any) -> None:
         )
     if str(value.get("unit") or "") != "m":
         raise RuntimeError("Le repere monde VisionSort utilise obligatoirement les metres.")
+    if "frame_id" in value and not str(value.get("frame_id") or "").strip():
+        raise RuntimeError("world_coordinate_convention.frame_id ne peut pas etre vide.")
     if str(value.get("x_axis") or "") != "conveyor_longitudinal":
         raise RuntimeError("L'axe X monde doit etre conveyor_longitudinal.")
     if str(value.get("y_axis") or "") != "conveyor_transverse":

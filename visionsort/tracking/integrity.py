@@ -521,6 +521,8 @@ class TrackIntegrityManager:
         )
         if candidate.anchor.world_m is not None:
             extra["anchor_world_m"] = list(candidate.anchor.world_m)
+            if candidate.anchor.world_frame_id:
+                extra["world_frame_id"] = candidate.anchor.world_frame_id
         canonical = replace(
             candidate.observation,
             local_track_id=state.local_track_id,
@@ -1249,6 +1251,11 @@ class TrackIntegrityManager:
             item for item in history
             if item.world_valid and item.anchor_world_m is not None
         ]
+        world_frame_ids = {
+            str(item.extra.get("world_frame_id"))
+            for item in world_observations
+            if item.extra.get("world_frame_id")
+        }
         summary = {
             "start_frame": history[0].frame_index,
             "end_frame": history[-1].frame_index,
@@ -1284,6 +1291,9 @@ class TrackIntegrityManager:
                 if world_observations else None
             ),
             "world_observation_count": len(world_observations),
+            "world_frame_id": (
+                next(iter(world_frame_ids)) if len(world_frame_ids) == 1 else None
+            ),
             "validated_on_site": False,
         }
         return Tracklet(
