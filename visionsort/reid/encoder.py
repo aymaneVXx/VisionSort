@@ -44,6 +44,10 @@ class ParcelReIDEncoder:
             else device
         )
         self.device = torch.device(resolved_device)
+        if self.device.type == "cpu":
+            # Camera workers run in separate processes. One thread per encoder
+            # prevents severe oversubscription with two or three live sources.
+            torch.set_num_threads(1)
         model = mobilenet_v3_small(weights=None)
         state = torch.load(path, map_location="cpu", weights_only=True)
         model.load_state_dict(state, strict=True)

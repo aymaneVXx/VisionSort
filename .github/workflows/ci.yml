@@ -53,6 +53,10 @@ jobs:
           --report data/runtime/reports/supervisor-e2e.json
           --max-frames 72
 
+      - name: Multicamera parcel ReID end-to-end scenario
+        if: matrix.python-version == '3.12'
+        run: python -m visionsort.runtime.multicam_reid_e2e
+
       - name: RuntimeSupervisor multi-model end-to-end scenario
         if: matrix.python-version == '3.12'
         run: >-
