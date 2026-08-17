@@ -13,6 +13,9 @@ from visionsort.reid.encoder import ProjectionHead, l2_normalize
 import visionsort.reid.adaptation as adaptation_module
 
 
+DATASET_VERSION = "reid-pairs-v2-physical"
+
+
 def _descriptor(vector: list[float]) -> dict:
     value = l2_normalize(np.asarray(vector, dtype=np.float32)).tolist()
     return {
@@ -111,7 +114,7 @@ def _add_training_pairs(repo: ReIDRepository, *, count: int = 4) -> None:
             left_descriptor=positive_left,
             right_descriptor=positive_right,
             metadata={},
-            dataset_version="reid-pairs-v1",
+            dataset_version=DATASET_VERSION,
         )
         repo.add_pair(
             session_id="adapt-session",
@@ -122,7 +125,7 @@ def _add_training_pairs(repo: ReIDRepository, *, count: int = 4) -> None:
             left_descriptor=negative_left,
             right_descriptor=positive_right,
             metadata={},
-            dataset_version="reid-pairs-v1",
+            dataset_version=DATASET_VERSION,
         )
 
 
@@ -282,7 +285,7 @@ def test_projection_head_training_changes_only_the_small_projection(tmp_path):
         min_hard_negatives=2,
         epochs=3,
     )
-    pairs = repo.list_pairs(dataset_version="reid-pairs-v1")
+    pairs = repo.list_pairs(dataset_version=DATASET_VERSION)
     adapter_down, adapter_up, bias = adapter._train_projection(pairs)
 
     assert adapter_down.shape == (1, 4)

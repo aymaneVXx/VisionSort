@@ -39,7 +39,7 @@ class AutoReIDAdapter:
         enabled: bool = True,
         min_positive_pairs: int = 32,
         min_hard_negatives: int = 16,
-        dataset_version: str = "reid-pairs-v1",
+        dataset_version: str = "reid-pairs-v2-physical",
         epochs: int = 24,
         on_promoted: Callable[[ProjectionHead], None] | None = None,
     ) -> None:
