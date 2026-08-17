@@ -74,13 +74,27 @@ class CharucoBoardConfig:
 
 
 DEFAULT_WORLD_CONVENTION = {
-    "frame_id": "site_world",
     "unit": "m",
     "x_axis": "conveyor_longitudinal",
     "y_axis": "conveyor_transverse",
     "z_axis": "up",
     "conveyor_plane_z_m": 0.0,
 }
+
+
+def world_convention_for_source(
+    source_id: str,
+    convention: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return a safe convention for a newly created camera calibration.
+
+    A shared frame is never inferred. Callers must provide its ``frame_id``
+    explicitly when several cameras were measured in the same physical frame.
+    """
+    normalized = {**DEFAULT_WORLD_CONVENTION, **(convention or {})}
+    frame_id = str(normalized.get("frame_id") or "").strip()
+    normalized["frame_id"] = frame_id or f"camera:{source_id}"
+    return normalized
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,7 +214,7 @@ class CalibrationProfile:
                 "homography_world_to_image_undistorted",
             ),
             world_coordinate_convention_json=canonical_json(
-                world_coordinate_convention or DEFAULT_WORLD_CONVENTION
+                world_convention_for_source(source_id, world_coordinate_convention)
             ),
             board_config_json=canonical_json(board_config),
             optical_configuration_json=canonical_json(

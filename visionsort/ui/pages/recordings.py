@@ -12,7 +12,11 @@ from visionsort.ui.state import UIContext
 
 
 def render(context: UIContext) -> None:
-    page_header("Recordings", "Segments enregistrés et métadonnées")
+    page_header(
+        "Enregistrements",
+        "Consultez les vidéos conservées pour le replay et la création de datasets.",
+        eyebrow="Archives",
+    )
     st.info(
         "Cette archive contient les frames retenues après le mécanisme "
         "« latest frame wins ». Elle permet de reproduire les observations, "

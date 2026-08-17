@@ -1,109 +1,130 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 import pandas as pd
 import streamlit as st
 
 from visionsort.ui.components.common import (
     demo_warning,
     page_header,
+    short_identifier,
     show_preview,
+    status_badge,
+    status_label,
 )
 from visionsort.ui.state import UIContext
 
 
+def _time(value: object) -> str:
+    try:
+        return datetime.fromtimestamp(float(value)).astimezone().strftime("%H:%M:%S")
+    except (TypeError, ValueError, OSError):
+        return "—"
+
+
 def render(context: UIContext) -> None:
     page_header(
-        "Live Tracking", "Previews annotees, tracks locaux et colis globaux"
+        "Exploitation",
+        "Suivez les flux, les colis et le résultat du tri en temps réel.",
     )
     demo_warning(context)
     sessions = context.repo.list_capture_sessions()
-    session_map = {
-        f"{row['name']} ({row['id']})": row["id"] for row in sessions
-    }
+    session_map = {f"{row['name']}": row["id"] for row in sessions}
     selected = st.selectbox(
-        "CaptureSession",
+        "Session affichée",
         list(session_map),
         index=0 if session_map else None,
     )
     selected_session_id = session_map[selected] if selected else None
     sources = context.repo.list_sources()
-    if not sources:
-        st.info("Aucune source a afficher.")
-        return
     if selected_session_id:
         session_sources = {
             row["source_id"]
-            for row in context.repo.list_capture_session_sources(
-                selected_session_id
-            )
+            for row in context.repo.list_capture_session_sources(selected_session_id)
         }
         sources = [row for row in sources if row["id"] in session_sources]
 
-    runtime_state = context.repo.get_runtime_model_state()
-    runtime_tasks = (
-        (runtime_state.get("consistency") or {}).get("tasks") or []
-    )
-    runtime_by_task = {
-        str(row.get("task")): row for row in runtime_tasks
-    }
-    if runtime_tasks:
-        st.subheader("Routage runtime effectif")
-        st.dataframe(
-            pd.DataFrame(
-                [
-                    {
-                        "tache": row.get("task"),
-                        "modele_runtime": row.get("runtime_model_id"),
-                        "generation": row.get("routing_generation"),
-                        "charge": row.get("loaded"),
-                        "coherent": row.get("consistent"),
-                    }
-                    for row in runtime_tasks
-                ]
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    cols = st.columns(min(3, len(sources)))
-    for index, source in enumerate(sources):
-        with cols[index % len(cols)]:
-            show_preview(
-                source.get("preview_path"),
-                f"{source['role']} - {source.get('status') or 'OFFLINE'}",
-            )
-            assignments = source.get("model_assignments") or []
-            routes = []
-            for assignment in assignments:
-                if not assignment.get("enabled", 1):
-                    continue
-                task = str(assignment.get("task"))
-                runtime = runtime_by_task.get(task) or {}
-                model_id = runtime.get("runtime_model_id") or assignment.get(
-                    "model_id"
+    st.subheader("Flux vidéo")
+    if not sources:
+        st.info("Aucune caméra à afficher.")
+    else:
+        columns = st.columns(min(3, len(sources)))
+        for index, source in enumerate(sources):
+            with columns[index % len(columns)].container(border=True):
+                st.markdown(f"**{source['name']} — {source['role']}**")
+                st.markdown(
+                    status_badge(source.get("status") or "OFFLINE"),
+                    unsafe_allow_html=True,
                 )
-                generation = runtime.get("routing_generation") or 0
-                routes.append(f"{task}={model_id}@g{generation}")
-            st.caption(
-                f"FPS: {source.get('fps') or 0:.2f} | "
-                f"Runtime: {' | '.join(routes) or 'UNAVAILABLE'} | "
-                f"Tracker: {source['tracker_id']}"
-            )
+                show_preview(source.get("preview_path"), str(source["name"]))
+                st.caption(f"{float(source.get('fps') or 0):.1f} images/s")
 
-    st.subheader("Tracklets")
-    tracklets = context.repo.list_tracklets()
+    tracklets = context.repo.list_tracklets(limit=500)
     if selected_session_id:
         tracklets = [
-            row
-            for row in tracklets
-            if row.get("session_id") == selected_session_id
+            row for row in tracklets if row.get("session_id") == selected_session_id
         ]
-    st.dataframe(pd.DataFrame(tracklets), use_container_width=True)
-    st.subheader("Colis globaux")
+    parcel_ids = {row.get("parcel_id") for row in tracklets if row.get("parcel_id")}
     parcels = context.repo.list_parcels()
-    st.dataframe(
-        pd.DataFrame(parcels)
-        if parcels
-        else pd.DataFrame(columns=["parcel_id", "state"]),
-        use_container_width=True,
+    if selected_session_id:
+        parcels = [row for row in parcels if row.get("parcel_id") in parcel_ids]
+
+    st.subheader("Colis suivis")
+    if not parcels:
+        st.info("Aucun colis suivi pour cette session.")
+        return
+    card_columns = st.columns(3)
+    for index, parcel in enumerate(parcels[:9]):
+        with card_columns[index % 3].container(border=True):
+            st.markdown(
+                f"### Colis {short_identifier(parcel.get('parcel_id'), prefix='#')}"
+            )
+            st.markdown(
+                status_badge(parcel.get("destination_result")),
+                unsafe_allow_html=True,
+            )
+            expected = parcel.get("expected_destination") or "Non renseignée"
+            observed = parcel.get("observed_destination") or "Non observée"
+            st.write(f"Destination attendue : **{expected}**")
+            st.write(f"Destination observée : **{observed}**")
+            if parcel.get("operator_id"):
+                st.caption(f"Opérateur associé : {parcel['operator_id']}")
+
+    table = pd.DataFrame(
+        [
+            {
+                "Heure": _time(parcel.get("last_seen_at")),
+                "Colis": short_identifier(parcel.get("parcel_id"), prefix="#"),
+                "État": status_label(parcel.get("state")),
+                "Destination attendue": parcel.get("expected_destination") or "—",
+                "Destination observée": parcel.get("observed_destination") or "—",
+                "Résultat": status_label(parcel.get("destination_result")),
+                "Opérateur": parcel.get("operator_id") or "—",
+            }
+            for parcel in parcels
+        ]
     )
+    st.dataframe(table, hide_index=True, use_container_width=True)
+
+    with st.expander("Détails du suivi"):
+        st.caption(
+            "Informations utiles pour vérifier le passage d’un colis entre les caméras. "
+            "Les scores complets sont disponibles dans Diagnostic."
+        )
+        public_columns = [
+            "parcel_id",
+            "camera_role",
+            "started_at_global",
+            "ended_at_global",
+            "last_zone_id",
+            "match_result",
+        ]
+        available = [name for name in public_columns if tracklets and name in tracklets[0]]
+        st.dataframe(
+            pd.DataFrame(tracklets)[available]
+            if tracklets and available
+            else pd.DataFrame(columns=public_columns),
+            hide_index=True,
+            use_container_width=True,
+        )

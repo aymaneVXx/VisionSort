@@ -60,6 +60,7 @@ def _profile(
     optical_configuration: dict[str, str] | None = None,
     status: CalibrationStatus = CalibrationStatus.VALID,
     created_at: str = "2026-08-07T10:00:00+00:00",
+    world_frame_id: str | None = None,
 ) -> CalibrationProfile:
     matrix = np.asarray(homography if homography is not None else KNOWN_H)
     return CalibrationProfile.create(
@@ -85,7 +86,10 @@ def _profile(
         },
         status=status,
         created_at=created_at,
-        world_coordinate_convention=DEFAULT_WORLD_CONVENTION,
+        world_coordinate_convention={
+            **DEFAULT_WORLD_CONVENTION,
+            **({"frame_id": world_frame_id} if world_frame_id else {}),
+        },
     )
 
 
@@ -121,6 +125,30 @@ def _register_source(db: VisionSortDB, source_id: str = "source-c1") -> None:
             "enabled": True,
         }
     )
+
+
+def test_new_calibrations_use_distinct_camera_frames_by_default():
+    camera_c1 = _profile(source_id="C1")
+    camera_c2 = _profile(source_id="C2")
+
+    assert camera_c1.world_coordinate_convention["frame_id"] == "camera:C1"
+    assert camera_c2.world_coordinate_convention["frame_id"] == "camera:C2"
+
+
+def test_common_world_frame_requires_an_explicit_identifier():
+    camera_c1 = _profile(source_id="C1", world_frame_id="site_world")
+    camera_c2 = _profile(source_id="C2", world_frame_id="site_world")
+
+    assert camera_c1.world_coordinate_convention["frame_id"] == "site_world"
+    assert camera_c2.world_coordinate_convention["frame_id"] == "site_world"
+
+
+def test_existing_shared_frame_profile_remains_readable():
+    original = _profile(source_id="legacy-C1", world_frame_id="site_world")
+    restored = CalibrationProfile.from_dict(original.to_dict())
+
+    assert restored.world_coordinate_convention["frame_id"] == "site_world"
+    assert restored.fingerprint_sha256 == original.fingerprint_sha256
 
 
 def test_known_homography_round_trip_has_low_error():

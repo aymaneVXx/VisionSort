@@ -532,6 +532,15 @@ class ControlRepository:
             **(info if isinstance(info, dict) else {}),
         }
 
+    def latest_reid_adaptation_run(self) -> dict[str, Any] | None:
+        row = self.db.fetch_one(
+            """
+            SELECT * FROM reid_adaptation_runs
+            ORDER BY updated_at DESC LIMIT 1
+            """
+        )
+        return dict(row) if row else None
+
     def list_trackers(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self.db.fetch_all("SELECT * FROM tracker_registry ORDER BY id ASC")]
 

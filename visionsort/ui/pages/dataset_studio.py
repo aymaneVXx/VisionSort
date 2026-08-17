@@ -20,7 +20,11 @@ from visionsort.ui.state import UIContext
 
 
 def render(context: UIContext) -> None:
-    page_header("Dataset Studio", "Sélection intelligente, pseudo-annotation et export YOLO")
+    page_header(
+        "Données & annotations",
+        "Préparez, vérifiez et exportez les images utilisées pour améliorer les modèles.",
+        eyebrow="Outils avancés",
+    )
     demo_warning(context)
 
     sessions = context.repo.list_capture_sessions()

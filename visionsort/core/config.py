@@ -48,7 +48,6 @@ DEFAULT_CONFIG = {
     },
     "schema_version": 2,
     "world_coordinate_convention": {
-        "frame_id": "site_world",
         "unit": "m",
         "x_axis": "conveyor_longitudinal",
         "y_axis": "conveyor_transverse",

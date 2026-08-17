@@ -5,189 +5,285 @@ import json
 import pandas as pd
 import streamlit as st
 
+from visionsort.calibration.repository import CalibrationRepository
 from visionsort.core.enums import CommandType
-from visionsort.ui.components.common import demo_warning, page_header
+from visionsort.ui.components.common import (
+    demo_warning,
+    page_header,
+    render_status,
+)
 from visionsort.ui.state import UIContext
 
 
+_ROLE_LABELS = {
+    "C1": "Entrée",
+    "C2": "Convoyeur",
+    "C3": "Sortie",
+}
+
+
+def _source_label(source: dict) -> str:
+    role = str(source.get("role") or "")
+    return f"{source.get('name')} — {_ROLE_LABELS.get(role, role)}"
+
+
 def render(context: UIContext) -> None:
-    page_header("Cameras", "Déclaration, test et pilotage des sources")
+    page_header(
+        "Caméras",
+        "Ajoutez les flux, vérifiez leur état et préparez une session d’exploitation.",
+    )
     demo_warning(context)
     models = context.repo.list_models()
     parcel_models = [
-        row
-        for row in models
-        if row.get("task") in {"detection", "segmentation"}
+        row for row in models if row.get("task") in {"detection", "segmentation"}
     ]
-    pose_models = [
-        row for row in models if row.get("task") == "pose"
-    ]
+    pose_models = [row for row in models if row.get("task") == "pose"]
     trackers = context.repo.list_trackers()
     sources = context.repo.list_sources()
+    calibration_repo = CalibrationRepository(context.db)
 
-    st.subheader("Capture Sessions")
-    with st.form("create_session"):
-        session_name = st.text_input("Nom de session", value="Session Replay")
-        demo_mode = st.checkbox("DEMO/REPLAY (explicite)", value=bool(context.config_demo_mode))
-        source_options = {f"{row['role']} | {row['name']} ({row['id']})": row for row in sources}
-        c1 = st.selectbox("Source C1", list(source_options) if source_options else [], index=0 if source_options else None)
-        c2 = st.selectbox("Source C2", list(source_options) if source_options else [], index=0 if source_options else None)
-        c3_enabled = st.checkbox("Activer C3", value=False)
-        c3 = st.selectbox("Source C3", list(source_options) if source_options else [], index=0 if source_options else None, disabled=not c3_enabled)
-        offsets = st.columns(3)
-        offset_c1 = offsets[0].number_input("Offset C1 (ms)", value=0.0, step=50.0)
-        offset_c2 = offsets[1].number_input("Offset C2 (ms)", value=0.0, step=50.0)
-        offset_c3 = offsets[2].number_input("Offset C3 (ms)", value=0.0, step=50.0, disabled=not c3_enabled)
-        if st.form_submit_button("Créer la session"):
-            items = []
-            if c1:
-                items.append({"source_id": source_options[c1]["id"], "camera_role": "C1", "time_offset_ms": float(offset_c1)})
-            if c2:
-                items.append({"source_id": source_options[c2]["id"], "camera_role": "C2", "time_offset_ms": float(offset_c2)})
-            if c3_enabled and c3:
-                items.append({"source_id": source_options[c3]["id"], "camera_role": "C3", "time_offset_ms": float(offset_c3)})
-            context.repo.enqueue_command(
-                CommandType.CREATE_SESSION,
-                {"name": session_name, "demo_mode": bool(demo_mode), "sources": items, "config": {"validated_on_site": False}},
-            )
-            st.success("Commande de création de session envoyée.")
-
-    sessions = context.repo.list_capture_sessions()
-    if sessions:
-        for sess in sessions[:10]:
-            with st.container(border=True):
-                st.write(f"**{sess['name']}** ({sess['id']}) - état `{sess.get('pipeline_state')}` - demo={bool(sess.get('demo_mode'))}")
-                media_report = json.loads(
-                    sess.get("media_report_json") or "{}"
-                )
-                if media_report:
-                    message = (
-                        f"Archive média: `{media_report.get('status', 'INCONNU')}` "
-                        f"— {media_report.get('totals', {}).get('segments_produced', 0)} "
-                        "segment(s)"
-                    )
-                    if media_report.get("valid"):
-                        st.success(message)
-                    else:
-                        st.error(message)
-                        for error in media_report.get("errors", []):
-                            st.caption(error)
-                cols = st.columns(3)
-                if cols[0].button("Démarrer session", key=f"start-session-{sess['id']}"):
-                    context.repo.enqueue_command(CommandType.START_SESSION, {"session_id": sess["id"]})
-                if cols[1].button("Arrêter session", key=f"stop-session-{sess['id']}"):
-                    context.repo.enqueue_command(CommandType.STOP_SESSION, {"session_id": sess["id"]})
-                if cols[2].button("Voir sources", key=f"show-session-{sess['id']}"):
-                    st.dataframe(pd.DataFrame(context.repo.list_capture_session_sources(sess["id"])), use_container_width=True)
+    st.subheader("Caméras enregistrées")
+    if not sources:
+        st.info("Aucune caméra configurée. Utilisez « Ajouter une caméra » ci-dessous.")
     else:
-        st.info("Aucune session pour le moment.")
-    with st.form("register_source"):
-        name = st.text_input("Nom", value="Replay C1")
-        role = st.selectbox("Rôle", ["C1", "C2", "C3"])
-        source_type = st.selectbox("Type", ["REPLAY", "VIDEO_FILE", "RTSP"])
-        uri = st.text_input("URI / chemin vidéo", value="")
-        optical_setup_id = st.text_input(
-            "Identifiant configuration optique",
-            value="default",
-            help=(
-                "Changez cet identifiant après toute modification de lentille, "
-                "zoom ou mise au point afin d'invalider explicitement l'ancienne calibration."
-            ),
-        )
-        model_id = st.selectbox(
-            "Modèle colis",
-            [row["id"] for row in parcel_models],
-            index=0 if parcel_models else None,
-        )
-        enable_pose = st.checkbox(
-            "Ajouter le pipeline opérateur Pose",
-            value=False,
-            disabled=not pose_models,
-            help=(
-                "Le modèle actif de la tâche pose sera partagé entre "
-                "les caméras qui utilisent ce pipeline."
-            ),
-        )
-        pose_model_id = st.selectbox(
-            "Modèle Pose",
-            [row["id"] for row in pose_models],
-            index=0 if pose_models else None,
-            disabled=not enable_pose,
-        )
-        tracker_id = st.selectbox("Tracker", [row["id"] for row in trackers], index=0 if trackers else None)
-        if st.form_submit_button("Enregistrer la source"):
-            selected_model = next(
-                row for row in parcel_models if row["id"] == model_id
+        columns = st.columns(min(3, len(sources)))
+        for index, source in enumerate(sources):
+            active_calibration = calibration_repo.get_active_profile(str(source["id"]))
+            with columns[index % len(columns)].container(border=True):
+                st.markdown(f"### {_source_label(source)}")
+                render_status(source.get("status") or "OFFLINE")
+                info = st.columns(2)
+                info[0].metric("Fréquence", f"{float(source.get('fps') or 0):.1f} FPS")
+                info[1].metric(
+                    "Calibration",
+                    "Prête" if active_calibration else "À faire",
+                )
+                controls = st.columns(2)
+                if controls[0].button(
+                    "Tester",
+                    key=f"test-{source['id']}",
+                    use_container_width=True,
+                ):
+                    context.repo.enqueue_command(
+                        CommandType.TEST_SOURCE,
+                        {"uri": source["uri"], "role": source["role"]},
+                    )
+                    st.info("Test de connexion demandé.")
+                if controls[1].button(
+                    "Arrêter",
+                    key=f"stop-{source['id']}",
+                    use_container_width=True,
+                ):
+                    context.repo.enqueue_command(
+                        CommandType.STOP_SOURCE,
+                        {"source_id": source["id"]},
+                    )
+                recording = st.columns(2)
+                if recording[0].button(
+                    "Enregistrer",
+                    key=f"record-{source['id']}",
+                    use_container_width=True,
+                ):
+                    context.repo.enqueue_command(
+                        CommandType.START_RECORDING,
+                        {"source_id": source["id"]},
+                    )
+                if recording[1].button(
+                    "Arrêter l’enregistrement",
+                    key=f"stop-record-{source['id']}",
+                    use_container_width=True,
+                ):
+                    context.repo.enqueue_command(
+                        CommandType.STOP_RECORDING,
+                        {"source_id": source["id"]},
+                    )
+                with st.expander("Détails avancés"):
+                    st.write(f"Identifiant : `{source['id']}`")
+                    st.write(f"Type de flux : `{source['source_type']}`")
+                    st.write(f"Adresse : `{source['uri']}`")
+                    st.write(f"Suivi : `{source['tracker_id']}`")
+                    st.write(
+                        "Configuration optique : "
+                        f"`{source.get('optical_setup_id') or 'default'}`"
+                    )
+                    if source.get("last_error"):
+                        st.error(str(source["last_error"]))
+                    st.json(source.get("model_assignments") or [])
+
+    with st.expander("Ajouter une caméra", expanded=not sources):
+        with st.form("register_source"):
+            main = st.columns(3)
+            name = main[0].text_input("Nom de la caméra", value="Caméra entrée")
+            role = main[1].selectbox(
+                "Emplacement",
+                ["C1", "C2", "C3"],
+                format_func=lambda value: f"{value} — {_ROLE_LABELS[value]}",
             )
-            assignments = [
-                {
-                    "pipeline_role": (
-                        "parcel_segmentation"
-                        if selected_model["task"] == "segmentation"
-                        else "parcel_detection"
-                    ),
-                    "task": selected_model["task"],
-                    "model_id": model_id,
-                    "use_active": True,
-                    "enabled": True,
-                }
-            ]
-            if enable_pose and pose_model_id:
-                assignments.append(
+            source_type = main[2].selectbox(
+                "Type de flux",
+                ["RTSP", "VIDEO_FILE", "REPLAY"],
+                format_func=lambda value: {
+                    "RTSP": "Caméra réseau",
+                    "VIDEO_FILE": "Fichier vidéo",
+                    "REPLAY": "Replay de test",
+                }[value],
+            )
+            uri = st.text_input("Adresse du flux ou chemin de la vidéo")
+            optical_setup_id = "default"
+            model_id = parcel_models[0]["id"] if parcel_models else None
+            enable_pose = False
+            pose_model_id = pose_models[0]["id"] if pose_models else None
+            tracker_id = trackers[0]["id"] if trackers else None
+            if st.checkbox("Afficher les paramètres avancés"):
+                optical_setup_id = st.text_input(
+                    "Configuration optique",
+                    value="default",
+                    help="Modifiez cette valeur après un changement de lentille, zoom ou mise au point.",
+                )
+                model_id = st.selectbox(
+                    "Modèle de détection des colis",
+                    [row["id"] for row in parcel_models],
+                    index=0 if parcel_models else None,
+                )
+                enable_pose = st.checkbox(
+                    "Activer le suivi opérateur",
+                    value=False,
+                    disabled=not pose_models,
+                )
+                pose_model_id = st.selectbox(
+                    "Modèle opérateur",
+                    [row["id"] for row in pose_models],
+                    index=0 if pose_models else None,
+                    disabled=not enable_pose,
+                )
+                tracker_id = st.selectbox(
+                    "Moteur de suivi",
+                    [row["id"] for row in trackers],
+                    index=0 if trackers else None,
+                )
+            submitted = st.form_submit_button(
+                "Enregistrer la caméra",
+                type="primary",
+                disabled=not parcel_models or not trackers,
+            )
+            if submitted:
+                selected_model = next(row for row in parcel_models if row["id"] == model_id)
+                assignments = [
                     {
-                        "pipeline_role": "operator_pose",
-                        "task": "pose",
-                        "model_id": pose_model_id,
+                        "pipeline_role": (
+                            "parcel_segmentation"
+                            if selected_model["task"] == "segmentation"
+                            else "parcel_detection"
+                        ),
+                        "task": selected_model["task"],
+                        "model_id": model_id,
                         "use_active": True,
                         "enabled": True,
                     }
-                )
-            context.repo.enqueue_command(
-                CommandType.REGISTER_SOURCE,
-                {
-                    "name": name,
-                    "role": role,
-                    "source_type": source_type,
-                    "uri": uri,
-                    "model_id": model_id,
-                    "model_assignments": assignments,
-                    "tracker_id": tracker_id,
-                    "optical_setup_id": optical_setup_id,
-                    "enabled": True,
-                },
-            )
-            st.success("Commande d'enregistrement envoyée au supervisor.")
-    if st.button("Bootstrap démo", type="secondary"):
-        context.repo.enqueue_command(CommandType.BOOTSTRAP_DEMO, {})
-        st.info("Commande de bootstrap démo envoyée.")
-    st.subheader("Sources enregistrées")
-    if not sources:
-        st.info("Aucune source disponible.")
-        return
-    for row in sources:
-        with st.container(border=True):
-            st.write(f"**{row['name']}** - {row['role']} - {row['source_type']} - état `{row.get('status') or 'OFFLINE'}`")
-            assignments = row.get("model_assignments") or []
-            st.caption(
-                "Pipelines: "
-                + (
-                    ", ".join(
-                        f"{item['pipeline_role']} → "
-                        f"{item.get('model_id') or 'actif ' + item['task']}"
-                        for item in assignments
+                ]
+                if enable_pose and pose_model_id:
+                    assignments.append(
+                        {
+                            "pipeline_role": "operator_pose",
+                            "task": "pose",
+                            "model_id": pose_model_id,
+                            "use_active": True,
+                            "enabled": True,
+                        }
                     )
-                    if assignments
-                    else "migration legacy en attente"
+                context.repo.enqueue_command(
+                    CommandType.REGISTER_SOURCE,
+                    {
+                        "name": name,
+                        "role": role,
+                        "source_type": source_type,
+                        "uri": uri,
+                        "model_id": model_id,
+                        "model_assignments": assignments,
+                        "tracker_id": tracker_id,
+                        "optical_setup_id": optical_setup_id,
+                        "enabled": True,
+                    },
                 )
+                st.success("Caméra envoyée pour enregistrement.")
+
+    st.subheader("Sessions d’exploitation")
+    sessions = context.repo.list_capture_sessions()
+    for session in sessions[:8]:
+        with st.container(border=True):
+            title = st.columns([3, 1])
+            title[0].markdown(f"**{session['name']}**")
+            title[1].caption(str(session.get("pipeline_state") or "Prête"))
+            media_report = json.loads(session.get("media_report_json") or "{}")
+            if media_report and not media_report.get("valid", True):
+                st.warning("L’archive vidéo de cette session est incomplète.")
+            controls = st.columns(3)
+            if controls[0].button(
+                "Démarrer",
+                key=f"start-session-{session['id']}",
+                type="primary",
+                use_container_width=True,
+            ):
+                context.repo.enqueue_command(
+                    CommandType.START_SESSION, {"session_id": session["id"]}
+                )
+            if controls[1].button(
+                "Arrêter",
+                key=f"stop-session-{session['id']}",
+                use_container_width=True,
+            ):
+                context.repo.enqueue_command(
+                    CommandType.STOP_SESSION, {"session_id": session["id"]}
+                )
+            if controls[2].button(
+                "Voir les caméras",
+                key=f"show-session-{session['id']}",
+                use_container_width=True,
+            ):
+                st.dataframe(
+                    pd.DataFrame(
+                        context.repo.list_capture_session_sources(session["id"])
+                    ),
+                    use_container_width=True,
+                )
+    if not sessions:
+        st.caption("Aucune session créée.")
+
+    with st.expander("Créer une session"):
+        with st.form("create_session"):
+            session_name = st.text_input("Nom", value="Exploitation principale")
+            demo_mode = st.checkbox(
+                "Session de démonstration / replay",
+                value=bool(context.config_demo_mode),
             )
-            cols = st.columns(4)
-            if cols[0].button("Tester", key=f"test-{row['id']}"):
-                context.repo.enqueue_command(CommandType.TEST_SOURCE, {"uri": row["uri"], "role": row["role"]})
-            cols[1].button("Démarrer via session", key=f"start-{row['id']}", disabled=True, help="Créez une CaptureSession puis utilisez 'Démarrer session'.")
-            if cols[2].button("Arrêter", key=f"stop-{row['id']}"):
-                context.repo.enqueue_command(CommandType.STOP_SOURCE, {"source_id": row["id"]})
-            if cols[3].button("Enregistrer", key=f"rec-{row['id']}"):
-                context.repo.enqueue_command(CommandType.START_RECORDING, {"source_id": row["id"]})
-            if st.button("Arrêter enregistrement", key=f"stop-rec-{row['id']}"):
-                context.repo.enqueue_command(CommandType.STOP_RECORDING, {"source_id": row["id"]})
-    st.dataframe(pd.DataFrame(sources), use_container_width=True)
+            source_options = {_source_label(row): row for row in sources}
+            selected_sources = st.multiselect(
+                "Caméras utilisées",
+                list(source_options),
+                default=list(source_options),
+            )
+            if st.form_submit_button(
+                "Créer la session",
+                disabled=not selected_sources,
+            ):
+                items = [
+                    {
+                        "source_id": source_options[label]["id"],
+                        "camera_role": source_options[label]["role"],
+                        "time_offset_ms": 0.0,
+                    }
+                    for label in selected_sources
+                ]
+                context.repo.enqueue_command(
+                    CommandType.CREATE_SESSION,
+                    {
+                        "name": session_name,
+                        "demo_mode": bool(demo_mode),
+                        "sources": items,
+                        "config": {"validated_on_site": False},
+                    },
+                )
+                st.success("Création de session demandée.")
+    if st.button("Préparer les données de démonstration", type="secondary"):
+        context.repo.enqueue_command(CommandType.BOOTSTRAP_DEMO, {})
+        st.info("Préparation de la démonstration demandée.")

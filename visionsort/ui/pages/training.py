@@ -26,7 +26,11 @@ def _metric_text(value, digits: int = 3) -> str:
 
 
 def render(context: UIContext) -> None:
-    page_header("Training", "Lancement et suivi des recettes d'entrainement")
+    page_header(
+        "Entraînement",
+        "Lancez et suivez l’amélioration contrôlée des modèles.",
+        eyebrow="Outils avancés",
+    )
     demo_warning(context)
     datasets = [
         row

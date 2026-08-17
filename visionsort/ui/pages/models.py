@@ -1,303 +1,225 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
-from visionsort.core.paths import ROOT_DIR
 from visionsort.core.enums import CommandType, ModelStatus
-from visionsort.ui.components.common import demo_warning, page_header
+from visionsort.ui.components.common import (
+    demo_warning,
+    page_header,
+    render_status,
+    status_label,
+)
 from visionsort.ui.state import UIContext
 
 
+_TASK_LABELS = {
+    "detection": "Détection des colis",
+    "segmentation": "Contour des colis",
+    "pose": "Suivi des opérateurs",
+    "local_tracking": "Suivi dans une caméra",
+    "reid_multicamera": "Ré-identification entre caméras",
+}
+
+
 def _load_json(text: str | None) -> dict:
-    if not text:
-        return {}
     try:
-        value = json.loads(text)
+        value = json.loads(text or "{}")
     except json.JSONDecodeError:
         return {}
     return value if isinstance(value, dict) else {}
 
 
-def _metric_text(value, digits: int = 3) -> str:
-    return "UNAVAILABLE" if value is None else f"{float(value):.{digits}f}"
-
-
-def _history_frame(rows: list[dict]) -> pd.DataFrame:
-    formatted: list[dict] = []
-    for row in rows:
-        metadata = _load_json(row.get("metadata_json"))
-        steps = metadata.get("switch_steps") or {}
-        formatted.append(
-            {
-                "date": row.get("completed_at")
-                or row.get("activated_at"),
-                "tâche": row.get("task"),
-                "ancien": row.get("previous_model_id") or "-",
-                "nouveau": row.get("activated_model_id"),
-                "génération": row.get("routing_generation"),
-                "statut": row.get("status"),
-                "runtime appliqué": bool(
-                    row.get("runtime_applied")
-                ),
-                "acteur": row.get("actor"),
-                "raison": row.get("reason"),
-                "étapes": " | ".join(
-                    f"{name}={status}"
-                    for name, status in steps.items()
-                ),
-                "erreur": row.get("error_text") or "",
-            }
-        )
-    return pd.DataFrame(formatted)
+def _metric(value: object, digits: int = 3) -> str:
+    try:
+        return f"{float(value):.{digits}f}"
+    except (TypeError, ValueError):
+        return "—"
 
 
 def render(context: UIContext) -> None:
-    page_header("Models", "Registre local, comparaison, promotion et rollback")
+    page_header(
+        "Modèles",
+        "Vérifiez les modèles actifs et gérez leur cycle de vie sans interrompre l’exploitation.",
+    )
     demo_warning(context)
-    with st.expander("Importer un modele baseline Ultralytics"):
-        baseline_path = st.text_input(
-            "Fichier de poids local (.pt)",
-            help="Le fichier est copie dans une version immuable du registre VisionSort.",
-        )
-        baseline_name = st.text_input("Nom du baseline")
-        baseline_task = st.selectbox(
-            "Tache du baseline", ["detection", "segmentation", "pose"]
-        )
-        if st.button("Importer le baseline", disabled=not baseline_path.strip()):
-            context.repo.enqueue_command(
-                CommandType.IMPORT_BASELINE_MODEL,
-                {
-                    "source_path": baseline_path.strip(),
-                    "name": baseline_name.strip() or None,
-                    "task": baseline_task,
-                },
-            )
-            st.info("Import baseline envoye au supervisor.")
     models = context.repo.list_models()
     if not models:
-        st.info("Aucun modèle en base.")
+        st.info("Aucun modèle disponible.")
         return
+    overview_tab, management_tab = st.tabs(["Vue générale", "Gestion avancée"])
 
-    runtime_state = context.repo.get_runtime_model_state()
-    consistency = runtime_state.get("consistency") or {}
-    st.subheader("Cohérence registre / runtime")
-    if not runtime_state:
-        st.warning(
-            "Le supervisor n'a pas encore publié son état runtime."
-        )
-    elif consistency.get("consistent"):
-        st.success(
-            "Le registre, le routage en mémoire et les modèles chargés "
-            "sont cohérents."
-        )
-    else:
-        st.error(
-            "Incohérence détectée: "
-            + " | ".join(
-                consistency.get("errors")
-                or ["état runtime incomplet"]
-            )
-        )
-    task_states = consistency.get("tasks") or []
-    if task_states:
-        latest_activations = runtime_state.get(
-            "latest_activation_by_task", {}
-        )
-        latest_rollbacks = runtime_state.get(
-            "latest_rollback_by_task", {}
-        )
-        st.dataframe(
-            pd.DataFrame(
-                [
-                    {
-                        "tâche": row.get("task"),
-                        "actif en base": row.get(
-                            "registry_model_id"
-                        ),
-                        "actif runtime": row.get(
-                            "runtime_model_id"
-                        ),
-                        "génération": row.get(
-                            "routing_generation"
-                        ),
-                        "chargé": row.get("loaded"),
-                        "références": row.get("references"),
-                        "in-flight": row.get("inflight"),
-                        "cohérent": row.get("consistent"),
-                        "dernière activation": (
-                            latest_activations.get(
-                                str(row.get("task")), {}
-                            ).get("activated_model_id")
-                        ),
-                        "dernier rollback": (
-                            latest_rollbacks.get(
-                                str(row.get("task")), {}
-                            ).get("activated_model_id")
-                        ),
-                    }
-                    for row in task_states
-                ]
+    with overview_tab:
+        active_models = [row for row in models if int(row.get("is_active") or 0)]
+        runtime_state = context.repo.get_runtime_model_state()
+        consistency = runtime_state.get("consistency") or {}
+        if consistency.get("consistent"):
+            st.success("Les modèles actifs sont chargés et opérationnels.")
+        elif runtime_state:
+            st.warning("Le chargement des modèles doit être vérifié dans Diagnostic.")
+        else:
+            st.info("L’état du moteur n’est pas encore disponible.")
+
+        columns = st.columns(2)
+        for index, model in enumerate(active_models):
+            metrics = _load_json(model.get("metrics_json"))
+            with columns[index % 2].container(border=True):
+                st.markdown(
+                    f"### {_TASK_LABELS.get(str(model.get('task')), model.get('task'))}"
+                )
+                render_status("READY")
+                st.write(f"Modèle actif : **{model.get('name') or model.get('id')}**")
+                values = st.columns(3)
+                values[0].metric("Précision", _metric(metrics.get("precision")))
+                values[1].metric("Rappel", _metric(metrics.get("recall")))
+                values[2].metric("Images/s", _metric(metrics.get("fps"), 1))
+        if not active_models:
+            st.warning("Aucun modèle actif.")
+
+        reid_model = next(
+            (
+                row
+                for row in active_models
+                if row.get("task") == "reid_multicamera"
             ),
-            use_container_width=True,
-            hide_index=True,
+            None,
         )
-    for warning in consistency.get("warnings") or []:
-        st.warning(str(warning))
-    unload_errors = consistency.get("unload_errors") or {}
-    if unload_errors:
-        st.error(
-            "Échecs de déchargement: "
-            + " | ".join(
-                f"{model_id}: {error}"
-                for model_id, error in unload_errors.items()
-            )
+        adaptation = context.repo.latest_reid_adaptation_run()
+        reid_config = (
+            (context.config_values.get("tracking") or {}).get("reid") or {}
         )
-    with st.expander("Détails des références runtime"):
-        st.json(
-            {
-                "modèles chargés": consistency.get(
-                    "loaded_model_ids", []
-                ),
-                "références": consistency.get(
-                    "references_by_model", {}
-                ),
-                "in-flight": consistency.get(
-                    "inflight_by_model", {}
-                ),
-                "dernière publication": runtime_state.get(
-                    "published_at"
-                )
-                or runtime_state.get("updated_at"),
-            }
-        )
-
-    history = context.repo.list_model_activation_history(limit=100)
-    if history:
-        latest = history[0]
-        latest_metadata = _load_json(latest.get("metadata_json"))
-        st.caption(
-            "Dernière bascule: "
-            f"`{latest.get('task')}` "
-            f"`{latest.get('previous_model_id') or '-'}` → "
-            f"`{latest.get('activated_model_id')}` | "
-            f"statut `{latest.get('status')}` | "
-            f"génération `{latest.get('routing_generation')}`"
-        )
-        steps = latest_metadata.get("switch_steps") or {}
-        if steps:
-            st.caption(
-                "Progression: "
-                + " → ".join(
-                    f"{name}: {status}"
-                    for name, status in steps.items()
-                )
-            )
-
-    active_models = {
-        str(row["task"]): row
-        for row in models
-        if int(row.get("is_active") or 0) == 1
-    }
-    if active_models:
-        st.caption(
-            "Modèles actifs par tâche: "
-            + " | ".join(
-                f"`{task}` → `{row['id']}`"
-                for task, row in sorted(active_models.items())
-            )
-        )
-
-    for row in models:
-        notes = _load_json(row.get("notes_json"))
-        metrics = _load_json(row.get("metrics_json"))
-        is_active = int(row.get("is_active") or 0) == 1
-        is_candidate = row["status"] == ModelStatus.CANDIDATE.value
-        can_promote = is_candidate and not is_active
-        can_reject = not is_active and row["status"] not in {
-            ModelStatus.CHAMPION.value,
-            ModelStatus.REJECTED.value,
-        }
-        can_archive = not is_active and row["status"] not in {
-            ModelStatus.ARCHIVED.value
-        }
         with st.container(border=True):
-            st.write(
-                f"**{row['id']}** - {row['name']} - backend `{row['backend']}` - "
-                f"statut `{row['status']}` - actif `{is_active}`"
-            )
-            info_cols = st.columns(4)
-            info_cols[0].metric("Precision", _metric_text(metrics.get("precision")))
-            info_cols[1].metric("Recall", _metric_text(metrics.get("recall")))
-            info_cols[2].metric("mAP50", _metric_text(metrics.get("mAP50")))
-            info_cols[3].metric("FPS", _metric_text(metrics.get("fps"), 2))
-            if notes:
-                st.caption(
-                    f"demo_only={bool(notes.get('demo_only'))} | "
-                    f"validated_on_site={bool(notes.get('validated_on_site'))} | "
-                    f"parent={metrics.get('parent_model_id') or row.get('parent_model_id') or '-'}"
-                )
-            comparison = metrics.get("comparison") or {}
-            benchmark = metrics.get("benchmark") or {}
-            active_model = active_models.get(str(row["task"]))
-            if active_model and active_model["id"] != row["id"]:
-                active_metrics = _load_json(active_model.get("metrics_json"))
-                deltas = {
-                    key: float(metrics[key]) - float(active_metrics[key])
-                    for key in ("precision", "recall", "mAP50", "mAP50_95", "fps")
-                    if metrics.get(key) is not None
-                    and active_metrics.get(key) is not None
-                }
-                st.caption(
-                    "Delta vs actif: "
-                    + ", ".join(f"{key}={value:+.3f}" for key, value in deltas.items())
-                )
+            st.markdown("### Adaptation au site")
+            if not bool(reid_config.get("auto_adaptation", True)):
+                render_status("OFFLINE")
+                st.write("Adaptation automatique désactivée")
+            elif adaptation:
+                render_status(adaptation.get("state"))
+                st.write(status_label(adaptation.get("state")))
+            else:
+                render_status("COLLECTING")
+                st.write("Collecte d’exemples fiables en cours")
             st.caption(
-                f"evaluation={metrics.get('evaluation_status', '-')} | "
-                f"benchmark={benchmark.get('status') or '-'} | "
-                f"compare_to={comparison.get('against_model_id') or '-'}"
+                f"Base visuelle : {reid_model.get('name') if reid_model else 'MobileNetV3'}"
             )
-            report_path = metrics.get("report_path") or notes.get("report_path")
-            if report_path:
-                report_abs = ROOT_DIR / str(report_path)
-                if Path(report_abs).exists():
-                    with st.expander(f"Rapport {row['id']}"):
-                        st.code(report_abs.read_text(encoding="utf-8"), language="json")
-            cols = st.columns(5)
-            can_activate = row["status"] in {
-                ModelStatus.BASELINE.value,
-                ModelStatus.CHAMPION.value,
-                ModelStatus.ARCHIVED.value,
-            } and not (
-                row["status"] == ModelStatus.ARCHIVED.value
-                and notes.get("archived_from_status")
-                == ModelStatus.CANDIDATE.value
-            )
-            if cols[0].button("Activer", key=f"activate-{row['id']}", disabled=is_active or not can_activate):
-                context.repo.enqueue_command(CommandType.ACTIVATE_MODEL, {"model_id": row["id"]})
-            if cols[1].button("Promouvoir", key=f"promote-{row['id']}", disabled=not can_promote):
-                context.repo.enqueue_command(CommandType.PROMOTE_MODEL, {"model_id": row["id"]})
-            if cols[2].button("Rejeter", key=f"reject-model-{row['id']}", disabled=not can_reject):
-                context.repo.enqueue_command(CommandType.REJECT_MODEL, {"model_id": row["id"]})
-            if cols[3].button("Archiver", key=f"archive-{row['id']}", disabled=not can_archive):
-                context.repo.enqueue_command(CommandType.ARCHIVE_MODEL, {"model_id": row["id"]})
-    st.divider()
-    rollback_task = st.selectbox(
-        "Tâche à restaurer",
-        sorted({str(row["task"]) for row in models}),
-    )
-    if st.button("Rollback vers précédent actif", type="secondary"):
-        context.repo.enqueue_command(
-            CommandType.ROLLBACK_MODEL, {"task": rollback_task}
+
+    with management_tab:
+        st.warning(
+            "Ces actions modifient le modèle utilisé par le système. "
+            "Elles sont destinées à un ingénieur habilité."
         )
-    if history:
-        st.subheader("Historique des activations et rollbacks")
+        with st.form("import-baseline-model"):
+            st.markdown("#### Importer un modèle de référence")
+            import_columns = st.columns(3)
+            baseline_path = import_columns[0].text_input("Fichier de poids local (.pt)")
+            baseline_name = import_columns[1].text_input("Nom")
+            baseline_task = import_columns[2].selectbox(
+                "Usage", ["detection", "segmentation", "pose"]
+            )
+            if st.form_submit_button(
+                "Importer",
+                disabled=not baseline_path.strip(),
+            ):
+                context.repo.enqueue_command(
+                    CommandType.IMPORT_BASELINE_MODEL,
+                    {
+                        "source_path": baseline_path.strip(),
+                        "name": baseline_name.strip() or None,
+                        "task": baseline_task,
+                    },
+                )
+                st.info("Import envoyé.")
+
+        for row in models:
+            metrics = _load_json(row.get("metrics_json"))
+            notes = _load_json(row.get("notes_json"))
+            is_active = int(row.get("is_active") or 0) == 1
+            is_candidate = row.get("status") == ModelStatus.CANDIDATE.value
+            with st.container(border=True):
+                title = st.columns([3, 1])
+                title[0].markdown(
+                    f"**{row.get('name') or row['id']}**  \n"
+                    f"{_TASK_LABELS.get(str(row.get('task')), row.get('task'))}"
+                )
+                with title[1]:
+                    render_status("ACTIVE" if is_active else row.get("status"))
+                metric_columns = st.columns(4)
+                metric_columns[0].metric("Précision", _metric(metrics.get("precision")))
+                metric_columns[1].metric("Rappel", _metric(metrics.get("recall")))
+                metric_columns[2].metric("mAP50", _metric(metrics.get("mAP50")))
+                metric_columns[3].metric("Images/s", _metric(metrics.get("fps"), 1))
+                controls = st.columns(4)
+                can_activate = row.get("status") in {
+                    ModelStatus.BASELINE.value,
+                    ModelStatus.CHAMPION.value,
+                    ModelStatus.ARCHIVED.value,
+                }
+                if controls[0].button(
+                    "Activer",
+                    key=f"activate-{row['id']}",
+                    disabled=is_active or not can_activate,
+                    use_container_width=True,
+                ):
+                    context.repo.enqueue_command(
+                        CommandType.ACTIVATE_MODEL, {"model_id": row["id"]}
+                    )
+                if controls[1].button(
+                    "Promouvoir",
+                    key=f"promote-{row['id']}",
+                    disabled=not is_candidate or is_active,
+                    use_container_width=True,
+                ):
+                    context.repo.enqueue_command(
+                        CommandType.PROMOTE_MODEL, {"model_id": row["id"]}
+                    )
+                if controls[2].button(
+                    "Rejeter",
+                    key=f"reject-model-{row['id']}",
+                    disabled=is_active
+                    or row.get("status")
+                    in {ModelStatus.CHAMPION.value, ModelStatus.REJECTED.value},
+                    use_container_width=True,
+                ):
+                    context.repo.enqueue_command(
+                        CommandType.REJECT_MODEL, {"model_id": row["id"]}
+                    )
+                if controls[3].button(
+                    "Archiver",
+                    key=f"archive-{row['id']}",
+                    disabled=is_active or row.get("status") == ModelStatus.ARCHIVED.value,
+                    use_container_width=True,
+                ):
+                    context.repo.enqueue_command(
+                        CommandType.ARCHIVE_MODEL, {"model_id": row["id"]}
+                    )
+                st.caption(
+                    f"ID : {row['id']} · backend : {row.get('backend')} · "
+                    f"parent : {row.get('parent_model_id') or '—'} · "
+                    f"validation site : {bool(notes.get('validated_on_site'))}"
+                )
+
+        st.subheader("Restaurer une version précédente")
+        rollback_task = st.selectbox(
+            "Fonction concernée",
+            sorted({str(row.get("task")) for row in models}),
+            format_func=lambda value: _TASK_LABELS.get(value, value),
+        )
+        if st.button("Restaurer le précédent modèle actif", type="secondary"):
+            context.repo.enqueue_command(
+                CommandType.ROLLBACK_MODEL, {"task": rollback_task}
+            )
+
+        history = context.repo.list_model_activation_history(limit=100)
+        st.subheader("Historique des changements")
         st.dataframe(
-            _history_frame(history),
-            use_container_width=True,
+            pd.DataFrame(history)
+            if history
+            else pd.DataFrame(columns=["task", "status", "activated_at"]),
             hide_index=True,
+            use_container_width=True,
         )
-    st.dataframe(pd.DataFrame(models), use_container_width=True)
+        st.subheader("État technique du moteur")
+        st.json(context.repo.get_runtime_model_state())
+        st.dataframe(pd.DataFrame(models), use_container_width=True)
