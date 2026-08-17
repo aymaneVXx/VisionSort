@@ -59,12 +59,16 @@ VisionSort est une plateforme locale Python + Streamlit pour piloter un cycle co
   `source_calibration_assignments` référence la version active par source;
   `capture_session_sources` garde le profil complet réellement affecté à la
   session.
+- `reid_training_pairs` ne conserve que les positives très fiables et les
+  hard negatives; `reid_adaptation_runs` journalise le cycle automatique,
+  le dataset, le candidat, les métriques et l'issue.
 
 La migration v12 sépare `expected_destination`, `observed_destination` et
 `destination_result`. Une destination historique reste non vérifiée faute de
 consigne externe.
 
-Les migrations incrémentales SQLite v6 à v12 ajoutent ces structures
+La migration v13 ajoute la collecte et le cycle d'adaptation ReID. Les
+migrations incrémentales SQLite v6 à v13 ajoutent ces structures
 sans recréer les bases existantes.
 
 ## Modules Principaux
@@ -75,6 +79,7 @@ sans recréer les bases existantes.
 - `visionsort/runtime/e2e.py` : validation CPU complète avec backends simulés explicitement
 - `visionsort/runtime/supervisor_e2e.py` : validation multiprocessus de l'archive immuable, du dataset et du déploiement
 - `visionsort/runtime/multimodel_e2e.py` : validation multiprocessus des pipelines parcelle + pose et du rechargement sélectif
+- `visionsort/runtime/multicam_reid_e2e.py` : replay PR3 réel ByteTrack, intégrité, ReID multi-vues, LAPJV et GlobalParcel
 - `visionsort/acquisition/worker.py` : boucle caméra/source, previews, enregistrement, observations JSONL
 - `visionsort/inference/engine.py` : backends de modèles et provenance modèle/version
 - `visionsort/tracking/engine.py` : trackers locaux, tracklets, matching multicaméra
@@ -82,6 +87,7 @@ sans recréer les bases existantes.
 - `visionsort/tracking/geometry.py` : ground anchor masque/bbox et accès à la géométrie monde
 - `visionsort/tracking/person.py` : personnes ByteTrack et poignets liés à leur origine
 - `visionsort/tracking/replay_benchmark.py` : comparaison ByteTrack brut / identité canonique
+- `visionsort/reid/` : encodeur colis figé, keyframes, hard gates, score de handoff et adaptation contrastive
 - `visionsort/events/interactions.py` : association opérateur-colis, LAPJV et hystérésis
 - `visionsort/events/engine.py` : événements métier prise/transport/dépôt
 - `visionsort/datasets/pipeline.py` : création dataset, split stable, déduplication, provenance
@@ -125,6 +131,34 @@ python -m visionsort.tracking.replay_benchmark replay.jsonl `
 
 Le rapport compare fragmentations, ID switches, nombre de tracks, relinks,
 refus ambigus et coût moyen/maximal de la couche d'intégrité.
+
+## Tracking multicaméra et ReID colis
+
+Le chemin PR3 est figé ainsi :
+
+```text
+Canonical Tracklet -> 3 à 5 keyframes -> MobileNetV3-Small figé
+-> descripteur multi-vues -> hard gates topologie/temps/zones/monde
+-> score explicable -> LAPJV
+-> MATCHED | AMBIGUOUS | UNRESOLVED | NEW_AT_INGRESS
+```
+
+Les poids ImageNet1K officiels sont embarqués et vérifiés par SHA-256; aucun
+téléchargement n'a lieu au runtime. Le masque colis nettoie le crop lorsqu'il
+existe, sinon une bbox légèrement élargie est utilisée. Le ReID visuel ne voit
+que les candidats ayant déjà franchi les gates physiques et ne décide jamais
+seul. Une caméra ingress peut créer un `GlobalParcel`; une caméra intermédiaire
+incertaine produit `UNRESOLVED` sans inventer une nouvelle identité.
+
+`AutoReIDAdapter` collecte uniquement les handoffs stables à forte marge et
+leurs concurrents plausibles. Il entraîne une tête linéaire contrastive en
+arrière-plan, jamais le backbone, puis compare le candidat sur un hold-out
+déterministe. Le registre existant conserve candidat, métriques, activation et
+rollback. Après une promotion ou un rejet, le cycle passe à `FROZEN`.
+
+```powershell
+python -m visionsort.runtime.multicam_reid_e2e
+```
 
 ## Interaction opérateur-colis figée
 
@@ -263,7 +297,7 @@ Des rapports JSON machine-readable sont produits dans `data/runtime/reports/`.
 - previews JPEG et enregistrements segmentés
 - tracking local par caméra
 - tracklets persistés
-- matching multicam `MATCHED / AMBIGUOUS / UNMATCHED`
+- matching multicam `MATCHED / AMBIGUOUS / UNRESOLVED / NEW_AT_INGRESS`
 - événements prise/transport/dépôt en logique Replay
 - regroupement de toutes les instances par frame et groupes synchronisés C1/C2/C3
 - split immuable par session, déduplication et contrôles anti-fuite
@@ -326,6 +360,7 @@ pas échouer la CI.
 ## Limites Connues
 
 - Les règles multicaméra, prise et dépôt sont testables en Replay mais non validées sur site.
+- Le backbone ReID est générique et opérationnel sans apprentissage site; les seuils et le gain réel de la projection restent à valider sur les colis, lumières et caméras industriels.
 - Le backend `demo_synth_det` reste réservé à `DEMO_MODE`.
 - Les poids Ultralytics doivent être présents localement et leur empreinte vérifiable avant chargement; le runtime ne masque pas de téléchargement automatique.
 - ByteTrack et BoT-SORT exigent `lap` et restent à valider sur les flux réels du site.

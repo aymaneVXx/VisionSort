@@ -70,7 +70,7 @@ def test_v9_migration_seeds_existing_active_models(tmp_path):
         WHERE activated_model_id = 'demo_synth_det'
         """
     )
-    assert version is not None and version[0] == 12
+    assert version is not None and version[0] == 13
     assert model is not None and model["status"] == "CANDIDATE"
     assert history is not None
     assert history["status"] == "ACTIVE"
@@ -105,7 +105,27 @@ def test_v12_migration_preserves_legacy_destination_as_unverified_observation(
         FROM global_parcels WHERE parcel_id = 'parcel-legacy'
         """
     )
-    assert db.fetch_one("PRAGMA user_version")[0] == 12
+    assert db.fetch_one("PRAGMA user_version")[0] == 13
     assert row["expected_destination"] is None
     assert row["observed_destination"] == "destination-A"
     assert row["destination_result"] == "DESTINATION_UNVERIFIED"
+
+
+def test_v13_migration_adds_reid_adaptation_tables(tmp_path):
+    db = VisionSortDB(tmp_path / "legacy-v12.db")
+    db.initialize()
+    with db.connect() as conn:
+        conn.execute("DROP TABLE reid_training_pairs")
+        conn.execute("DROP TABLE reid_adaptation_runs")
+        conn.execute("PRAGMA user_version = 12")
+
+    db.initialize()
+
+    assert db.fetch_one("PRAGMA user_version")[0] == 13
+    tables = {
+        str(row["name"])
+        for row in db.fetch_all(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    assert {"reid_training_pairs", "reid_adaptation_runs"} <= tables

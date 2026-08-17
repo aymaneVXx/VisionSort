@@ -23,6 +23,8 @@ from visionsort.core.types import Observation
 from visionsort.database.db import VisionSortDB
 from visionsort.database.repositories import ControlRepository
 from visionsort.events.engine import ParcelEventEngine
+from visionsort.reid.encoder import ParcelReIDEncoder
+from visionsort.reid.keyframes import HandoffKeyframeSelector
 from visionsort.sources.frame_sources import build_source
 from visionsort.tracking.engine import build_tracker
 
@@ -423,6 +425,33 @@ def camera_worker_loop(
         zones=zones_by_role.get(camera_role, []),
         integrity_config=config.get("tracking", "integrity", default={}),
     )
+    reid_config = config.get("tracking", "reid", default={}) or {}
+    keyframe_selector: HandoffKeyframeSelector | None = None
+    reid_error: str | None = None
+    if bool(reid_config.get("enabled", True)):
+        try:
+            reid_encoder = ParcelReIDEncoder(
+                str(
+                    reid_config.get("model")
+                    or "data/models/reid/mobilenet_v3_small-047dcff4.pth"
+                ),
+                device=str(reid_config.get("device") or "cpu"),
+            )
+            keyframe_selector = HandoffKeyframeSelector(
+                reid_encoder,
+                max_views=int(reid_config.get("max_views") or 5),
+                min_views=int(reid_config.get("min_views") or 3),
+                priority_zone_ids={
+                    str(zone.get("zone_id"))
+                    for zone in zones_by_role.get(camera_role, [])
+                    if str(zone.get("kind") or "").lower()
+                    in {"entry", "exit"}
+                },
+            )
+        except Exception as exc:
+            # Tracking remains operational; the supervisor exposes the local
+            # artifact/configuration problem instead of losing the camera.
+            reid_error = str(exc)
     event_engine = ParcelEventEngine(
         zones_by_role=zones_by_role,
         source_roles={camera_id: camera_role},
@@ -815,6 +844,8 @@ def camera_worker_loop(
                 stream_epoch=int(frame.stream_epoch),
                 world_geometry=world_geometry,
             )
+            if keyframe_selector is not None:
+                keyframe_selector.observe(track_obs, frame.image)
             last_tracking_model_id = observations[0].model_id if observations else None
             pop_integrity_events = getattr(tracker, "pop_integrity_events", None)
             if callable(pop_integrity_events):
@@ -849,6 +880,8 @@ def camera_worker_loop(
                     }
                 )
             for tracklet in finalized:
+                if keyframe_selector is not None:
+                    tracklet = keyframe_selector.attach(tracklet)
                 runtime_queue.put({"kind": "TRACKLET", "tracklet": asdict(tracklet)})
 
             now = time.time()
@@ -898,10 +931,21 @@ def camera_worker_loop(
                         if callable(getattr(tracker, "integrity_metrics", None))
                         else {}
                     ),
+                    "parcel_reid": {
+                        "enabled": keyframe_selector is not None,
+                        "model_version": (
+                            keyframe_selector.encoder.model_version
+                            if keyframe_selector is not None
+                            else None
+                        ),
+                        "error": reid_error,
+                    },
                     "validated_on_site": False,
                 },
             )
         for tracklet in tracker.flush():
+            if keyframe_selector is not None:
+                tracklet = keyframe_selector.attach(tracklet)
             runtime_queue.put({"kind": "TRACKLET", "tracklet": asdict(tracklet)})
         pop_integrity_events = getattr(tracker, "pop_integrity_events", None)
         if callable(pop_integrity_events):

@@ -8,6 +8,8 @@ from typing import Any
 ZONE_KINDS = {"entry", "exit", "pick", "destination"}
 SITE_TRACKING_KEYS = {
     "integrity",
+    "multicam",
+    "reid",
     "zones",
     "site_topology",
     "handoff_window_seconds",
@@ -16,6 +18,8 @@ SITE_TRACKING_KEYS = {
     "hypothesis_expiry_seconds",
     "event_confirmation_seconds",
 }
+MULTICAM_KEYS = {"minimum_match_score", "ambiguity_margin"}
+REID_KEYS = {"enabled", "model", "auto_adaptation"}
 TRACK_INTEGRITY_KEYS = {
     "max_occlusion_seconds",
     "max_speed_m_s",
@@ -184,6 +188,40 @@ def validate_site_config(config: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError(
                 f"Parametre d'integrite invalide: {key} doit etre dans ]0, 1]."
             )
+    multicam = tracking.get("multicam", {})
+    if not isinstance(multicam, dict):
+        raise RuntimeError(
+            "Configuration site invalide: tracking.multicam doit etre un objet."
+        )
+    unknown_multicam = set(multicam) - MULTICAM_KEYS
+    if unknown_multicam:
+        raise RuntimeError(
+            "Parametres multicam inconnus: "
+            + ", ".join(sorted(str(value) for value in unknown_multicam))
+        )
+    for key, value in multicam.items():
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"Parametre multicam invalide: {key} doit etre numerique.") from exc
+        if not math.isfinite(number) or not 0.0 < number <= 1.0:
+            raise RuntimeError(f"Parametre multicam invalide: {key} doit etre dans ]0, 1].")
+    reid = tracking.get("reid", {})
+    if not isinstance(reid, dict):
+        raise RuntimeError(
+            "Configuration site invalide: tracking.reid doit etre un objet."
+        )
+    unknown_reid = set(reid) - REID_KEYS
+    if unknown_reid:
+        raise RuntimeError(
+            "Parametres ReID inconnus: "
+            + ", ".join(sorted(str(value) for value in unknown_reid))
+        )
+    for key in ("enabled", "auto_adaptation"):
+        if key in reid and not isinstance(reid[key], bool):
+            raise RuntimeError(f"Parametre ReID invalide: {key} doit etre booleen.")
+    if "model" in reid and not str(reid["model"]).strip():
+        raise RuntimeError("Parametre ReID invalide: model ne peut pas etre vide.")
     zones_by_role = tracking.get("zones", {})
     if not isinstance(zones_by_role, dict):
         raise RuntimeError("Configuration site invalide: tracking.zones doit etre un objet.")

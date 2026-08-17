@@ -33,13 +33,14 @@ class PersonTrackBuilder:
         by_link_token: dict[str, list[int]] = {}
 
         for person in persons:
+            person_id = self._native_person_id(person)
             for token in self._person_link_tokens(person):
-                by_link_token.setdefault(token, []).append(person.local_track_id)
+                by_link_token.setdefault(token, []).append(person_id)
             left = self._pose_wrist(person, index=9, side="left")
             right = self._pose_wrist(person, index=10, side="right")
             built.append(
                 PersonTrack(
-                    person_track_id=person.local_track_id,
+                    person_track_id=person_id,
                     bbox=person.bbox,
                     left_wrist=left,
                     right_wrist=right,
@@ -105,12 +106,24 @@ class PersonTrackBuilder:
 
     @classmethod
     def _person_link_tokens(cls, person: TrackObservation) -> set[str]:
-        tokens = {str(person.local_track_id)}
+        tokens = {
+            str(person.local_track_id),
+            str(cls._native_person_id(person)),
+        }
         for key in ("person_track_id", "operator_id"):
             value = person.extra.get(key)
             if value is not None and str(value):
                 tokens.add(str(value))
         return tokens
+
+    @staticmethod
+    def _native_person_id(person: TrackObservation) -> int:
+        """Keep the operator identity aligned with native ByteTrack tracklets."""
+        return int(
+            person.backend_track_id
+            if person.backend_track_id is not None
+            else person.local_track_id
+        )
 
     @staticmethod
     def _explicit_wrist_origin(

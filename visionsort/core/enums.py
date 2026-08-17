@@ -86,7 +86,21 @@ class DestinationResult(str, Enum):
 class MatchResult(str, Enum):
     MATCHED = "MATCHED"
     AMBIGUOUS = "AMBIGUOUS"
+    UNRESOLVED = "UNRESOLVED"
+    NEW_AT_INGRESS = "NEW_AT_INGRESS"
+    # Legacy value kept for persisted pre-PR3 rows and non-parcel tracklets.
     UNMATCHED = "UNMATCHED"
+
+
+class ReIDAdaptationState(str, Enum):
+    BOOTSTRAP = "BOOTSTRAP"
+    COLLECTING = "COLLECTING"
+    READY = "READY"
+    TRAINING = "TRAINING"
+    VALIDATING = "VALIDATING"
+    PROMOTED = "PROMOTED"
+    REJECTED = "REJECTED"
+    FROZEN = "FROZEN"
 
 
 class LocalTrackLifecycle(str, Enum):

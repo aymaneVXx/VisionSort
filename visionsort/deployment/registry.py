@@ -211,6 +211,15 @@ def validate_activation_candidate(
 
 
 def _required_promotion_metrics(task: str) -> tuple[str, ...]:
+    if task == "reid_multicamera":
+        return (
+            "positive_pair_retrieval_accuracy",
+            "hard_negative_separation",
+            "handoff_accuracy",
+            "false_match_rate",
+            "ambiguous_rate",
+            "global_id_switches",
+        )
     if task == "segmentation":
         return ("mask_precision", "mask_recall", "mask_mAP50", "fps")
     if task == "pose":
@@ -589,7 +598,7 @@ def rollback_to_previous_active(
           AND h.status IN ('ACTIVE', 'SUPERSEDED', 'ROLLED_BACK')
           AND h.activated_model_id <> COALESCE(?, '')
           AND m.task = ?
-          AND m.status IN (?, ?)
+          AND m.status IN (?, ?, ?)
         ORDER BY COALESCE(h.completed_at, h.activated_at) DESC
         """,
         (
@@ -598,6 +607,7 @@ def rollback_to_previous_active(
             selected_task,
             ModelStatus.CHAMPION.value,
             ModelStatus.ARCHIVED.value,
+            ModelStatus.BASELINE.value,
         ),
     )
     invalid_errors: list[str] = []
@@ -613,7 +623,21 @@ def rollback_to_previous_active(
             continue
         model_id = str(candidate["id"])
         if apply:
-            activate_model(db, model_id)
+            if str(candidate.get("model_status")) == ModelStatus.BASELINE.value:
+                # Rollback is the controlled exception to the ordinary
+                # baseline activation guard: the current champion is being
+                # replaced atomically by its validated predecessor.
+                with db.connect() as conn:
+                    conn.execute(
+                        "UPDATE model_registry SET is_active = 0, updated_at = ? WHERE task = ?",
+                        (utc_now(), selected_task),
+                    )
+                    conn.execute(
+                        "UPDATE model_registry SET is_active = 1, updated_at = ? WHERE id = ?",
+                        (utc_now(), model_id),
+                    )
+            else:
+                activate_model(db, model_id)
         return model_id
     suffix = (
         " Artefacts invalides: " + " | ".join(invalid_errors)

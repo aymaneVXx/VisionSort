@@ -65,6 +65,13 @@ tracking:
     max_speed_m_s: 3.0
     min_relink_score: 0.55
     ambiguity_margin: 0.10
+  multicam:
+    minimum_match_score: 0.48
+    ambiguity_margin: 0.08
+  reid:
+    enabled: true
+    model: data/models/reid/mobilenet_v3_small-047dcff4.pth
+    auto_adaptation: true
   handoff_window_seconds: 0.75
   handoff_buffer_max_items: 1000
   handoff_expiry_seconds: 30.0

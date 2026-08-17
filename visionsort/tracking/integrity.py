@@ -1245,6 +1245,10 @@ class TrackIntegrityManager:
         ground_truth_hint = history[-1].extra.get("parcel_hint") or history[0].extra.get(
             "parcel_hint"
         )
+        world_observations = [
+            item for item in history
+            if item.world_valid and item.anchor_world_m is not None
+        ]
         summary = {
             "start_frame": history[0].frame_index,
             "end_frame": history[-1].frame_index,
@@ -1271,6 +1275,15 @@ class TrackIntegrityManager:
             "integrity_status": state.integrity_status.value,
             "integrity_decision_reasons": list(dict.fromkeys(state.decision_reasons)),
             "stream_epoch": state.stream_epoch,
+            "first_anchor_world_m": (
+                list(world_observations[0].anchor_world_m)
+                if world_observations else None
+            ),
+            "last_anchor_world_m": (
+                list(world_observations[-1].anchor_world_m)
+                if world_observations else None
+            ),
+            "world_observation_count": len(world_observations),
             "validated_on_site": False,
         }
         return Tracklet(
