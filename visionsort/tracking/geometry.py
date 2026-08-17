@@ -13,6 +13,7 @@ class GroundAnchor:
     pixel: tuple[float, float]
     normalized: tuple[float, float]
     world_m: tuple[float, float] | None
+    world_frame_id: str | None
     method: str
     world_valid: bool
 
@@ -41,17 +42,20 @@ class GroundAnchorEstimator:
             float(np.clip(pixel[1] / height, 0.0, 1.0)),
         )
         world_m: tuple[float, float] | None = None
+        world_frame_id: str | None = None
         if world_geometry is not None:
             try:
                 candidate = world_geometry.image_to_world(pixel, image_size=(width, height))
                 if np.isfinite(candidate).all():
                     world_m = (float(candidate[0]), float(candidate[1]))
+                    world_frame_id = getattr(world_geometry, "world_frame_id", None)
             except (RuntimeError, ValueError, TypeError):
                 world_m = None
         return GroundAnchor(
             pixel=pixel,
             normalized=normalized,
             world_m=world_m,
+            world_frame_id=world_frame_id,
             method=method,
             world_valid=world_m is not None,
         )

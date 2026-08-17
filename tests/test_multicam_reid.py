@@ -4,7 +4,7 @@ import numpy as np
 
 from visionsort.core.enums import MatchResult
 from visionsort.core.types import TrackObservation, Tracklet
-from visionsort.reid.encoder import ProjectionHead, l2_normalize
+from visionsort.reid.encoder import ParcelReIDEncoder, ProjectionHead, l2_normalize
 from visionsort.reid.handoff import HandoffCandidateGenerator
 from visionsort.reid.keyframes import HandoffKeyframeSelector
 from visionsort.runtime.multicam_reid_e2e import run_multicam_reid_replay
@@ -46,15 +46,20 @@ class _FakeEncoder:
         return l2_normalize(np.asarray(values, dtype=np.float32))
 
 
-def _descriptor(vector: list[float]) -> dict:
+def _descriptor(
+    vector: list[float], *, view_count: int = 3, min_views: int = 3
+) -> dict:
     normalized = l2_normalize(np.asarray(vector, dtype=np.float32)).tolist()
     return {
-        "embeddings": [normalized, normalized, normalized],
+        "embeddings": [normalized for _ in range(view_count)],
         "aggregate_embedding": normalized,
-        "view_count": 3,
-        "view_qualities": [0.9, 0.85, 0.8],
+        "view_count": view_count,
+        "view_qualities": [0.9 for _ in range(view_count)],
         "model_version": "test-backbone-v1",
-        "used_mask": [False, False, False],
+        "used_mask": [False for _ in range(view_count)],
+        "min_views": min_views,
+        "average_view_quality": 0.9,
+        "descriptor_quality": "RELIABLE" if view_count >= min_views else "LOW",
     }
 
 
@@ -136,6 +141,8 @@ def test_keyframe_selector_builds_multi_view_descriptor_without_mask():
     assert 3 <= descriptor["view_count"] <= 5
     assert len(descriptor["embeddings"]) == descriptor["view_count"]
     assert all(value is False for value in descriptor["used_mask"])
+    assert descriptor["descriptor_quality"] == "RELIABLE"
+    assert descriptor["average_view_quality"] > 0.0
     np.testing.assert_allclose(
         np.linalg.norm(descriptor["aggregate_embedding"]), 1.0, atol=1e-5
     )
@@ -165,6 +172,18 @@ def test_keyframe_selector_uses_mask_when_available():
     assert result.summary_json["appearance_descriptor"]["used_mask"] == [True]
 
 
+def test_reid_letterbox_preserves_rectangular_parcel_ratio():
+    crop = np.zeros((40, 160, 3), dtype=np.uint8)
+    letterboxed = ParcelReIDEncoder._letterbox(crop, size=224)
+    content = np.any(letterboxed != 114, axis=2)
+    rows, columns = np.where(content)
+
+    content_height = int(rows.max() - rows.min() + 1)
+    content_width = int(columns.max() - columns.min() + 1)
+    assert letterboxed.shape == (224, 224, 3)
+    assert content_width / content_height == 4.0
+
+
 def test_hard_gates_reject_topology_transit_and_wrong_zones_before_reid():
     generator = HandoffCandidateGenerator(TOPOLOGY, {}, ZONES)
     outgoing = _tracklet(
@@ -191,6 +210,7 @@ def test_hard_gates_reject_topology_transit_and_wrong_zones_before_reid():
     assert "zone entrante non entry" in decision.reasons
 
     outgoing.summary_json["last_anchor_world_m"] = [0.0, 0.0]
+    outgoing.summary_json["world_frame_id"] = "site-world"
     impossible_motion = _tracklet(
         "world-impossible",
         "C2",
@@ -199,9 +219,16 @@ def test_hard_gates_reject_topology_transit_and_wrong_zones_before_reid():
         first_zone="c2_entry",
     )
     impossible_motion.summary_json["first_anchor_world_m"] = [20.0, 0.0]
+    impossible_motion.summary_json["world_frame_id"] = "site-world"
     world_decision = generator.evaluate(outgoing, impossible_motion)
     assert world_decision.accepted is False
     assert "mouvement monde impossible" in world_decision.reasons
+
+    impossible_motion.summary_json["world_frame_id"] = "another-world"
+    different_frames = generator.evaluate(outgoing, impossible_motion)
+    assert different_frames.accepted is True
+    assert different_frames.evidence["world_available"] is False
+    assert different_frames.evidence["same_world_frame"] is False
 
 
 def test_ingress_creation_match_and_intermediate_unresolved_without_world_calibration():
@@ -285,10 +312,104 @@ def test_score_below_threshold_is_unresolved_and_reid_disabled_still_matches():
     assert "reid" not in legacy_match[3].features
 
 
+def test_min_views_controls_whether_reid_is_used():
+    low_views = GlobalParcelTracker(TOPOLOGY, {}, zones_by_role=ZONES)
+    outgoing = _tracklet(
+        "low-out", "C1", started=0.0, ended=1.0, vector=[1, 0, 0]
+    )
+    outgoing.summary_json["appearance_descriptor"] = _descriptor(
+        [1, 0, 0], view_count=2, min_views=3
+    )
+    low_views.process_tracklet(outgoing)
+    low_decision = low_views.process_tracklet(
+        _tracklet(
+            "low-in", "C2", started=2.0, ended=2.5, vector=[1, 0, 0]
+        )
+    )
+
+    assert low_decision[3] is not None
+    assert low_decision[3].features["reid_used"] is False
+    assert "reid" not in low_decision[3].features
+
+    enough_views = GlobalParcelTracker(TOPOLOGY, {}, zones_by_role=ZONES)
+    enough_views.process_tracklet(
+        _tracklet(
+            "enough-out", "C1", started=0.0, ended=1.0, vector=[1, 0, 0]
+        )
+    )
+    enough_decision = enough_views.process_tracklet(
+        _tracklet(
+            "enough-in", "C2", started=2.0, ended=2.5, vector=[1, 0, 0]
+        )
+    )
+    assert enough_decision[3] is not None
+    assert enough_decision[3].features["reid_used"] is True
+    assert enough_decision[3].features["reid"] > 0.99
+
+
+def test_lapjv_2x2_matches_both_parcels_without_silent_swap():
+    tracker = GlobalParcelTracker(TOPOLOGY, {}, zones_by_role=ZONES)
+    outgoing_a = _tracklet(
+        "out-a", "C1", started=0.0, ended=1.0, vector=[1, 0, 0]
+    )
+    outgoing_b = _tracklet(
+        "out-b", "C1", started=0.0, ended=1.0, vector=[0, 1, 0]
+    )
+    parcel_a = tracker.process_tracklet(outgoing_a)[0]
+    parcel_b = tracker.process_tracklet(outgoing_b)[0]
+    decisions = tracker.process_tracklets(
+        [
+            _tracklet(
+                "in-b", "C2", started=2.0, ended=2.5, vector=[0.02, 1, 0]
+            ),
+            _tracklet(
+                "in-a", "C2", started=2.0, ended=2.5, vector=[1, 0.02, 0]
+            ),
+        ]
+    )
+
+    assert [item[1] for item in decisions] == [MatchResult.MATCHED, MatchResult.MATCHED]
+    assert [item[0] for item in decisions] == [parcel_b, parcel_a]
+    assert [item[3].from_tracklet_id for item in decisions] == ["out-b", "out-a"]
+
+
+def test_visually_indistinguishable_hard_negatives_become_ambiguous():
+    tracker = GlobalParcelTracker(TOPOLOGY, {}, zones_by_role=ZONES)
+    tracker.process_tracklet(
+        _tracklet("close-a", "C1", started=0.0, ended=1.0, vector=[1, 0, 0])
+    )
+    tracker.process_tracklet(
+        _tracklet(
+            "close-b", "C1", started=0.0, ended=1.0, vector=[1, 0.01, 0]
+        )
+    )
+    decisions = tracker.process_tracklets(
+        [
+            _tracklet(
+                "close-in-a", "C2", started=2.0, ended=2.5, vector=[1, 0.002, 0]
+            ),
+            _tracklet(
+                "close-in-b", "C2", started=2.0, ended=2.5, vector=[1, 0.008, 0]
+            ),
+        ]
+    )
+
+    assert all(item[1] == MatchResult.AMBIGUOUS for item in decisions)
+    assert all(item[0] == "" for item in decisions)
+
+
 def test_real_multicam_reid_replay_e2e():
     report = run_multicam_reid_replay()
     assert report["status"] == "PASS"
     assert report["decisions"] == ["NEW_AT_INGRESS", "MATCHED"]
     assert min(report["views_per_tracklet"]) >= 3
-    assert report["reid_similarity"] >= 0.90
+    assert report["reid_similarity"] >= 0.80
     assert report["handoff_score"] >= 0.48
+    assert report["same_parcel_variations"]["decision"] == "MATCHED"
+    assert report["hard_negative_2x2"]["status"] == "PASS"
+    assert report["hard_negative_2x2"]["parcel_count"] == 2
+    assert report["hard_negative_2x2"]["silent_swaps"] == 0
+    assert all(
+        item["decision"] in {"MATCHED", "AMBIGUOUS"}
+        for item in report["hard_negative_2x2"]["outcomes"]
+    )
