@@ -167,6 +167,23 @@ def test_transaction_refuses_consumed_candidate_without_partial_update(
     assert "déjà progressé" in audit[0]["reason"]
 
 
+def test_multicam_decisions_emit_structured_uppercase_audit_events(tmp_path):
+    db, supervisor, _ = _ambiguous_supervisor(tmp_path)
+    rows = db.fetch_all(
+        "SELECT event_type, payload_json FROM events ORDER BY created_at, id"
+    )
+    event_types = [str(row["event_type"]) for row in rows]
+    assert event_types.count("GLOBAL_PARCEL_CREATED") == 2
+    assert "HANDOFF_AMBIGUOUS" in event_types
+    ambiguous_payload = next(
+        row["payload_json"]
+        for row in rows
+        if row["event_type"] == "HANDOFF_AMBIGUOUS"
+    )
+    assert '"final_decision": "AMBIGUOUS"' in ambiguous_payload
+    assert '"competing_candidates"' in ambiguous_payload
+
+
 def test_transaction_rejects_candidate_outside_hypothesis(tmp_path):
     db, supervisor, hypothesis = _ambiguous_supervisor(tmp_path)
 

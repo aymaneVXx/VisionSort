@@ -18,6 +18,9 @@ data/datasets/*
 !data/datasets/.gitkeep
 data/models/*
 !data/models/.gitkeep
+!data/models/reid/
+data/models/reid/*
+!data/models/reid/mobilenet_v3_small-047dcff4.pth
 data/visionsort.db
 data/demo/*
 !data/demo/.gitkeep

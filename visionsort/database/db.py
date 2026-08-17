@@ -68,6 +68,24 @@ DEFAULT_MODELS = [
         "is_active": 0,
         "notes_json": json.dumps({"demo_only": False, "validated_on_site": False}),
     },
+    {
+        "id": "parcel_reid_mobilenet_v3_small_v1",
+        "name": "Parcel ReID MobileNetV3-Small ImageNet1K",
+        "task": ModelTask.REID_MULTICAMERA.value,
+        "backend": "torchvision_reid_backbone",
+        "weights_path": "data/models/reid/mobilenet_v3_small-047dcff4.pth",
+        "status": ModelStatus.BASELINE.value,
+        "is_active": 1,
+        "notes_json": json.dumps(
+            {
+                "backbone_frozen": True,
+                "open_set": True,
+                "runtime_download": False,
+                "artifact_sha256": "047dcff4addef86ea5bc2eff13c9614dc11f47ab1160d0a71a25e7db994f4e1f",
+                "validated_on_site": False,
+            }
+        ),
+    },
 ]
 
 
@@ -461,6 +479,31 @@ class VisionSortDB:
                     result TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS reid_training_pairs (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    edge_key TEXT NOT NULL,
+                    label TEXT NOT NULL CHECK(label IN ('POSITIVE', 'HARD_NEGATIVE')),
+                    left_tracklet_id TEXT NOT NULL,
+                    right_tracklet_id TEXT NOT NULL,
+                    left_descriptor_json TEXT NOT NULL,
+                    right_descriptor_json TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    dataset_version TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(left_tracklet_id, right_tracklet_id, label)
+                );
+                CREATE TABLE IF NOT EXISTS reid_adaptation_runs (
+                    id TEXT PRIMARY KEY,
+                    state TEXT NOT NULL,
+                    dataset_version TEXT NOT NULL,
+                    active_model_id TEXT,
+                    candidate_model_id TEXT,
+                    metrics_json TEXT NOT NULL DEFAULT '{}',
+                    error_text TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS site_config (
                     id TEXT PRIMARY KEY,
                     config_json TEXT NOT NULL,
@@ -497,6 +540,8 @@ class VisionSortDB:
                 CREATE INDEX IF NOT EXISTS idx_pending_handoffs_session ON pending_handoffs(session_id, link_key, received_at);
                 CREATE INDEX IF NOT EXISTS idx_handoff_hypotheses_status ON handoff_hypotheses(status, session_id, expires_at);
                 CREATE INDEX IF NOT EXISTS idx_handoff_resolution_audit_hypothesis ON handoff_resolution_audit(hypothesis_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_reid_pairs_dataset ON reid_training_pairs(dataset_version, label, created_at);
+                CREATE INDEX IF NOT EXISTS idx_reid_runs_state ON reid_adaptation_runs(state, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_recording_frames_lookup ON recording_frames(session_id, source_id, stream_epoch, frame_index);
                 CREATE INDEX IF NOT EXISTS idx_recordings_session_source ON recordings(session_id, source_id, started_at);
                 CREATE INDEX IF NOT EXISTS idx_source_model_assignments_source ON source_model_assignments(source_id, enabled);
@@ -1019,6 +1064,42 @@ class VisionSortDB:
                 """
             )
             conn.execute("PRAGMA user_version = 12")
+
+        if version < 13:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS reid_training_pairs (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    edge_key TEXT NOT NULL,
+                    label TEXT NOT NULL CHECK(label IN ('POSITIVE', 'HARD_NEGATIVE')),
+                    left_tracklet_id TEXT NOT NULL,
+                    right_tracklet_id TEXT NOT NULL,
+                    left_descriptor_json TEXT NOT NULL,
+                    right_descriptor_json TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    dataset_version TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(left_tracklet_id, right_tracklet_id, label)
+                );
+                CREATE TABLE IF NOT EXISTS reid_adaptation_runs (
+                    id TEXT PRIMARY KEY,
+                    state TEXT NOT NULL,
+                    dataset_version TEXT NOT NULL,
+                    active_model_id TEXT,
+                    candidate_model_id TEXT,
+                    metrics_json TEXT NOT NULL DEFAULT '{}',
+                    error_text TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_reid_pairs_dataset
+                    ON reid_training_pairs(dataset_version, label, created_at);
+                CREATE INDEX IF NOT EXISTS idx_reid_runs_state
+                    ON reid_adaptation_runs(state, updated_at);
+                """
+            )
+            conn.execute("PRAGMA user_version = 13")
 
     @staticmethod
     def _seed_model_activation_history(

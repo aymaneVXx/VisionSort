@@ -57,6 +57,7 @@ from visionsort.inference.engine import inference_worker_loop
 from visionsort.media.archive import build_session_media_report
 from visionsort.runtime.demo_assets import ensure_demo_assets
 from visionsort.runtime.pipeline_worker import pipeline_worker_loop
+from visionsort.reid.adaptation import AutoReIDAdapter
 from visionsort.sources.frame_sources import can_open_uri
 from visionsort.tracking.engine import GlobalParcelTracker
 from visionsort.tracking.handoffs import PendingHandoffBuffer
@@ -168,10 +169,28 @@ class RuntimeSupervisor:
             max_concurrent_live_sources=int(self.config.get("gpu", "max_concurrent_live_sources", default=3)),
         )
         topology_edges = self.config.get("tracking", "site_topology", "edges", default=[])
+        multicam_config = self.config.get("tracking", "multicam", default={}) or {}
+        reid_config = self.config.get("tracking", "reid", default={}) or {}
         self.global_tracker = GlobalParcelTracker(
             topology_edges=topology_edges,
             source_roles=self._source_roles(),
             zones_by_role=self.config.get("tracking", "zones", default={}),
+            minimum_score=float(multicam_config.get("minimum_match_score", 0.48)),
+            ambiguity_margin=float(multicam_config.get("ambiguity_margin", 0.08)),
+            reid_enabled=bool(reid_config.get("enabled", True)),
+            max_speed_m_s=float(
+                self.config.get("tracking", "integrity", "max_speed_m_s", default=3.0)
+            ),
+        )
+        self.auto_reid_adapter = AutoReIDAdapter(
+            self.db,
+            event_repo=self.event_repo,
+            enabled=bool(reid_config.get("auto_adaptation", True))
+            and bool(reid_config.get("enabled", True)),
+            on_promoted=self._apply_reid_projection,
+        )
+        self.global_tracker.handoff_scorer.projection = (
+            self.auto_reid_adapter.active_projection()
         )
         self.pending_handoff_buffer = PendingHandoffBuffer(
             self.db,
@@ -208,6 +227,9 @@ class RuntimeSupervisor:
 
     def _source_roles(self) -> dict[str, str]:
         return {row["id"]: row["role"] for row in self.db.fetch_all("SELECT id, role FROM sources")}
+
+    def _apply_reid_projection(self, projection) -> None:
+        self.global_tracker.handoff_scorer.projection = projection
 
     @staticmethod
     def _tracklet_from_row(row: dict[str, Any]) -> Tracklet:
@@ -318,6 +340,10 @@ class RuntimeSupervisor:
         if not self.inference_process.is_alive():
             self.inference_process.start()
         for task in sorted(self.active_model_ids_by_task):
+            if task == "reid_multicamera":
+                # ReID projection heads are consumed by GlobalParcelTracker,
+                # not by the detector/pose inference process.
+                continue
             model_id = str(
                 self.runtime_route(task).get("model_id") or ""
             )
@@ -358,6 +384,9 @@ class RuntimeSupervisor:
     def shutdown(self) -> None:
         if self._shutdown_complete:
             return
+        adapter = getattr(self, "auto_reid_adapter", None)
+        if adapter is not None:
+            adapter.shutdown(timeout=3.0)
         for source_id in list(self.camera_processes):
             self.stop_source(source_id)
         self.drain_runtime_messages()
@@ -586,7 +615,7 @@ class RuntimeSupervisor:
                 """
                 SELECT id, task, status, updated_at
                 FROM model_registry
-                WHERE is_active = 1
+                WHERE is_active = 1 AND task <> 'reid_multicamera'
                 ORDER BY task, updated_at DESC
                 """
             )
@@ -599,7 +628,11 @@ class RuntimeSupervisor:
         routes_proxy = getattr(
             self, "active_runtime_models_by_task", {}
         )
-        route_tasks = set(str(task) for task in routes_proxy.keys())
+        route_tasks = {
+            str(task)
+            for task in routes_proxy.keys()
+            if str(task) != "reid_multicamera"
+        }
         tasks = sorted(set(registry_by_task) | route_tasks)
         status = dict(
             worker_status
@@ -2259,6 +2292,21 @@ class RuntimeSupervisor:
             self.global_tracker.zones_by_role = runtime_config.get(
                 "tracking", "zones", default={}
             )
+            multicam_config = runtime_config.get(
+                "tracking", "multicam", default={}
+            ) or {}
+            reid_config = runtime_config.get(
+                "tracking", "reid", default={}
+            ) or {}
+            self.global_tracker.minimum_score = float(
+                multicam_config.get("minimum_match_score", 0.48)
+            )
+            self.global_tracker.ambiguity_margin = float(
+                multicam_config.get("ambiguity_margin", 0.08)
+            )
+            self.global_tracker.handoff_scorer.reid_enabled = bool(
+                reid_config.get("enabled", True)
+            )
             for tracklet in wave:
                 self._try_resolve_hypotheses_with_later_evidence(tracklet)
             wave_outcomes = self.global_tracker.process_tracklets(wave)
@@ -2285,7 +2333,9 @@ class RuntimeSupervisor:
             candidate_set = self.global_tracker.last_candidate_sets.get(
                 tracklet.tracklet_id, []
             )
-            if result == MatchResult.AMBIGUOUS:
+            if result == MatchResult.AMBIGUOUS or (
+                result == MatchResult.UNRESOLVED and candidate_set
+            ):
                 hypothesis_id = self.hypothesis_repo.create(
                     session_id=tracklet.session_id,
                     incoming_tracklet_id=tracklet.tracklet_id,
@@ -2303,6 +2353,26 @@ class RuntimeSupervisor:
                 parcel_id=parcel_id or None,
                 match_result=result.value,
             )
+            adapter = getattr(self, "auto_reid_adapter", None)
+            if (
+                adapter is not None
+                and result == MatchResult.MATCHED
+                and candidate is not None
+            ):
+                outgoing = self.global_tracker.tracklets.get(
+                    candidate.from_tracklet_id
+                )
+                if outgoing is not None:
+                    adapter.observe_handoff(
+                        outgoing=outgoing,
+                        incoming=tracklet,
+                        selected=candidate,
+                        candidates=candidate_set,
+                        tracklets_by_id=self.global_tracker.tracklets,
+                        result=result,
+                        ambiguity_margin=self.global_tracker.ambiguity_margin,
+                    )
+                    adapter.maybe_start_async()
             if parcel_id:
                 parcel = self.global_tracker.parcels[parcel_id]
                 local_parcel_key = (
@@ -2318,26 +2388,42 @@ class RuntimeSupervisor:
                     parcel, local_events, tracklet=tracklet
                 )
                 self.tracking_repo.upsert_global_parcel(parcel)
-            event_type = (
-                "handoff_ambiguous"
-                if result == MatchResult.AMBIGUOUS
-                else "handoff_matched"
-                if result == MatchResult.MATCHED
-                else "tracklet_unmatched"
-            )
+            event_type = {
+                MatchResult.MATCHED: "HANDOFF_MATCHED",
+                MatchResult.AMBIGUOUS: "HANDOFF_AMBIGUOUS",
+                MatchResult.UNRESOLVED: "HANDOFF_UNRESOLVED",
+                MatchResult.NEW_AT_INGRESS: "GLOBAL_PARCEL_CREATED",
+            }.get(result, "HANDOFF_UNRESOLVED")
             self.event_repo.add_event(
                 event_type,
                 {
+                    "from_tracklet": (
+                        candidate.from_tracklet_id if candidate else None
+                    ),
+                    "to_tracklet": tracklet.tracklet_id,
                     "tracklet_id": tracklet.tracklet_id,
                     "reasons": reasons,
                     "candidate": asdict(candidate) if candidate else None,
-                    "candidates": [asdict(item) for item in candidate_set],
+                    "competing_candidates": [
+                        asdict(item) for item in candidate_set
+                    ],
+                    "gate_rejections": self.global_tracker.last_gate_rejections.get(
+                        tracklet.tracklet_id, []
+                    ),
+                    "final_decision": result.value,
+                    "model_version": (
+                        candidate.model_version if candidate else None
+                    ),
                     "hypothesis_id": hypothesis_id,
                     "validated_on_site": False,
                 },
                 parcel_id=parcel_id or None,
                 camera_id=tracklet.camera_id,
-                severity="warning" if result == MatchResult.AMBIGUOUS else "info",
+                severity=(
+                    "warning"
+                    if result in {MatchResult.AMBIGUOUS, MatchResult.UNRESOLVED}
+                    else "info"
+                ),
                 session_id=tracklet.session_id,
                 source_id=tracklet.source_id,
                 timestamp_global=tracklet.ended_at_global,

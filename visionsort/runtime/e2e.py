@@ -171,6 +171,8 @@ def run_demo_e2e(
     match_counts = {
         MatchResult.MATCHED.value: 0,
         MatchResult.AMBIGUOUS.value: 0,
+        MatchResult.UNRESOLVED.value: 0,
+        MatchResult.NEW_AT_INGRESS.value: 0,
         MatchResult.UNMATCHED.value: 0,
     }
     for tracklet in all_tracklets:

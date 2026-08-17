@@ -202,6 +202,13 @@ def run_multimodel_e2e(
     config_values["app"]["demo_mode"] = True
     config_values["runtime"]["poll_interval_seconds"] = 0.05
     config_values["runtime"]["max_inference_queue"] = 32
+    # This scenario validates hot multi-model routing. Parcel ReID has its own
+    # real ByteTrack-to-GlobalParcel replay and would only consume CPU here.
+    config_values["tracking"]["reid"] = {
+        **config_values["tracking"].get("reid", {}),
+        "enabled": False,
+        "auto_adaptation": False,
+    }
     supervisor = RuntimeSupervisor(
         db_path=db_path,
         config=AppConfig(values=config_values),

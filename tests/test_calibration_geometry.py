@@ -433,7 +433,7 @@ def test_v10_database_migrates_to_calibration_schema_without_rebuild(tmp_path):
     db = VisionSortDB(db_path)
     db.initialize()
 
-    assert db.fetch_one("PRAGMA user_version")[0] == 12
+    assert db.fetch_one("PRAGMA user_version")[0] == 13
     source_columns = {
         row["name"] for row in db.fetch_all("PRAGMA table_info(sources)")
     }

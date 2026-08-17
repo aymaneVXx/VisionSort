@@ -1,3 +1,7 @@
+from dataclasses import replace
+
+import numpy as np
+
 from visionsort.core.enums import DestinationResult, ParcelState
 from visionsort.core.types import (
     Observation,
@@ -283,6 +287,111 @@ def test_person_builder_never_attaches_an_unowned_nearby_wrist():
     assert built[0].right_wrist is None
 
 
+def test_bytetrack_person_id_17_stays_operator_and_persisted_tracklet_id(
+    monkeypatch, tmp_path
+):
+    import visionsort.tracking.engine as engine_module
+
+    monkeypatch.setattr(engine_module, "DETAILS_DIR", tmp_path / "details")
+    tracker = ByteTrackTracker(
+        session_id="session-person-id",
+        source_id="camera",
+        camera_id="camera",
+        camera_role="C2",
+        tracker_id="bytetrack_cpu",
+        zones=[],
+    )
+    monkeypatch.setattr(
+        tracker.native_tracker,
+        "update",
+        lambda boxes, img: np.asarray(
+            [[80.0, 50.0, 220.0, 330.0, 17.0, 0.95, 0.0, 0.0]],
+            dtype=np.float32,
+        ),
+    )
+    keypoints = [(0.0, 0.0, 0.0) for _ in range(17)]
+    keypoints[9] = (120.0, 170.0, 0.95)
+    keypoints[10] = (125.0, 170.0, 0.95)
+    context, _ = tracker.update(
+        frame_index=0,
+        timestamp_local=0.0,
+        timestamp_global=0.0,
+        image_size=(1000, 500),
+        observations=[
+            Observation(
+                "person",
+                0.95,
+                (80.0, 50.0, 220.0, 330.0),
+                keypoints=keypoints,
+            )
+        ],
+    )
+
+    person = PersonTrackBuilder().update(context)[0]
+    assert context[0].local_track_id != 17
+    assert context[0].backend_track_id == 17
+    assert person.person_track_id == 17
+
+    engine = ParcelEventEngine(
+        zones_by_role={
+            "C2": [
+                {
+                    "zone_id": "pick",
+                    "kind": "pick",
+                    "x1": 0.0,
+                    "y1": 0.0,
+                    "x2": 1.0,
+                    "y2": 1.0,
+                }
+            ]
+        },
+        source_roles={"camera": "C2"},
+    )
+    for index, timestamp in enumerate((0.0, 0.1, 0.2, 0.3, 0.4, 0.5)):
+        parcel_x = 100.0 + index * 2.0
+        parcel = TrackObservation(
+            session_id="session-person-id",
+            source_id="camera",
+            camera_id="camera",
+            camera_role="C2",
+            local_track_id=1,
+            backend_track_id=101,
+            frame_index=index,
+            timestamp_local=timestamp,
+            timestamp_global=timestamp,
+            class_name="parcel",
+            confidence=0.95,
+            bbox=(parcel_x, 150.0, parcel_x + 40.0, 200.0),
+            velocity=(20.0, 0.0),
+            zone_id="pick",
+            identity_status="STABLE",
+            extra={"_image_w": 1000, "_image_h": 500},
+        )
+        timed_context = replace(
+            context[0],
+            frame_index=index,
+            timestamp_local=timestamp,
+            timestamp_global=timestamp,
+            bbox=(80.0 + index * 2.0, 50.0, 220.0 + index * 2.0, 330.0),
+            extra={
+                **context[0].extra,
+                "keypoints": [
+                    *[(0.0, 0.0, 0.0) for _ in range(9)],
+                    (parcel_x + 20.0, 170.0, 0.95),
+                    (parcel_x + 25.0, 170.0, 0.95),
+                    *[(0.0, 0.0, 0.0) for _ in range(6)],
+                ],
+            },
+        )
+        engine.update("camera", [parcel], [timed_context])
+
+    assert engine.parcels["camera:1"].operator_id == "camera:17"
+    person_tracklet = next(
+        item for item in tracker.flush() if item.class_name == "person"
+    )
+    assert person_tracklet.local_track_id == 17
+
+
 def test_interaction_matcher_one_operator_one_parcel():
     builder = PersonTrackBuilder()
     person = builder.update(
@@ -549,7 +658,7 @@ def test_global_tracker_does_not_force_ambiguous_competitors():
     assert result[3] is not None
 
 
-def test_global_tracker_returns_unmatched_outside_transit_window():
+def test_global_tracker_returns_unresolved_outside_transit_window():
     tracker = _global_tracker()
     first_id = tracker.process_tracklet(
         _tracklet("out", "C1", started=0.0, ended=1.0)
@@ -558,5 +667,6 @@ def test_global_tracker_returns_unmatched_outside_transit_window():
         _tracklet("late", "C2", started=20.0, ended=21.0)
     )
 
-    assert result[1].value == "UNMATCHED"
+    assert result[1].value == "UNRESOLVED"
+    assert result[0] == ""
     assert result[0] != first_id

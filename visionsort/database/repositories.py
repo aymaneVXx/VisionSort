@@ -894,6 +894,151 @@ class TrackingRepository:
         )
 
 
+class ReIDRepository:
+    """Durable pseudo-pairs and lifecycle records for automatic ReID adaptation."""
+
+    def __init__(self, db: VisionSortDB):
+        self.db = db
+
+    def add_pair(
+        self,
+        *,
+        session_id: str,
+        edge_key: str,
+        label: str,
+        left_tracklet_id: str,
+        right_tracklet_id: str,
+        left_descriptor: dict[str, Any],
+        right_descriptor: dict[str, Any],
+        metadata: dict[str, Any],
+        dataset_version: str,
+    ) -> bool:
+        if label not in {"POSITIVE", "HARD_NEGATIVE"}:
+            raise ValueError(f"Label ReID invalide: {label}")
+        with self.db.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO reid_training_pairs
+                (id, session_id, edge_key, label, left_tracklet_id,
+                 right_tracklet_id, left_descriptor_json,
+                 right_descriptor_json, metadata_json, dataset_version,
+                 created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"reid-pair-{uuid.uuid4().hex}",
+                    session_id,
+                    edge_key,
+                    label,
+                    left_tracklet_id,
+                    right_tracklet_id,
+                    json.dumps(left_descriptor),
+                    json.dumps(right_descriptor),
+                    json.dumps(metadata),
+                    dataset_version,
+                    utc_now(),
+                ),
+            )
+            return cursor.rowcount > 0
+
+    def list_pairs(
+        self, *, dataset_version: str | None = None
+    ) -> list[dict[str, Any]]:
+        if dataset_version is None:
+            rows = self.db.fetch_all(
+                "SELECT * FROM reid_training_pairs ORDER BY created_at, id"
+            )
+        else:
+            rows = self.db.fetch_all(
+                """
+                SELECT * FROM reid_training_pairs
+                WHERE dataset_version = ? ORDER BY created_at, id
+                """,
+                (dataset_version,),
+            )
+        output: list[dict[str, Any]] = []
+        for raw in rows:
+            row = dict(raw)
+            row["left_descriptor"] = json.loads(
+                row.pop("left_descriptor_json") or "{}"
+            )
+            row["right_descriptor"] = json.loads(
+                row.pop("right_descriptor_json") or "{}"
+            )
+            row["metadata"] = json.loads(row.pop("metadata_json") or "{}")
+            output.append(row)
+        return output
+
+    def pair_counts(
+        self, *, dataset_version: str | None = None
+    ) -> dict[str, int]:
+        if dataset_version is None:
+            rows = self.db.fetch_all(
+                """
+                SELECT label, COUNT(*) AS count FROM reid_training_pairs
+                GROUP BY label
+                """
+            )
+        else:
+            rows = self.db.fetch_all(
+                """
+                SELECT label, COUNT(*) AS count FROM reid_training_pairs
+                WHERE dataset_version = ? GROUP BY label
+                """,
+                (dataset_version,),
+            )
+        counts = {"POSITIVE": 0, "HARD_NEGATIVE": 0}
+        counts.update({str(row["label"]): int(row["count"]) for row in rows})
+        return counts
+
+    def create_run(
+        self,
+        *,
+        state: str,
+        dataset_version: str,
+        active_model_id: str | None,
+    ) -> str:
+        run_id = f"reid-run-{uuid.uuid4().hex}"
+        now = utc_now()
+        self.db.execute(
+            """
+            INSERT INTO reid_adaptation_runs
+            (id, state, dataset_version, active_model_id,
+             candidate_model_id, metrics_json, error_text, created_at,
+             updated_at)
+            VALUES (?, ?, ?, ?, NULL, '{}', NULL, ?, ?)
+            """,
+            (run_id, state, dataset_version, active_model_id, now, now),
+        )
+        return run_id
+
+    def update_run(
+        self,
+        run_id: str,
+        *,
+        state: str,
+        candidate_model_id: str | None = None,
+        metrics: dict[str, Any] | None = None,
+        error_text: str | None = None,
+    ) -> None:
+        self.db.execute(
+            """
+            UPDATE reid_adaptation_runs
+            SET state = ?, candidate_model_id = COALESCE(?, candidate_model_id),
+                metrics_json = ?, error_text = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                state,
+                candidate_model_id,
+                json.dumps(metrics or {}),
+                error_text,
+                utc_now(),
+                run_id,
+            ),
+        )
+
+
 class HandoffHypothesisRepository:
     def __init__(self, db: VisionSortDB):
         self.db = db

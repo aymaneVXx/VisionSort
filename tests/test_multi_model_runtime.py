@@ -270,6 +270,7 @@ def test_pose_activation_does_not_deactivate_parcel_model(tmp_path):
     assert active == {
         "detection": "demo_synth_det",
         "pose": "demo-pose",
+        "reid_multicamera": "parcel_reid_mobilenet_v3_small_v1",
     }
 
 

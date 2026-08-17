@@ -190,3 +190,21 @@ class HandoffCandidate:
     score: float
     result: MatchResult
     reasons: list[str]
+    features: dict[str, float | str | bool | None] = field(default_factory=dict)
+    gate_evidence: dict[str, Any] = field(default_factory=dict)
+    model_version: str | None = None
+
+
+@dataclass(slots=True)
+class TrackletAppearanceDescriptor:
+    """Serializable multi-view descriptor produced from one canonical tracklet."""
+
+    embeddings: list[list[float]]
+    aggregate_embedding: list[float]
+    view_count: int
+    view_qualities: list[float]
+    model_version: str
+    used_mask: list[bool] = field(default_factory=list)
+
+    def to_json(self) -> dict[str, Any]:
+        return asdict(self)

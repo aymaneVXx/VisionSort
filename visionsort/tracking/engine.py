@@ -15,8 +15,9 @@ import lap
 from visionsort.core.config import relative_to_root
 from visionsort.core.enums import MatchResult, ParcelState
 from visionsort.core.paths import DETAILS_DIR, ROOT_DIR
-from visionsort.core.site_config import zone_kind
 from visionsort.core.types import GlobalParcel, HandoffCandidate, Observation, TrackObservation, Tracklet
+from visionsort.reid.encoder import ProjectionHead
+from visionsort.reid.handoff import HandoffCandidateGenerator, HandoffScorer
 from visionsort.tracking.integrity import TrackIntegrityConfig, TrackIntegrityManager
 
 if TYPE_CHECKING:
@@ -663,6 +664,9 @@ class GlobalParcelTracker:
         zones_by_role: dict[str, list[dict[str, Any]]] | None = None,
         minimum_score: float = 0.48,
         ambiguity_margin: float = 0.08,
+        reid_enabled: bool = True,
+        projection: ProjectionHead | None = None,
+        max_speed_m_s: float = 3.0,
     ):
         self.topology_edges = topology_edges
         self.source_roles = source_roles
@@ -673,6 +677,17 @@ class GlobalParcelTracker:
         self.tracklet_to_parcel: dict[str, str] = {}
         self.tracklets: dict[str, Tracklet] = {}
         self.last_candidate_sets: dict[str, list[HandoffCandidate]] = {}
+        self.last_gate_rejections: dict[str, list[dict[str, Any]]] = {}
+        self.candidate_generator = HandoffCandidateGenerator(
+            topology_edges,
+            source_roles,
+            self.zones_by_role,
+            max_speed_m_s=max_speed_m_s,
+        )
+        self.handoff_scorer = HandoffScorer(
+            reid_enabled=reid_enabled,
+            projection=projection,
+        )
 
     def process_tracklet(self, tracklet: Tracklet) -> tuple[str, MatchResult, list[str], HandoffCandidate | None]:
         return self.process_tracklets([tracklet])[0]
@@ -694,6 +709,7 @@ class GlobalParcelTracker:
 
         for incoming_index, incoming in enumerate(incoming_tracklets):
             candidates: list[HandoffCandidate] = []
+            self.last_gate_rejections[incoming.tracklet_id] = []
             for parcel in self.parcels.values():
                 outgoing = self.tracklets.get(parcel.current_tracklet_id)
                 if outgoing is None or outgoing.session_id != incoming.session_id:
@@ -834,14 +850,27 @@ class GlobalParcelTracker:
                 results[incoming_index] = ("", MatchResult.AMBIGUOUS, reasons, best)
                 self.tracklets[incoming.tracklet_id] = incoming
                 continue
-            parcel_id = self._register_new_parcel(incoming)
-            reason = "aucun candidat compatible" if candidates else "nouveau colis en entrée"
-            results[incoming_index] = (
-                parcel_id,
-                MatchResult.UNMATCHED,
-                [reason],
-                candidates[0] if candidates else None,
-            )
+            if self._is_ingress(incoming):
+                parcel_id = self._register_new_parcel(incoming)
+                results[incoming_index] = (
+                    parcel_id,
+                    MatchResult.NEW_AT_INGRESS,
+                    ["nouveau colis observé sur une caméra ingress"],
+                    candidates[0] if candidates else None,
+                )
+            else:
+                self.tracklets[incoming.tracklet_id] = incoming
+                reason = (
+                    "candidats sous le score minimal"
+                    if candidates
+                    else "aucun prédécesseur physiquement compatible"
+                )
+                results[incoming_index] = (
+                    "",
+                    MatchResult.UNRESOLVED,
+                    [reason],
+                    candidates[0] if candidates else None,
+                )
 
         return [item for item in results if item is not None]
 
@@ -911,112 +940,21 @@ class GlobalParcelTracker:
     def _score_candidate(
         self, outgoing: Tracklet, incoming: Tracklet
     ) -> HandoffCandidate | None:
-        previous_role = outgoing.camera_role or self.source_roles.get(
-            outgoing.camera_id, outgoing.camera_id
-        )
-        incoming_role = incoming.camera_role or self.source_roles.get(
-            incoming.camera_id, incoming.camera_id
-        )
-        edge = self._find_edge(previous_role, incoming_role)
-        if edge is None:
+        self.candidate_generator.topology_edges = self.topology_edges
+        self.candidate_generator.source_roles = self.source_roles
+        self.candidate_generator.zones_by_role = self.zones_by_role
+        gates = self.candidate_generator.evaluate(outgoing, incoming)
+        if not gates.accepted:
+            self.last_gate_rejections.setdefault(incoming.tracklet_id, []).append(
+                {
+                    "from_tracklet_id": outgoing.tracklet_id,
+                    "to_tracklet_id": incoming.tracklet_id,
+                    "reasons": gates.reasons,
+                    "gate_evidence": gates.evidence,
+                }
+            )
             return None
-        dt = incoming.started_at_global - outgoing.ended_at_global
-        minimum = float(edge["min_transit_s"])
-        maximum = float(edge["max_transit_s"])
-        if dt < minimum or dt > maximum:
-            return None
-        midpoint = (minimum + maximum) / 2.0
-        half_window = max((maximum - minimum) / 2.0, 1e-6)
-        temporal_score = max(0.0, 1.0 - abs(dt - midpoint) / half_window)
-
-        outgoing_dimensions = self._dimensions(outgoing)
-        incoming_dimensions = self._dimensions(incoming)
-        width_ratio = min(outgoing_dimensions[0], incoming_dimensions[0]) / max(
-            outgoing_dimensions[0], incoming_dimensions[0], 1e-6
-        )
-        height_ratio = min(outgoing_dimensions[1], incoming_dimensions[1]) / max(
-            outgoing_dimensions[1], incoming_dimensions[1], 1e-6
-        )
-        dimension_score = (width_ratio + height_ratio) / 2.0
-
-        outgoing_zone = self._summary(outgoing).get("last_zone_id") or outgoing.last_zone_id
-        incoming_zone = self._summary(incoming).get("first_zone_id")
-        zone_score = 0.5
-        outgoing_kind = zone_kind(
-            self.zones_by_role.get(previous_role, []), outgoing_zone
-        )
-        incoming_kind = zone_kind(
-            self.zones_by_role.get(incoming_role, []), incoming_zone
-        )
-        if outgoing_kind is not None:
-            zone_score += 0.25 if outgoing_kind == "exit" else -0.15
-        if incoming_kind is not None:
-            zone_score += 0.25 if incoming_kind == "entry" else -0.15
-        zone_score = min(1.0, max(0.0, zone_score))
-
-        outgoing_velocity = self._velocity(outgoing)
-        incoming_velocity = self._velocity(incoming)
-        outgoing_speed = math.hypot(*outgoing_velocity)
-        incoming_speed = math.hypot(*incoming_velocity)
-        speed_score = min(outgoing_speed, incoming_speed) / max(
-            outgoing_speed, incoming_speed, 1e-6
-        )
-        trajectory_score = 0.5
-        if outgoing_speed > 1e-6 and incoming_speed > 1e-6:
-            cosine = (
-                outgoing_velocity[0] * incoming_velocity[0]
-                + outgoing_velocity[1] * incoming_velocity[1]
-            ) / (outgoing_speed * incoming_speed)
-            trajectory_score = (max(-1.0, min(1.0, cosine)) + 1.0) / 2.0
-
-        outgoing_appearance = self._appearance(outgoing)
-        incoming_appearance = self._appearance(incoming)
-        appearance_score = None
-        if outgoing_appearance and incoming_appearance:
-            length = min(len(outgoing_appearance), len(incoming_appearance))
-            a = np.asarray(outgoing_appearance[:length], dtype=np.float32)
-            b = np.asarray(incoming_appearance[:length], dtype=np.float32)
-            denom = float(np.linalg.norm(a) * np.linalg.norm(b))
-            if denom > 1e-9:
-                appearance_score = (float(np.dot(a, b) / denom) + 1.0) / 2.0
-
-        weights = {
-            "temporal": 0.25,
-            "dimensions": 0.25,
-            "zone": 0.20,
-            "speed": 0.15,
-            "trajectory": 0.05,
-        }
-        components = {
-            "temporal": temporal_score,
-            "dimensions": dimension_score,
-            "zone": zone_score,
-            "speed": speed_score,
-            "trajectory": trajectory_score,
-        }
-        if appearance_score is not None:
-            weights["appearance"] = 0.20
-            components["appearance"] = appearance_score
-        total_weight = sum(weights.values())
-        score = sum(components[name] * weight for name, weight in weights.items()) / total_weight
-        reasons = [
-            f"edge={previous_role}->{incoming_role}",
-            f"transit={dt:.3f}s",
-            f"dimensions={dimension_score:.3f}",
-            f"zones={zone_score:.3f}",
-            f"zone_kinds={outgoing_kind or 'unknown'}->{incoming_kind or 'unknown'}",
-            f"speed={speed_score:.3f}",
-            f"trajectory={trajectory_score:.3f}",
-        ]
-        if appearance_score is not None:
-            reasons.append(f"appearance={appearance_score:.3f}")
-        return HandoffCandidate(
-            from_tracklet_id=outgoing.tracklet_id,
-            to_tracklet_id=incoming.tracklet_id,
-            score=float(score),
-            result=MatchResult.UNMATCHED,
-            reasons=reasons,
-        )
+        return self.handoff_scorer.score(outgoing, incoming, gates)
 
     @staticmethod
     def _summary(tracklet: Tracklet) -> dict[str, Any]:
@@ -1038,8 +976,21 @@ class GlobalParcelTracker:
         return speed, 0.0
 
     def _appearance(self, tracklet: Tracklet) -> list[float] | None:
-        appearance = self._summary(tracklet).get("appearance_embedding")
+        descriptor = self._summary(tracklet).get("appearance_descriptor") or {}
+        appearance = descriptor.get("aggregate_embedding") or self._summary(tracklet).get(
+            "appearance_embedding"
+        )
         return [float(value) for value in appearance] if appearance else None
+
+    def _is_ingress(self, tracklet: Tracklet) -> bool:
+        role = tracklet.camera_role or self.source_roles.get(
+            tracklet.camera_id, tracklet.camera_id
+        )
+        if not self.topology_edges:
+            return True
+        from_roles = {str(edge.get("from_role")) for edge in self.topology_edges}
+        to_roles = {str(edge.get("to_role")) for edge in self.topology_edges}
+        return role in (from_roles - to_roles)
 
     def _find_edge(self, from_role: str, to_role: str) -> dict[str, Any] | None:
         for edge in self.topology_edges:
